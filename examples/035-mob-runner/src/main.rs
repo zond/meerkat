@@ -206,5 +206,13 @@ async fn main() -> color_eyre::Result<()> {
         crossterm::cursor::SetCursorStyle::DefaultUserShape
     );
 
-    result
+    // Print error if any, then force exit to kill lingering background tasks
+    // (agent LLM retries, event routers, etc.).
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            std::process::exit(1);
+        }
+    }
 }
