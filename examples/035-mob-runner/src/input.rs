@@ -140,7 +140,17 @@ impl InputEditor {
             }
 
             (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
-                InputAction::Interrupt
+                if self.buf.is_empty() {
+                    // Empty input: signal interrupt (double-tap behavior handled by caller).
+                    InputAction::Interrupt
+                } else {
+                    // Non-empty input: clear the line (first Ctrl+C).
+                    self.buf.clear();
+                    self.cursor = 0;
+                    self.history_idx = None;
+                    self.saved_input.clear();
+                    InputAction::Redraw
+                }
             }
 
             (KeyCode::Char('d'), m)
@@ -565,9 +575,20 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     lines
 }
 
+/// RAII guard that restores terminal state on drop.
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+        let _ = std::io::stderr().execute(cursor::SetCursorStyle::DefaultUserShape);
+    }
+}
+
 /// Run the input editor in a dedicated thread. Enables raw mode on entry,
-/// restores on exit. Renders to stderr. The `output_rx` channel coordinates
-/// with the async side to hide/show the box around output.
+/// restores on exit (guaranteed by `RawModeGuard`). Renders to stderr.
+/// The `output_rx` channel coordinates with the async side to hide/show
+/// the box around output.
 pub fn run_input_thread(
     label: String,
     line_tx: tokio::sync::mpsc::Sender<InputResult>,
@@ -583,8 +604,14 @@ pub fn run_input_thread(
         return;
     }
 
+    // Ensures terminal is restored even on panic or early return.
+    let _guard = RawModeGuard;
+
     let _ = stderr.execute(cursor::SetCursorStyle::SteadyBar);
     let _ = editor.render(&mut stderr);
+
+    // Track double Ctrl+C: first clears input / shows hint, second quits.
+    let mut last_ctrl_c: Option<std::time::Instant> = None;
 
     loop {
         // Drain all pending output signals.
@@ -616,40 +643,63 @@ pub fn run_input_thread(
             };
 
             match ev {
-                Event::Key(key) => match editor.handle_key(key) {
-                    InputAction::Submit(line) => {
-                        if box_visible {
-                            let _ = editor.clear_box(&mut stderr);
+                Event::Key(key) => {
+                    // Reset double-tap timer on any non-Ctrl+C key.
+                    let is_ctrl_c = key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL);
+                    if !is_ctrl_c {
+                        last_ctrl_c = None;
+                    }
+
+                    match editor.handle_key(key) {
+                        InputAction::Submit(line) => {
+                            if box_visible {
+                                let _ = editor.clear_box(&mut stderr);
+                            }
+                            let _ = write!(stderr, "\x1b[1myou>\x1b[0m {line}\r\n");
+                            let _ = editor.render(&mut stderr);
+                            box_visible = true;
+                            if line_tx.blocking_send(InputResult::Line(line)).is_err() {
+                                break;
+                            }
                         }
-                        let _ = write!(stderr, "\x1b[1myou>\x1b[0m {line}\r\n");
-                        let _ = editor.render(&mut stderr);
-                        box_visible = true;
-                        if line_tx.blocking_send(InputResult::Line(line)).is_err() {
+                        InputAction::Interrupt => {
+                            // Double Ctrl+C within 1 second: actually quit.
+                            let now = std::time::Instant::now();
+                            if let Some(prev) = last_ctrl_c {
+                                if now.duration_since(prev) < std::time::Duration::from_secs(1) {
+                                    if box_visible {
+                                        let _ = editor.clear_box(&mut stderr);
+                                    }
+                                    let _ = line_tx.blocking_send(InputResult::Interrupt);
+                                    break;
+                                }
+                            }
+                            // First Ctrl+C on empty input: show hint.
+                            last_ctrl_c = Some(now);
+                            if box_visible {
+                                let _ = editor.clear_box(&mut stderr);
+                            }
+                            let _ = write!(
+                                stderr,
+                                "\x1b[2mPress Ctrl+C again to quit\x1b[0m\r\n"
+                            );
+                            let _ = editor.render(&mut stderr);
+                            box_visible = true;
+                        }
+                        InputAction::Eof => {
+                            if box_visible {
+                                let _ = editor.clear_box(&mut stderr);
+                            }
+                            let _ = line_tx.blocking_send(InputResult::Eof);
                             break;
                         }
-                    }
-                    InputAction::Interrupt => {
-                        if box_visible {
-                            let _ = editor.clear_box(&mut stderr);
+                        InputAction::Redraw if box_visible => {
+                            let _ = editor.render(&mut stderr);
                         }
-                        if line_tx.blocking_send(InputResult::Interrupt).is_err() {
-                            break;
-                        }
-                        let _ = editor.render(&mut stderr);
-                        box_visible = true;
+                        _ => {}
                     }
-                    InputAction::Eof => {
-                        if box_visible {
-                            let _ = editor.clear_box(&mut stderr);
-                        }
-                        let _ = line_tx.blocking_send(InputResult::Eof);
-                        break;
-                    }
-                    InputAction::Redraw if box_visible => {
-                        let _ = editor.render(&mut stderr);
-                    }
-                    _ => {}
-                },
+                }
                 Event::Resize(w, _h) => {
                     editor.term_width = w;
                     if box_visible {
@@ -661,8 +711,7 @@ pub fn run_input_thread(
         }
     }
 
-    let _ = terminal::disable_raw_mode();
-    let _ = stderr.execute(cursor::SetCursorStyle::DefaultUserShape);
+    // _guard drops here, restoring terminal.
 }
 
 /// Fallback for environments that don't support raw mode.
