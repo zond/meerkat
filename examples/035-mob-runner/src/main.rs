@@ -130,19 +130,7 @@ fn open_persistent_service(
     Ok(Arc::new(service))
 }
 
-#[tokio::main]
-async fn main() -> color_eyre::Result<()> {
-    color_eyre::install()?;
-
-    // Initialize tracing (controlled via RUST_LOG).
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
+async fn run() -> color_eyre::Result<()> {
     let (model_override, state_dir_path) = parse_args();
 
     // Resolve model.
@@ -192,4 +180,30 @@ async fn main() -> color_eyre::Result<()> {
     }
 
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> color_eyre::Result<()> {
+    color_eyre::install()?;
+
+    // Initialize tracing (controlled via RUST_LOG).
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    let result = run().await;
+
+    // Always restore terminal before printing errors. disable_raw_mode is
+    // idempotent — harmless if raw mode was never enabled or already disabled.
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = crossterm::execute!(
+        std::io::stderr(),
+        crossterm::cursor::SetCursorStyle::DefaultUserShape
+    );
+
+    result
 }

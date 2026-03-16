@@ -14,7 +14,7 @@
 
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, EnableBracketedPaste, DisableBracketedPaste},
     style,
     terminal::{self, ClearType},
     ExecutableCommand, QueueableCommand,
@@ -261,6 +261,17 @@ impl InputEditor {
 
             _ => InputAction::Noop,
         }
+    }
+
+    /// Insert pasted text at the cursor position.
+    /// Newlines are replaced with spaces since this is a single-line editor.
+    pub fn insert_paste(&mut self, text: &str) {
+        let cleaned: String = text
+            .chars()
+            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+            .collect();
+        self.buf.insert_str(self.cursor, &cleaned);
+        self.cursor += cleaned.len();
     }
 
     /// Compute the cursor's logical row inside the box content area.
@@ -593,6 +604,7 @@ struct RawModeGuard;
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        let _ = std::io::stderr().execute(DisableBracketedPaste);
         let _ = terminal::disable_raw_mode();
         let _ = std::io::stderr().execute(cursor::SetCursorStyle::DefaultUserShape);
     }
@@ -620,6 +632,7 @@ pub fn run_input_thread(
     // Ensures terminal is restored even on panic or early return.
     let _guard = RawModeGuard;
 
+    let _ = stderr.execute(EnableBracketedPaste);
     let _ = stderr.execute(cursor::SetCursorStyle::SteadyBar);
     let _ = editor.render(&mut stderr);
 
@@ -711,6 +724,12 @@ pub fn run_input_thread(
                             let _ = editor.render(&mut stderr);
                         }
                         _ => {}
+                    }
+                }
+                Event::Paste(text) => {
+                    editor.insert_paste(&text);
+                    if box_visible {
+                        let _ = editor.render(&mut stderr);
                     }
                 }
                 Event::Resize(w, _h) => {

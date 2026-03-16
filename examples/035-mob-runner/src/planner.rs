@@ -385,6 +385,9 @@ pub async fn run_planner(
     )
     .wrap_err("failed to save planner session ID")?;
 
+    let mut session_id = session_id;
+    let mut first_turn = true;
+
     // Interactive loop.
     loop {
         let input = match input_rx.recv().await {
@@ -405,7 +408,25 @@ pub async fn run_planner(
             continue;
         }
 
-        let text = run_turn_streaming(&session_service, &session_id, input, &output_tx).await?;
+        // On the first turn, if the session is stale (e.g. redb was deleted),
+        // start_turn will fail. Recover by creating a fresh session.
+        let text = match run_turn_streaming(&session_service, &session_id, input.clone(), &output_tx).await {
+            Ok(text) => text,
+            Err(e) if first_turn => {
+                input::with_output(&output_tx, || {
+                    raw_eprintln!("\x1b[33m[Session error: {e:#}]\x1b[0m");
+                    raw_eprintln!("\x1b[2m[Starting fresh planner session...]\x1b[0m");
+                });
+                session_id = create_planner_session(&session_service, model).await?;
+                std::fs::write(
+                    state.planner_session_id(),
+                    serde_json::to_string(&session_id)?,
+                ).wrap_err("failed to save planner session ID")?;
+                run_turn_streaming(&session_service, &session_id, input, &output_tx).await?
+            }
+            Err(e) => return Err(e),
+        };
+        first_turn = false;
 
         // Check for a TOML mob definition. On validation failure, feed the error
         // back to the planner as a correction turn so it can self-correct.
