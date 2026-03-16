@@ -2,6 +2,7 @@
 //!
 //! Routes user input to the orchestrator and streams events from all agents.
 
+use crate::raw_eprintln;
 use crate::input::{self, InputResult, OutputSignal};
 use crate::render::EventRenderer;
 use crate::state::StateDir;
@@ -31,14 +32,14 @@ pub async fn run_mob_loop(
 
     // Print header.
     input::with_output(&output_tx, || {
-        eprintln!("\x1b[1m=== Mob Runner -- Execution Phase ===\x1b[0m");
-        eprintln!();
+        raw_eprintln!("\x1b[1m=== Mob Runner -- Execution Phase ===\x1b[0m");
+        raw_eprintln!();
         if let Some(ref id) = orch_id {
-            eprintln!("Orchestrator: \x1b[36m{id}\x1b[0m");
+            raw_eprintln!("Orchestrator: \x1b[36m{id}\x1b[0m");
         }
-        eprintln!("\x1b[2mCommands: /status, /members, /tasks, /send <agent> <msg>, /quit\x1b[0m");
-        eprintln!("\x1b[2mType a message to send to the orchestrator.\x1b[0m");
-        eprintln!();
+        raw_eprintln!("\x1b[2mCommands: /status, /members, /tasks, /send <agent> <msg>, /quit\x1b[0m");
+        raw_eprintln!("\x1b[2mType a message to send to the orchestrator.\x1b[0m");
+        raw_eprintln!();
     });
 
     let mut router_handle = handle.subscribe_mob_events();
@@ -57,7 +58,7 @@ pub async fn run_mob_loop(
             result = input_rx.recv(), if input_open => {
                 let Some(input_result) = result else {
                     input_open = false;
-                    input::with_output(&output_tx, || eprintln!("\x1b[2m[input closed]\x1b[0m"));
+                    input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[input closed]\x1b[0m"));
                     continue;
                 };
                 match input_result {
@@ -67,7 +68,7 @@ pub async fn run_mob_loop(
                         }
 
                         if line == "/quit" {
-                            input::with_output(&output_tx, || eprintln!("\x1b[2m[Shutting down mob]\x1b[0m"));
+                            input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[Shutting down mob]\x1b[0m"));
                             break;
                         }
 
@@ -75,16 +76,16 @@ pub async fn run_mob_loop(
                             let status = handle.status();
                             let members = handle.list_members().await;
                             let msg = format!("[Status: {status:?}, Members: {}]", members.len());
-                            input::with_output(&output_tx, || eprintln!("\x1b[2m{msg}\x1b[0m"));
+                            input::with_output(&output_tx, || raw_eprintln!("\x1b[2m{msg}\x1b[0m"));
                             continue;
                         }
 
                         if line == "/members" {
                             let members = handle.list_members().await;
                             input::with_output(&output_tx, || {
-                                eprintln!("\x1b[2m[Members ({}):]", members.len());
+                                raw_eprintln!("\x1b[2m[Members ({}):]", members.len());
                                 for m in &members {
-                                    eprintln!(
+                                    raw_eprintln!(
                                         "  {} (profile: {}, state: {:?}, wired_to: {:?})",
                                         m.meerkat_id, m.profile, m.state, m.wired_to
                                     );
@@ -101,20 +102,20 @@ pub async fn run_mob_loop(
                                 for event in &events {
                                     match &event.kind {
                                         meerkat_mob::MobEventKind::TaskCreated { task_id, subject, .. } => {
-                                            eprintln!("  \x1b[33m[{task_id}]\x1b[0m {subject}");
+                                            raw_eprintln!("  \x1b[33m[{task_id}]\x1b[0m {subject}");
                                             task_count += 1;
                                         }
                                         meerkat_mob::MobEventKind::TaskUpdated { task_id, status, owner } => {
                                             let owner_str = owner
                                                 .as_ref()
                                                 .map_or("unassigned", |o| o.as_ref());
-                                            eprintln!("  \x1b[33m[{task_id}]\x1b[0m status={status:?} owner={owner_str}");
+                                            raw_eprintln!("  \x1b[33m[{task_id}]\x1b[0m status={status:?} owner={owner_str}");
                                         }
                                         _ => {}
                                     }
                                 }
                                 if task_count == 0 {
-                                    eprintln!("\x1b[2m[No tasks yet]\x1b[0m");
+                                    raw_eprintln!("\x1b[2m[No tasks yet]\x1b[0m");
                                 }
                             });
                             continue;
@@ -123,14 +124,14 @@ pub async fn run_mob_loop(
                         if let Some(rest) = line.strip_prefix("/send ") {
                             let mut parts = rest.splitn(2, ' ');
                             let (Some(target_str), Some(msg_str)) = (parts.next(), parts.next()) else {
-                                input::with_output(&output_tx, || eprintln!("\x1b[2m[Usage: /send <agent> <message>]\x1b[0m"));
+                                input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[Usage: /send <agent> <message>]\x1b[0m"));
                                 continue;
                             };
                             let target = MeerkatId::from(target_str);
                             let msg = msg_str.to_string();
                             match handle.send_message(target.clone(), msg).await {
-                                Ok(_) => input::with_output(&output_tx, || eprintln!("\x1b[2m[Message sent to {target}]\x1b[0m")),
-                                Err(e) => input::with_output(&output_tx, || eprintln!("\x1b[2m[Failed to send to {target}: {e}]\x1b[0m")),
+                                Ok(_) => input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[Message sent to {target}]\x1b[0m")),
+                                Err(e) => input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[Failed to send to {target}: {e}]\x1b[0m")),
                             }
                             continue;
                         }
@@ -138,19 +139,19 @@ pub async fn run_mob_loop(
                         // Default: send to orchestrator.
                         if let Some(ref orch) = orch_id {
                             if let Err(e) = handle.send_message(orch.clone(), line).await {
-                                input::with_output(&output_tx, || eprintln!("\x1b[2m[Failed to send to orchestrator: {e}]\x1b[0m"));
+                                input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[Failed to send to orchestrator: {e}]\x1b[0m"));
                             }
                         } else {
-                            input::with_output(&output_tx, || eprintln!("\x1b[2m[No orchestrator defined -- use /send <agent> <msg>]\x1b[0m"));
+                            input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[No orchestrator defined -- use /send <agent> <msg>]\x1b[0m"));
                         }
                     }
                     InputResult::Interrupt => {
-                        input::with_output(&output_tx, || eprintln!("\x1b[2m[Ctrl+C -- shutting down]\x1b[0m"));
+                        input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[Ctrl+C -- shutting down]\x1b[0m"));
                         break;
                     }
                     InputResult::Eof => {
                         input_open = false;
-                        input::with_output(&output_tx, || eprintln!("\x1b[2m[input closed]\x1b[0m"));
+                        input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[input closed]\x1b[0m"));
                     }
                 }
             }
@@ -166,7 +167,7 @@ pub async fn run_mob_loop(
 
             _ = tokio::signal::ctrl_c() => {
                 input::hide_box(&output_tx);
-                eprintln!("\n\x1b[2m[Ctrl+C -- shutting down]\x1b[0m");
+                raw_eprintln!("\r\n\x1b[2m[Ctrl+C -- shutting down]\x1b[0m");
                 break;
             }
         }
@@ -175,11 +176,11 @@ pub async fn run_mob_loop(
     // Clean shutdown — hide box permanently for final messages.
     input::hide_box(&output_tx);
     router_handle.cancel();
-    eprintln!("\x1b[2m[Retiring all agents...]\x1b[0m");
+    raw_eprintln!("\x1b[2m[Retiring all agents...]\x1b[0m");
     if let Err(e) = handle.retire_all().await {
-        eprintln!("\x1b[33m[Warning: failed to retire agents: {e}]\x1b[0m");
+        raw_eprintln!("\x1b[33m[Warning: failed to retire agents: {e}]\x1b[0m");
     }
-    eprintln!(
+    raw_eprintln!(
         "\x1b[2m[Mob runner stopped. State saved in {}]\x1b[0m",
         state.root().display()
     );

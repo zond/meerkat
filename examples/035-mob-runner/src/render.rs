@@ -44,9 +44,9 @@ impl EventRenderer {
                 .is_none_or(|id| id != meerkat_id);
             self.current_source = Some(meerkat_id.clone());
 
-            let prefix = if source_changed { "\n" } else { "" };
+            let prefix = if source_changed { "\r\n" } else { "" };
             self.emit(format!(
-                "{prefix}\x1b[36m[{profile}/{meerkat_id}]\x1b[0m {text}\n"
+                "{prefix}\x1b[36m[{profile}/{meerkat_id}]\x1b[0m {text}\r\n"
             ));
         }
     }
@@ -70,28 +70,28 @@ impl EventRenderer {
                 self.flush_buffer(source, profile);
                 self.current_source = Some(source.clone());
                 self.emit(format!(
-                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mturn started\x1b[0m\n"
+                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mturn started\x1b[0m\r\n"
                 ));
             }
             AgentEvent::RunCompleted { .. } => {
                 self.flush_buffer(source, profile);
                 self.current_source = Some(source.clone());
                 self.emit(format!(
-                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mturn completed\x1b[0m\n\x1b[2m---\x1b[0m\n"
+                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mturn completed\x1b[0m\r\n\x1b[2m---\x1b[0m\r\n"
                 ));
             }
             AgentEvent::RunFailed { error, .. } => {
                 self.flush_buffer(source, profile);
                 self.current_source = Some(source.clone());
                 self.emit(format!(
-                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[31mFAILED: {error}\x1b[0m\n"
+                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[31mFAILED: {error}\x1b[0m\r\n"
                 ));
             }
             AgentEvent::ToolCallRequested { name, .. } => {
                 self.flush_buffer(source, profile);
                 self.current_source = Some(source.clone());
                 self.emit(format!(
-                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[33mtool: {name}\x1b[0m\n"
+                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[33mtool: {name}\x1b[0m\r\n"
                 ));
             }
             AgentEvent::ToolExecutionCompleted {
@@ -107,21 +107,21 @@ impl EventRenderer {
                 };
                 self.current_source = Some(source.clone());
                 self.emit(format!(
-                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mtool done:\x1b[0m {name} ({status}, {duration_ms}ms)\n"
+                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mtool done:\x1b[0m {name} ({status}, {duration_ms}ms)\r\n"
                 ));
             }
             AgentEvent::TurnStarted { turn_number } => {
                 self.flush_buffer(source, profile);
                 self.current_source = Some(source.clone());
                 self.emit(format!(
-                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mLLM turn {turn_number}\x1b[0m\n"
+                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mLLM turn {turn_number}\x1b[0m\r\n"
                 ));
             }
             AgentEvent::TurnCompleted { usage, .. } => {
                 let total = usage.input_tokens + usage.output_tokens;
                 self.current_source = Some(source.clone());
                 self.emit(format!(
-                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mturn done ({total} tokens)\x1b[0m\n"
+                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mturn done ({total} tokens)\x1b[0m\r\n"
                 ));
             }
             _ => {}

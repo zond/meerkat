@@ -12,6 +12,7 @@ use std::sync::{Arc, LazyLock};
 use std::sync::mpsc as std_mpsc;
 use tokio::sync::mpsc;
 
+use crate::raw_eprintln;
 use crate::input::{self, InputResult, OutputSignal};
 use crate::state::StateDir;
 
@@ -219,7 +220,7 @@ async fn run_turn_streaming(
             }
             AgentEvent::TextComplete { content } => {
                 if in_text {
-                    eprintln!();
+                    raw_eprintln!();
                     in_text = false;
                 }
                 if full_text.is_empty() {
@@ -228,10 +229,10 @@ async fn run_turn_streaming(
             }
             AgentEvent::ToolCallRequested { name, .. } => {
                 if in_text {
-                    eprintln!();
+                    raw_eprintln!();
                     in_text = false;
                 }
-                eprintln!("  \x1b[33m[tool: {name}]\x1b[0m");
+                raw_eprintln!("  \x1b[33m[tool: {name}]\x1b[0m");
             }
             AgentEvent::ToolExecutionCompleted {
                 name,
@@ -240,17 +241,17 @@ async fn run_turn_streaming(
                 ..
             } => {
                 let status = if *is_error { "\x1b[31mERR\x1b[0m" } else { "\x1b[32mok\x1b[0m" };
-                eprintln!("  \x1b[2m[tool done: {name} ({status}\x1b[2m, {duration_ms}ms)]\x1b[0m");
+                raw_eprintln!("  \x1b[2m[tool done: {name} ({status}\x1b[2m, {duration_ms}ms)]\x1b[0m");
             }
             AgentEvent::RunFailed { error, .. } => {
-                eprintln!("\n\x1b[31m[ERROR: {error}]\x1b[0m");
+                raw_eprintln!("\r\n\x1b[31m[ERROR: {error}]\x1b[0m");
             }
             _ => {}
         }
     }
 
     if in_text {
-        eprintln!();
+        raw_eprintln!();
     }
 
     // Re-show the input box.
@@ -282,10 +283,10 @@ fn validate_mob_toml(toml_block: &str) -> Result<String, String> {
                 .filter(|d| d.severity == meerkat_mob::DiagnosticSeverity::Warning)
                 .collect();
             for w in &warnings {
-                eprintln!("  WARNING: {}", w.message);
+                raw_eprintln!("  WARNING: {}", w.message);
             }
             if errors.is_empty() {
-                eprintln!("\n[Valid mob definition detected — deploying '{}']", def.id);
+                raw_eprintln!("\n[Valid mob definition detected — deploying '{}']", def.id);
                 Ok(toml_block.to_string())
             } else {
                 let mut feedback = String::from(
@@ -293,14 +294,14 @@ fn validate_mob_toml(toml_block: &str) -> Result<String, String> {
                      Please fix and output a corrected ```toml block:\n",
                 );
                 for d in &errors {
-                    eprintln!("  ERROR: {}", d.message);
+                    raw_eprintln!("  ERROR: {}", d.message);
                     feedback.push_str(&format!("- {}\n", d.message));
                 }
                 Err(feedback)
             }
         }
         Err(e) => {
-            eprintln!("\n[TOML parse error: {e}]");
+            raw_eprintln!("\n[TOML parse error: {e}]");
             Err(format!(
                 "[SYSTEM] Your TOML mob definition failed to parse: {e}\n\
                  Please fix and output a corrected ```toml block."
@@ -348,12 +349,12 @@ pub async fn run_planner(
     output_tx: std_mpsc::Sender<OutputSignal>,
 ) -> color_eyre::Result<(String, mpsc::Receiver<InputResult>, std_mpsc::Sender<OutputSignal>)> {
     input::with_output(&output_tx, || {
-        eprintln!("\x1b[1m=== Mob Runner -- Planning Phase ===\x1b[0m");
-        eprintln!();
-        eprintln!("Chat with the planner to design your mob. The planner can explore");
-        eprintln!("the codebase, ask questions, and help you design a team of agents.");
-        eprintln!("When the plan is ready, it will output a mob definition.");
-        eprintln!();
+        raw_eprintln!("\x1b[1m=== Mob Runner -- Planning Phase ===\x1b[0m");
+        raw_eprintln!();
+        raw_eprintln!("Chat with the planner to design your mob. The planner can explore");
+        raw_eprintln!("the codebase, ask questions, and help you design a team of agents.");
+        raw_eprintln!("When the plan is ready, it will output a mob definition.");
+        raw_eprintln!();
     });
 
     // Resume an existing planner session or create a new one.
@@ -365,11 +366,11 @@ pub async fn run_planner(
         // Verify the session still exists in the store.
         match session_service.read(&id).await {
             Ok(_) => {
-                eprintln!("[Resuming planner session {id}]");
+                raw_eprintln!("[Resuming planner session {id}]");
                 id
             }
             Err(_) => {
-                eprintln!("[Previous planner session not found, starting fresh]");
+                raw_eprintln!("[Previous planner session not found, starting fresh]");
                 create_planner_session(&session_service, model).await?
             }
         }
@@ -390,12 +391,12 @@ pub async fn run_planner(
             Some(InputResult::Line(line)) => line,
             Some(InputResult::Interrupt) => {
                 input::hide_box(&output_tx);
-                eprintln!("\n\x1b[2m[Interrupted -- exiting]\x1b[0m");
+                raw_eprintln!("\r\n\x1b[2m[Interrupted -- exiting]\x1b[0m");
                 break;
             }
             Some(InputResult::Eof) | None => {
                 input::hide_box(&output_tx);
-                eprintln!("\n\x1b[2m[EOF -- exiting]\x1b[0m");
+                raw_eprintln!("\r\n\x1b[2m[EOF -- exiting]\x1b[0m");
                 break;
             }
         };
@@ -413,7 +414,7 @@ pub async fn run_planner(
                 Ok(valid_toml) => return Ok((valid_toml, input_rx, output_tx)),
                 Err(feedback) => {
                     input::with_output(&output_tx, || {
-                        eprintln!("\x1b[2m[Feeding errors back to planner for self-correction]\x1b[0m");
+                        raw_eprintln!("\x1b[2m[Feeding errors back to planner for self-correction]\x1b[0m");
                     });
                     let _text = run_turn_streaming(&session_service, &session_id, feedback, &output_tx).await?;
 
@@ -423,7 +424,7 @@ pub async fn run_planner(
                         }
                     }
                     input::with_output(&output_tx, || {
-                        eprintln!("\x1b[2m[Still invalid -- continue chatting to fix]\x1b[0m");
+                        raw_eprintln!("\x1b[2m[Still invalid -- continue chatting to fix]\x1b[0m");
                     });
                 }
             }

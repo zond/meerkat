@@ -55,6 +55,19 @@ pub enum OutputSignal {
     UpdateLabel(String),
 }
 
+/// Print a line to stderr with `\r\n` line endings, which is required in raw mode.
+/// Regular `eprintln!` only outputs `\n` (LF), which doesn't return the cursor
+/// to column 0 in raw terminal mode.
+#[macro_export]
+macro_rules! raw_eprintln {
+    () => {
+        eprint!("\r\n")
+    };
+    ($($arg:tt)*) => {
+        eprint!("{}\r\n", format_args!($($arg)*))
+    };
+}
+
 /// Hide the input box and block until the input thread confirms it is cleared.
 pub fn hide_box(output_tx: &std_mpsc::Sender<OutputSignal>) {
     let (ack_tx, ack_rx) = std_mpsc::sync_channel(0);
@@ -254,7 +267,7 @@ impl InputEditor {
     pub fn render(&mut self, out: &mut impl Write) -> std::io::Result<()> {
         self.term_width = terminal::size().unwrap_or((80, 24)).0;
 
-        let box_width = self.term_width.min(120) as usize;
+        let box_width = self.term_width as usize;
         if box_width < 10 {
             write!(out, "\r{} {}", self.label, self.buf)?;
             out.flush()?;
@@ -347,7 +360,7 @@ impl InputEditor {
             return Ok(());
         }
 
-        let inner_width = (self.term_width.min(120) as usize).saturating_sub(4);
+        let inner_width = (self.term_width as usize).saturating_sub(4);
         let cursor_row = self.cursor_content_row(inner_width);
 
         // Move from cursor position to top border, then clear each line downward.
@@ -608,7 +621,7 @@ pub fn run_input_thread(
                         if box_visible {
                             let _ = editor.clear_box(&mut stderr);
                         }
-                        let _ = writeln!(stderr, "\x1b[1myou>\x1b[0m {line}");
+                        let _ = write!(stderr, "\x1b[1myou>\x1b[0m {line}\r\n");
                         let _ = editor.render(&mut stderr);
                         box_visible = true;
                         if line_tx.blocking_send(InputResult::Line(line)).is_err() {
