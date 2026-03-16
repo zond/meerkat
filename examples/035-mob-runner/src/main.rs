@@ -27,6 +27,7 @@
 //! ```
 
 mod deploy;
+mod input;
 mod planner;
 mod render;
 mod state;
@@ -36,13 +37,13 @@ mod state;
 mod event_loop;
 
 use color_eyre::eyre::{self, WrapErr};
+use input::{InputResult, OutputSignal};
 use meerkat::{
     AgentFactory, Config, PersistenceBundle, RedbSessionStore, SessionStore,
     build_persistent_service,
 };
 use meerkat_mob::MobDefinition;
 use state::StateDir;
-use std::io::{BufRead, Write};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -86,29 +87,17 @@ fn parse_args() -> (Option<String>, String) {
     (model, state_dir)
 }
 
-/// Spawn a single stdin reader thread. The returned receiver is shared
-/// across both the planning and execution phases, avoiding multiple
-/// threads competing for stdin.
-fn spawn_stdin_reader() -> mpsc::Receiver<String> {
-    let (stdin_tx, stdin_rx) = mpsc::channel::<String>(16);
+/// Spawn the rich input editor thread. Returns:
+/// - `mpsc::Receiver<InputResult>` for receiving user input events
+/// - `std::sync::mpsc::Sender<OutputSignal>` for coordinating output with the box
+fn spawn_input_editor(label: &str) -> (mpsc::Receiver<InputResult>, std::sync::mpsc::Sender<OutputSignal>) {
+    let (line_tx, line_rx) = mpsc::channel::<InputResult>(16);
+    let (output_tx, output_rx) = std::sync::mpsc::channel::<OutputSignal>();
+    let label = label.to_string();
     std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        let mut line = String::new();
-        loop {
-            line.clear();
-            eprint!("you> ");
-            let _ = std::io::stderr().flush();
-            match stdin.lock().read_line(&mut line) {
-                Ok(0) | Err(_) => break, // EOF or error
-                Ok(_) => {
-                    if stdin_tx.blocking_send(line.trim().to_string()).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
+        input::run_input_thread(label, line_tx, output_rx);
     });
-    stdin_rx
+    (line_rx, output_tx)
 }
 
 /// Open a persistent session service backed by redb.
@@ -172,22 +161,26 @@ async fn main() -> color_eyre::Result<()> {
     // Open persistent session service (sessions survive restarts).
     let session_service = open_persistent_service(&state)?;
 
-    // Single stdin reader shared across both phases.
-    let stdin_rx = spawn_stdin_reader();
+    // Rich input editor shared across both phases.
+    let initial_label = if state.has_mob() { "mob" } else { "planner" };
+    let (input_rx, output_tx) = spawn_input_editor(initial_label);
 
     if state.has_mob() {
         // Resume existing mob.
         let handle = deploy::resume_mob(session_service, &state).await?;
-        event_loop::run_mob_loop(handle, &state, stdin_rx).await?;
+        event_loop::run_mob_loop(handle, &state, input_rx, output_tx).await?;
     } else {
         // Planning phase.
-        let (mob_toml, stdin_rx) = planner::run_planner(
-            session_service.clone(), &model, &state, stdin_rx,
+        let (mob_toml, input_rx, output_tx) = planner::run_planner(
+            session_service.clone(), &model, &state, input_rx, output_tx,
         ).await?;
 
         // Save the definition for resume.
         std::fs::write(state.mob_toml(), &mob_toml)
             .wrap_err("failed to save mob definition")?;
+
+        // Update input label for execution phase.
+        let _ = output_tx.send(OutputSignal::UpdateLabel("mob".to_string()));
 
         // Parse and deploy.
         let definition = MobDefinition::from_toml(&mob_toml)
@@ -195,7 +188,7 @@ async fn main() -> color_eyre::Result<()> {
         let handle = deploy::deploy_mob(definition, session_service, &state).await?;
 
         // Execution phase.
-        event_loop::run_mob_loop(handle, &state, stdin_rx).await?;
+        event_loop::run_mob_loop(handle, &state, input_rx, output_tx).await?;
     }
 
     Ok(())

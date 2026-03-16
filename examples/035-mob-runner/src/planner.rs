@@ -9,8 +9,10 @@ use meerkat_core::event::{AgentEvent, EventEnvelope};
 use meerkat_core::service::{CreateSessionRequest, InitialTurnPolicy, StartTurnRequest};
 use meerkat_core::types::SessionId;
 use std::sync::{Arc, LazyLock};
+use std::sync::mpsc as std_mpsc;
 use tokio::sync::mpsc;
 
+use crate::input::{self, InputResult, OutputSignal};
 use crate::state::StateDir;
 
 type SessionSvc = dyn SessionService;
@@ -171,10 +173,13 @@ fn extract_toml_block(text: &str) -> Option<String> {
 
 /// Run a turn on the planner session and stream text events to stderr.
 /// Returns the accumulated text from the turn.
+///
+/// Hides the input box during output, then re-shows it when done.
 async fn run_turn_streaming(
     session_service: &Arc<SessionSvc>,
     session_id: &SessionId,
     prompt: String,
+    output_tx: &std_mpsc::Sender<OutputSignal>,
 ) -> color_eyre::Result<String> {
     let (turn_tx, mut turn_rx) = mpsc::channel::<EventEnvelope<AgentEvent>>(256);
 
@@ -197,13 +202,16 @@ async fn run_turn_streaming(
         })
     };
 
+    // Hide the input box while streaming output.
+    input::hide_box(output_tx);
+
     let mut full_text = String::new();
     let mut in_text = false;
     while let Some(envelope) = turn_rx.recv().await {
         match &envelope.payload {
             AgentEvent::TextDelta { delta } => {
                 if !in_text {
-                    eprint!("planner> ");
+                    eprint!("\x1b[36mplanner>\x1b[0m ");
                     in_text = true;
                 }
                 eprint!("{delta}");
@@ -223,7 +231,7 @@ async fn run_turn_streaming(
                     eprintln!();
                     in_text = false;
                 }
-                eprintln!("  [tool: {name}]");
+                eprintln!("  \x1b[33m[tool: {name}]\x1b[0m");
             }
             AgentEvent::ToolExecutionCompleted {
                 name,
@@ -231,11 +239,11 @@ async fn run_turn_streaming(
                 duration_ms,
                 ..
             } => {
-                let status = if *is_error { "ERR" } else { "ok" };
-                eprintln!("  [tool done: {name} ({status}, {duration_ms}ms)]");
+                let status = if *is_error { "\x1b[31mERR\x1b[0m" } else { "\x1b[32mok\x1b[0m" };
+                eprintln!("  \x1b[2m[tool done: {name} ({status}\x1b[2m, {duration_ms}ms)]\x1b[0m");
             }
             AgentEvent::RunFailed { error, .. } => {
-                eprintln!("\n[ERROR: {error}]");
+                eprintln!("\n\x1b[31m[ERROR: {error}]\x1b[0m");
             }
             _ => {}
         }
@@ -244,6 +252,9 @@ async fn run_turn_streaming(
     if in_text {
         eprintln!();
     }
+
+    // Re-show the input box.
+    let _ = output_tx.send(OutputSignal::ShowBox);
 
     let turn_result = turn_handle
         .await
@@ -323,8 +334,8 @@ async fn create_planner_session(
 
 /// Run the interactive planning phase.
 ///
-/// Accepts a shared stdin receiver (spawned once in main). Returns the TOML
-/// mob definition and the stdin receiver for reuse by the execution phase.
+/// Uses the rich input editor. Returns the TOML mob definition and the
+/// input channels for reuse by the execution phase.
 ///
 /// If a planner session ID file exists from a previous run, the conversation
 /// is resumed rather than starting fresh (the session data is in the persistent
@@ -333,16 +344,17 @@ pub async fn run_planner(
     session_service: Arc<SessionSvc>,
     model: &str,
     state: &StateDir,
-    mut stdin_rx: mpsc::Receiver<String>,
-) -> color_eyre::Result<(String, mpsc::Receiver<String>)> {
-    eprintln!("=== Mob Runner — Planning Phase ===");
-    eprintln!();
-    eprintln!("Chat with the planner to design your mob. The planner can explore");
-    eprintln!("the codebase, ask questions, and help you design a team of agents.");
-    eprintln!("When the plan is ready, it will output a mob definition.");
-    eprintln!();
-    eprintln!("Type your messages and press Enter. Ctrl+C to quit.");
-    eprintln!();
+    mut input_rx: mpsc::Receiver<InputResult>,
+    output_tx: std_mpsc::Sender<OutputSignal>,
+) -> color_eyre::Result<(String, mpsc::Receiver<InputResult>, std_mpsc::Sender<OutputSignal>)> {
+    input::with_output(&output_tx, || {
+        eprintln!("\x1b[1m=== Mob Runner -- Planning Phase ===\x1b[0m");
+        eprintln!();
+        eprintln!("Chat with the planner to design your mob. The planner can explore");
+        eprintln!("the codebase, ask questions, and help you design a team of agents.");
+        eprintln!("When the plan is ready, it will output a mob definition.");
+        eprintln!();
+    });
 
     // Resume an existing planner session or create a new one.
     let session_id = if state.has_planner_session() {
@@ -374,10 +386,16 @@ pub async fn run_planner(
 
     // Interactive loop.
     loop {
-        let input = match stdin_rx.recv().await {
-            Some(line) => line,
-            None => {
-                eprintln!("\n[EOF — exiting]");
+        let input = match input_rx.recv().await {
+            Some(InputResult::Line(line)) => line,
+            Some(InputResult::Interrupt) => {
+                input::hide_box(&output_tx);
+                eprintln!("\n\x1b[2m[Interrupted -- exiting]\x1b[0m");
+                break;
+            }
+            Some(InputResult::Eof) | None => {
+                input::hide_box(&output_tx);
+                eprintln!("\n\x1b[2m[EOF -- exiting]\x1b[0m");
                 break;
             }
         };
@@ -386,30 +404,30 @@ pub async fn run_planner(
             continue;
         }
 
-        eprintln!();
-        let mut text = run_turn_streaming(&session_service, &session_id, input).await?;
+        let text = run_turn_streaming(&session_service, &session_id, input, &output_tx).await?;
 
         // Check for a TOML mob definition. On validation failure, feed the error
         // back to the planner as a correction turn so it can self-correct.
         if let Some(toml_block) = extract_toml_block(&text) {
             match validate_mob_toml(&toml_block) {
-                Ok(valid_toml) => return Ok((valid_toml, stdin_rx)),
+                Ok(valid_toml) => return Ok((valid_toml, input_rx, output_tx)),
                 Err(feedback) => {
-                    eprintln!("[Feeding errors back to planner for self-correction]");
-                    text = run_turn_streaming(&session_service, &session_id, feedback).await?;
+                    input::with_output(&output_tx, || {
+                        eprintln!("\x1b[2m[Feeding errors back to planner for self-correction]\x1b[0m");
+                    });
+                    let _text = run_turn_streaming(&session_service, &session_id, feedback, &output_tx).await?;
 
-                    // Check if the correction produced a valid definition.
-                    if let Some(fixed_toml) = extract_toml_block(&text) {
+                    if let Some(fixed_toml) = extract_toml_block(&_text) {
                         if let Ok(valid_toml) = validate_mob_toml(&fixed_toml) {
-                            return Ok((valid_toml, stdin_rx));
+                            return Ok((valid_toml, input_rx, output_tx));
                         }
                     }
-                    eprintln!("[Still invalid — continue chatting to fix]");
+                    input::with_output(&output_tx, || {
+                        eprintln!("\x1b[2m[Still invalid -- continue chatting to fix]\x1b[0m");
+                    });
                 }
             }
         }
-
-        eprintln!();
     }
 
     Err(eyre::eyre!("Planning cancelled"))

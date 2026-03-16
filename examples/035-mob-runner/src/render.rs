@@ -3,28 +3,36 @@
 //! Prints attributed agent events from the mob event router to stderr,
 //! tracking the "current speaker" and buffering text per-agent to avoid
 //! character-level interleaving when multiple agents stream simultaneously.
+//!
+//! Coordinates with the input box via `with_output`: hides the box,
+//! writes output, then re-shows it so the box stays at the bottom.
 
+use crate::input::OutputSignal;
 use meerkat_core::event::AgentEvent;
 use meerkat_mob::{AttributedEvent, MeerkatId, ProfileName};
 use std::collections::HashMap;
+use std::sync::mpsc as std_mpsc;
 
 /// Tracks current speaker and buffers text per-agent for coherent output.
 pub struct EventRenderer {
-    /// Text buffer per agent — flushed on TextComplete or non-text events.
     text_buffers: HashMap<MeerkatId, String>,
-    /// Which agent was last printed to stderr (for header changes).
     current_source: Option<MeerkatId>,
+    output_tx: std_mpsc::Sender<OutputSignal>,
 }
 
 impl EventRenderer {
-    pub fn new() -> Self {
+    pub fn new(output_tx: std_mpsc::Sender<OutputSignal>) -> Self {
         Self {
             text_buffers: HashMap::new(),
             current_source: None,
+            output_tx,
         }
     }
 
-    /// Flush the text buffer for a specific agent to stderr.
+    fn emit(&self, msg: String) {
+        crate::input::with_output(&self.output_tx, || eprint!("{msg}"));
+    }
+
     fn flush_buffer(&mut self, meerkat_id: &MeerkatId, profile: &ProfileName) {
         if let Some(text) = self.text_buffers.remove(meerkat_id) {
             if text.is_empty() {
@@ -33,17 +41,16 @@ impl EventRenderer {
             let source_changed = self
                 .current_source
                 .as_ref()
-                .map_or(true, |id| id != meerkat_id);
-            if source_changed {
-                eprintln!();
-                self.current_source = Some(meerkat_id.clone());
-            }
-            eprint!("[{profile}/{meerkat_id}] {text}");
-            eprintln!();
+                .is_none_or(|id| id != meerkat_id);
+            self.current_source = Some(meerkat_id.clone());
+
+            let prefix = if source_changed { "\n" } else { "" };
+            self.emit(format!(
+                "{prefix}\x1b[36m[{profile}/{meerkat_id}]\x1b[0m {text}\n"
+            ));
         }
     }
 
-    /// Render one attributed event. Returns a JSONL line for logging.
     pub fn render(&mut self, event: &AttributedEvent) -> String {
         let source = &event.source;
         let profile = &event.profile;
@@ -51,7 +58,6 @@ impl EventRenderer {
 
         match payload {
             AgentEvent::TextDelta { delta } => {
-                // Buffer text deltas — flushed on TextComplete.
                 self.text_buffers
                     .entry(source.clone())
                     .or_default()
@@ -62,24 +68,31 @@ impl EventRenderer {
             }
             AgentEvent::RunStarted { .. } => {
                 self.flush_buffer(source, profile);
-                self.track_source(source);
-                eprintln!("[{profile}/{source}] turn started");
+                self.current_source = Some(source.clone());
+                self.emit(format!(
+                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mturn started\x1b[0m\n"
+                ));
             }
             AgentEvent::RunCompleted { .. } => {
                 self.flush_buffer(source, profile);
-                self.track_source(source);
-                eprintln!("[{profile}/{source}] turn completed");
-                eprintln!("---");
+                self.current_source = Some(source.clone());
+                self.emit(format!(
+                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mturn completed\x1b[0m\n\x1b[2m---\x1b[0m\n"
+                ));
             }
             AgentEvent::RunFailed { error, .. } => {
                 self.flush_buffer(source, profile);
-                self.track_source(source);
-                eprintln!("[{profile}/{source}] FAILED: {error}");
+                self.current_source = Some(source.clone());
+                self.emit(format!(
+                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[31mFAILED: {error}\x1b[0m\n"
+                ));
             }
             AgentEvent::ToolCallRequested { name, .. } => {
                 self.flush_buffer(source, profile);
-                self.track_source(source);
-                eprintln!("[{profile}/{source}] tool: {name}");
+                self.current_source = Some(source.clone());
+                self.emit(format!(
+                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[33mtool: {name}\x1b[0m\n"
+                ));
             }
             AgentEvent::ToolExecutionCompleted {
                 name,
@@ -87,44 +100,39 @@ impl EventRenderer {
                 duration_ms,
                 ..
             } => {
-                let status = if *is_error { "ERR" } else { "ok" };
-                self.track_source(source);
-                eprintln!(
-                    "[{profile}/{source}] tool done: {name} ({status}, {duration_ms}ms)"
-                );
+                let status = if *is_error {
+                    "\x1b[31mERR\x1b[0m"
+                } else {
+                    "\x1b[32mok\x1b[0m"
+                };
+                self.current_source = Some(source.clone());
+                self.emit(format!(
+                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mtool done:\x1b[0m {name} ({status}, {duration_ms}ms)\n"
+                ));
             }
             AgentEvent::TurnStarted { turn_number } => {
                 self.flush_buffer(source, profile);
-                self.track_source(source);
-                eprintln!("[{profile}/{source}] LLM turn {turn_number}");
+                self.current_source = Some(source.clone());
+                self.emit(format!(
+                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mLLM turn {turn_number}\x1b[0m\n"
+                ));
             }
             AgentEvent::TurnCompleted { usage, .. } => {
                 let total = usage.input_tokens + usage.output_tokens;
-                self.track_source(source);
-                eprintln!("[{profile}/{source}] turn done ({total} tokens)");
+                self.current_source = Some(source.clone());
+                self.emit(format!(
+                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mturn done ({total} tokens)\x1b[0m\n"
+                ));
             }
-            // Skip verbose events
             _ => {}
         }
 
-        // Return a JSONL line for the event log.
         match serde_json::to_string(event) {
             Ok(line) => line,
             Err(e) => {
                 tracing::warn!("failed to serialize event for log: {e}");
                 String::new()
             }
-        }
-    }
-
-    /// Track source changes for non-text events.
-    fn track_source(&mut self, source: &MeerkatId) {
-        let source_changed = self
-            .current_source
-            .as_ref()
-            .map_or(true, |id| id != source);
-        if source_changed {
-            self.current_source = Some(source.clone());
         }
     }
 }
