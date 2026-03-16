@@ -284,7 +284,10 @@ async fn run_turn_streaming(
 
 /// Validate a TOML block as a mob definition.
 /// Returns `Ok(toml_string)` if valid, `Err(feedback_message)` if invalid.
-fn validate_mob_toml(toml_block: &str) -> Result<String, String> {
+fn validate_mob_toml(
+    toml_block: &str,
+    output_tx: &std_mpsc::Sender<OutputSignal>,
+) -> Result<String, String> {
     match meerkat_mob::MobDefinition::from_toml(toml_block) {
         Ok(def) => {
             let diagnostics = meerkat_mob::validate_definition(&def);
@@ -296,26 +299,39 @@ fn validate_mob_toml(toml_block: &str) -> Result<String, String> {
                 .iter()
                 .filter(|d| d.severity == meerkat_mob::DiagnosticSeverity::Warning)
                 .collect();
-            for w in &warnings {
-                raw_eprintln!("  WARNING: {}", w.message);
+            if !warnings.is_empty() {
+                input::with_output(output_tx, || {
+                    for w in &warnings {
+                        raw_eprintln!("  \x1b[33mWARNING: {}\x1b[0m", w.message);
+                    }
+                });
             }
             if errors.is_empty() {
-                raw_eprintln!("\n[Valid mob definition detected — deploying '{}']", def.id);
+                let id = def.id.clone();
+                input::with_output(output_tx, || {
+                    raw_eprintln!("\x1b[32m[Valid mob definition -- deploying '{id}']\x1b[0m");
+                });
                 Ok(toml_block.to_string())
             } else {
                 let mut feedback = String::from(
                     "[SYSTEM] Your mob definition has validation errors. \
                      Please fix and output a corrected ```toml block:\n",
                 );
+                input::with_output(output_tx, || {
+                    for d in &errors {
+                        raw_eprintln!("  \x1b[31mERROR: {}\x1b[0m", d.message);
+                    }
+                });
                 for d in &errors {
-                    raw_eprintln!("  ERROR: {}", d.message);
                     feedback.push_str(&format!("- {}\n", d.message));
                 }
                 Err(feedback)
             }
         }
         Err(e) => {
-            raw_eprintln!("\n[TOML parse error: {e}]");
+            input::with_output(output_tx, || {
+                raw_eprintln!("\x1b[31m[TOML parse error: {e}]\x1b[0m");
+            });
             Err(format!(
                 "[SYSTEM] Your TOML mob definition failed to parse: {e}\n\
                  Please fix and output a corrected ```toml block."
@@ -445,7 +461,7 @@ pub async fn run_planner(
         // Check for a TOML mob definition. On validation failure, feed the error
         // back to the planner as a correction turn so it can self-correct.
         if let Some(toml_block) = extract_toml_block(&text) {
-            match validate_mob_toml(&toml_block) {
+            match validate_mob_toml(&toml_block, &output_tx) {
                 Ok(valid_toml) => return Ok((valid_toml, input_rx, output_tx)),
                 Err(feedback) => {
                     input::with_output(&output_tx, || {
@@ -454,7 +470,7 @@ pub async fn run_planner(
                     let _text = run_turn_streaming(&session_service, &session_id, feedback, &output_tx).await?;
 
                     if let Some(fixed_toml) = extract_toml_block(&_text) {
-                        if let Ok(valid_toml) = validate_mob_toml(&fixed_toml) {
+                        if let Ok(valid_toml) = validate_mob_toml(&fixed_toml, &output_tx) {
                             return Ok((valid_toml, input_rx, output_tx));
                         }
                     }

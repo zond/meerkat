@@ -8,7 +8,10 @@ use meerkat_mob::{
     SpawnMemberSpec,
 };
 use std::sync::Arc;
+use std::sync::mpsc as std_mpsc;
 
+use crate::input::{self, OutputSignal};
+use crate::raw_eprintln;
 use crate::state::StateDir;
 
 /// Deploy a fresh mob from a definition.
@@ -16,6 +19,7 @@ pub async fn deploy_mob(
     definition: MobDefinition,
     session_service: Arc<dyn MobSessionService>,
     state: &StateDir,
+    output_tx: &std_mpsc::Sender<OutputSignal>,
 ) -> color_eyre::Result<MobHandle> {
     let storage = MobStorage::redb(state.mob_redb())
         .wrap_err("failed to open mob storage")?;
@@ -34,11 +38,11 @@ pub async fn deploy_mob(
         .await
         .wrap_err("failed to create mob")?;
 
-    eprintln!(
-        "[Mob '{}' created (status: {:?})]",
-        handle.mob_id(),
-        handle.status()
-    );
+    let mob_id = handle.mob_id().to_string();
+    let status = format!("{:?}", handle.status());
+    input::with_output(output_tx, || {
+        raw_eprintln!("[Mob '{mob_id}' created (status: {status})]");
+    });
 
     // Spawn one agent per profile.
     // Convention: meerkat_id = profile name (1:1 mapping in this example).
@@ -61,17 +65,19 @@ pub async fn deploy_mob(
 
         match handle.spawn_spec(spec).await {
             Ok(member_ref) => {
-                eprintln!("[Spawned {name}/{meerkat_id}: {member_ref:?}]");
+                input::with_output(output_tx, || {
+                    raw_eprintln!("[Spawned {name}/{meerkat_id}: {member_ref:?}]");
+                });
             }
             Err(e) => {
                 if is_orchestrator {
-                    // Orchestrator is required — fail the deployment.
                     return Err(e).wrap_err(format!(
                         "failed to spawn orchestrator {name}/{meerkat_id}"
                     ));
                 }
-                // Best-effort for workers: log and continue with partial roster.
-                eprintln!("[Failed to spawn {name}/{meerkat_id}: {e}]");
+                input::with_output(output_tx, || {
+                    raw_eprintln!("\x1b[33m[Failed to spawn {name}/{meerkat_id}: {e}]\x1b[0m");
+                });
             }
         }
     }
@@ -84,25 +90,30 @@ pub async fn deploy_mob(
             break;
         }
         if tokio::time::Instant::now() > deadline {
-            eprintln!(
-                "[Warning: only {}/{} members ready after timeout]",
-                members.len(),
-                expected_count
-            );
+            input::with_output(output_tx, || {
+                raw_eprintln!(
+                    "\x1b[33m[Warning: only {}/{} members ready after timeout]\x1b[0m",
+                    members.len(),
+                    expected_count
+                );
+            });
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
     let members = handle.list_members().await;
-    eprintln!("\n[Roster ({} members):]", members.len());
-    for m in &members {
-        eprintln!(
-            "  {} (profile: {}, wired_to: {:?})",
-            m.meerkat_id, m.profile, m.wired_to
-        );
-    }
-    eprintln!();
+    input::with_output(output_tx, || {
+        raw_eprintln!();
+        raw_eprintln!("[Roster ({} members):]", members.len());
+        for m in &members {
+            raw_eprintln!(
+                "  {} (profile: {}, wired_to: {:?})",
+                m.meerkat_id, m.profile, m.wired_to
+            );
+        }
+        raw_eprintln!();
+    });
 
     Ok(handle)
 }
@@ -111,8 +122,11 @@ pub async fn deploy_mob(
 pub async fn resume_mob(
     session_service: Arc<dyn MobSessionService>,
     state: &StateDir,
+    output_tx: &std_mpsc::Sender<OutputSignal>,
 ) -> color_eyre::Result<MobHandle> {
-    eprintln!("[Resuming mob from {}]", state.mob_redb().display());
+    input::with_output(output_tx, || {
+        raw_eprintln!("[Resuming mob from {}]", state.mob_redb().display());
+    });
 
     let storage = MobStorage::redb(state.mob_redb())
         .wrap_err("failed to open mob storage for resume")?;
@@ -123,21 +137,23 @@ pub async fn resume_mob(
         .await
         .wrap_err("failed to resume mob")?;
 
-    eprintln!(
-        "[Mob '{}' resumed (status: {:?})]",
-        handle.mob_id(),
-        handle.status()
-    );
+    let mob_id = handle.mob_id().to_string();
+    let status = format!("{:?}", handle.status());
+    input::with_output(output_tx, || {
+        raw_eprintln!("[Mob '{mob_id}' resumed (status: {status})]");
+    });
 
     let members = handle.list_members().await;
-    eprintln!("[Roster ({} members):]", members.len());
-    for m in &members {
-        eprintln!(
-            "  {} (profile: {}, wired_to: {:?})",
-            m.meerkat_id, m.profile, m.wired_to
-        );
-    }
-    eprintln!();
+    input::with_output(output_tx, || {
+        raw_eprintln!("[Roster ({} members):]", members.len());
+        for m in &members {
+            raw_eprintln!(
+                "  {} (profile: {}, wired_to: {:?})",
+                m.meerkat_id, m.profile, m.wired_to
+            );
+        }
+        raw_eprintln!();
+    });
 
     Ok(handle)
 }
