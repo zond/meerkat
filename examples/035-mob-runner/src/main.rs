@@ -27,6 +27,7 @@
 //! ```
 
 mod deploy;
+mod format;
 mod input;
 mod planner;
 mod render;

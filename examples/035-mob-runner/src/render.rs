@@ -7,64 +7,12 @@
 //! Coordinates with the input box via `with_output`: hides the box,
 //! writes output, then re-shows it so the box stays at the bottom.
 
+use crate::format;
 use crate::input::OutputSignal;
 use meerkat_core::event::AgentEvent;
 use meerkat_mob::{AttributedEvent, MeerkatId, ProfileName};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::mpsc as std_mpsc;
-
-/// Extract a readable preview from tool call args.
-fn tool_args_preview(name: &str, args: &Value) -> String {
-    match name {
-        "shell" | "bash" | "execute_command" => {
-            args.get("command")
-                .and_then(|v| v.as_str())
-                .map(|s| format!("\x1b[2m$ {s}\x1b[0m"))
-                .unwrap_or_default()
-        }
-        "read_file" | "read" => {
-            args.get("path")
-                .and_then(|v| v.as_str())
-                .map(|s| format!("\x1b[2m{s}\x1b[0m"))
-                .unwrap_or_default()
-        }
-        "write_file" | "write" => {
-            args.get("path")
-                .and_then(|v| v.as_str())
-                .map(|s| format!("\x1b[2m{s}\x1b[0m"))
-                .unwrap_or_default()
-        }
-        "list_directory" | "ls" => {
-            args.get("path")
-                .and_then(|v| v.as_str())
-                .map(|s| format!("\x1b[2m{s}\x1b[0m"))
-                .unwrap_or_default()
-        }
-        _ => {
-            let s = serde_json::to_string(args).unwrap_or_default();
-            if s.len() > 120 {
-                format!("\x1b[2m{}...\x1b[0m", &s[..117])
-            } else if s != "{}" {
-                format!("\x1b[2m{s}\x1b[0m")
-            } else {
-                String::new()
-            }
-        }
-    }
-}
-
-/// Truncate a tool result to a single-line preview.
-fn truncate_result(result: &str, max_len: usize) -> String {
-    let line = result.lines().next().unwrap_or("");
-    if line.len() > max_len {
-        format!("\x1b[2m{}...\x1b[0m", &line[..max_len.saturating_sub(3)])
-    } else if line.is_empty() {
-        String::new()
-    } else {
-        format!("\x1b[2m{line}\x1b[0m")
-    }
-}
 
 /// Tracks current speaker and buffers text per-agent for coherent output.
 pub struct EventRenderer {
@@ -143,7 +91,7 @@ impl EventRenderer {
             AgentEvent::ToolCallRequested { name, args, .. } => {
                 self.flush_buffer(source, profile);
                 self.current_source = Some(source.clone());
-                let preview = tool_args_preview(name, args);
+                let preview = format::tool_args_preview(name, args);
                 if preview.is_empty() {
                     self.emit(format!(
                         "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[33mtool: {name}\x1b[0m\r\n"
@@ -166,7 +114,7 @@ impl EventRenderer {
                 } else {
                     "\x1b[32mok\x1b[0m"
                 };
-                let preview = truncate_result(result, 200);
+                let preview = format::tool_result_preview(name, result, 3);
                 self.current_source = Some(source.clone());
                 if preview.is_empty() {
                     self.emit(format!(
