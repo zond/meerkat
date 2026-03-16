@@ -284,15 +284,28 @@ impl InputEditor {
             return Ok(());
         }
 
-        // Clear previous render.
-        if self.last_render_height > 0 {
-            for _ in 0..self.last_render_height {
-                out.queue(cursor::MoveUp(1))?;
-                out.queue(terminal::Clear(ClearType::CurrentLine))?;
-            }
-        }
-
         let inner_width = box_width - 4; // 2 border + 2 padding
+
+        // Clear previous render. The cursor is positioned inside the content
+        // area from the last render, so we need to account for its actual row.
+        if self.last_render_height > 0 {
+            let prev_cursor_row = self.cursor_content_row(inner_width);
+            // Move to top border: up by cursor_row + 1 (content rows + top border).
+            out.queue(cursor::MoveToColumn(0))?;
+            out.queue(cursor::MoveUp(prev_cursor_row + 1))?;
+            // Clear each line of the old box.
+            for i in 0..self.last_render_height {
+                out.queue(terminal::Clear(ClearType::CurrentLine))?;
+                if i < self.last_render_height - 1 {
+                    out.queue(cursor::MoveDown(1))?;
+                }
+            }
+            // Move back up to where the top border was.
+            if self.last_render_height > 1 {
+                out.queue(cursor::MoveUp(self.last_render_height - 1))?;
+            }
+            out.queue(cursor::MoveToColumn(0))?;
+        }
 
         // Top border: ╭─ label ──...──╮
         let label_display = if self.label.is_empty() {
