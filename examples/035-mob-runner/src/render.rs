@@ -46,6 +46,7 @@ impl EventRenderer {
             self.current_source = Some(meerkat_id.clone());
 
             let prefix = if source_changed { "\r\n" } else { "" };
+            let text = text.replace('\n', "\r\n");
             self.emit(format!(
                 "{prefix}\x1b[36m[{profile}/{meerkat_id}]\x1b[0m {text}\r\n"
             ));

@@ -217,7 +217,8 @@ async fn run_turn_streaming(
                     eprint!("\x1b[36mplanner>\x1b[0m ");
                     in_text = true;
                 }
-                eprint!("{delta}");
+                // In raw mode, \n alone doesn't return to column 0.
+                eprint!("{}", delta.replace('\n', "\r\n"));
                 full_text.push_str(delta);
             }
             AgentEvent::TextComplete { content } => {
