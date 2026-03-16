@@ -104,6 +104,8 @@ pub struct InputEditor {
     term_width: u16,
     /// Number of lines the box occupied on last render (for clearing).
     last_render_height: u16,
+    /// Cursor's content row from the last render (for clearing the previous box).
+    last_cursor_row: u16,
 }
 
 impl InputEditor {
@@ -118,6 +120,7 @@ impl InputEditor {
             label: label.into(),
             term_width: w,
             last_render_height: 0,
+            last_cursor_row: 0,
         }
     }
 
@@ -297,21 +300,16 @@ impl InputEditor {
 
         let inner_width = box_width - 4; // 2 border + 2 padding
 
-        // Clear previous render. The cursor is positioned inside the content
-        // area from the last render, so we need to account for its actual row.
+        // Clear previous render using the saved cursor position from last render.
         if self.last_render_height > 0 {
-            let prev_cursor_row = self.cursor_content_row(inner_width);
-            // Move to top border: up by cursor_row + 1 (content rows + top border).
             out.queue(cursor::MoveToColumn(0))?;
-            out.queue(cursor::MoveUp(prev_cursor_row + 1))?;
-            // Clear each line of the old box.
+            out.queue(cursor::MoveUp(self.last_cursor_row + 1))?;
             for i in 0..self.last_render_height {
                 out.queue(terminal::Clear(ClearType::CurrentLine))?;
                 if i < self.last_render_height - 1 {
                     out.queue(cursor::MoveDown(1))?;
                 }
             }
-            // Move back up to where the top border was.
             if self.last_render_height > 1 {
                 out.queue(cursor::MoveUp(self.last_render_height - 1))?;
             }
@@ -380,6 +378,7 @@ impl InputEditor {
         out.queue(style::ResetColor)?;
 
         self.last_render_height = (2 + line_count) as u16;
+        self.last_cursor_row = cursor_display_row as u16;
 
         // Position cursor inside the box.
         let lines_up = (line_count - cursor_display_row) as u16;
@@ -394,12 +393,9 @@ impl InputEditor {
             return Ok(());
         }
 
-        let inner_width = (self.term_width as usize).saturating_sub(4);
-        let cursor_row = self.cursor_content_row(inner_width);
-
-        // Move from cursor position to top border, then clear each line downward.
+        // Use saved cursor row from last render.
         out.queue(cursor::MoveToColumn(0))?;
-        out.queue(cursor::MoveUp(cursor_row + 1))?;
+        out.queue(cursor::MoveUp(self.last_cursor_row + 1))?;
 
         for i in 0..self.last_render_height {
             out.queue(terminal::Clear(ClearType::CurrentLine))?;

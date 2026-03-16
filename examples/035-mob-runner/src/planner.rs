@@ -16,7 +16,61 @@ use crate::raw_eprintln;
 use crate::input::{self, InputResult, OutputSignal};
 use crate::state::StateDir;
 
+use serde_json::Value;
+
 type SessionSvc = dyn SessionService;
+
+/// Extract a readable preview from tool call args.
+fn tool_args_preview(name: &str, args: &Value) -> String {
+    match name {
+        "shell" | "bash" | "execute_command" => {
+            args.get("command")
+                .and_then(|v| v.as_str())
+                .map(|s| format!("\x1b[2m$ {s}\x1b[0m"))
+                .unwrap_or_default()
+        }
+        "read_file" | "read" => {
+            args.get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| format!("\x1b[2m{s}\x1b[0m"))
+                .unwrap_or_default()
+        }
+        "write_file" | "write" => {
+            args.get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| format!("\x1b[2m{s}\x1b[0m"))
+                .unwrap_or_default()
+        }
+        "list_directory" | "ls" => {
+            args.get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| format!("\x1b[2m{s}\x1b[0m"))
+                .unwrap_or_default()
+        }
+        _ => {
+            let s = serde_json::to_string(args).unwrap_or_default();
+            if s.len() > 120 {
+                format!("\x1b[2m{}...\x1b[0m", &s[..117])
+            } else if s != "{}" {
+                format!("\x1b[2m{s}\x1b[0m")
+            } else {
+                String::new()
+            }
+        }
+    }
+}
+
+/// Truncate a tool result to a single-line preview.
+fn truncate_result(result: &str, max_len: usize) -> String {
+    let line = result.lines().next().unwrap_or("");
+    if line.len() > max_len {
+        format!("\x1b[2m{}...\x1b[0m", &line[..max_len.saturating_sub(3)])
+    } else if line.is_empty() {
+        String::new()
+    } else {
+        format!("\x1b[2m{line}\x1b[0m")
+    }
+}
 
 /// Compiled regex for extracting ```toml fenced code blocks.
 /// Captures the last ```toml block to avoid partial fragments the LLM
@@ -227,21 +281,32 @@ async fn run_turn_streaming(
                     full_text = content.clone();
                 }
             }
-            AgentEvent::ToolCallRequested { name, .. } => {
+            AgentEvent::ToolCallRequested { name, args, .. } => {
                 if in_text {
                     raw_eprintln!();
                     in_text = false;
                 }
-                raw_eprintln!("  \x1b[33m[tool: {name}]\x1b[0m");
+                let args_preview = tool_args_preview(name, args);
+                if args_preview.is_empty() {
+                    raw_eprintln!("  \x1b[33m[tool: {name}]\x1b[0m");
+                } else {
+                    raw_eprintln!("  \x1b[33m[tool: {name}]\x1b[0m {args_preview}");
+                }
             }
             AgentEvent::ToolExecutionCompleted {
                 name,
+                result,
                 is_error,
                 duration_ms,
                 ..
             } => {
                 let status = if *is_error { "\x1b[31mERR\x1b[0m" } else { "\x1b[32mok\x1b[0m" };
-                raw_eprintln!("  \x1b[2m[tool done: {name} ({status}\x1b[2m, {duration_ms}ms)]\x1b[0m");
+                let preview = truncate_result(result, 200);
+                if preview.is_empty() {
+                    raw_eprintln!("  \x1b[2m[{name} {status}\x1b[2m {duration_ms}ms]\x1b[0m");
+                } else {
+                    raw_eprintln!("  \x1b[2m[{name} {status}\x1b[2m {duration_ms}ms]\x1b[0m {preview}");
+                }
             }
             AgentEvent::RunFailed { error, .. } => {
                 raw_eprintln!("\r\n\x1b[31m[ERROR: {error}]\x1b[0m");
