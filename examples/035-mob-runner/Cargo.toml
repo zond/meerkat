@@ -1,0 +1,25 @@
+[package]
+name = "mob-runner"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "mob-runner"
+path = "src/main.rs"
+
+[dependencies]
+# jsonl-store is needed to satisfy an exhaustive match in meerkat's open_realm_persistence_in
+# when session-store is enabled, even though this example uses redb directly.
+meerkat = { path = "../../meerkat", features = ["comms", "session-store", "jsonl-store"] }
+meerkat-core = { path = "../../meerkat-core" }
+meerkat-mob = { path = "../../meerkat-mob" }
+meerkat-runtime = { path = "../../meerkat-runtime", features = ["redb-store"] }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+color-eyre = "0.6"
+regex = "1"
