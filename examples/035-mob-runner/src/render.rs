@@ -68,20 +68,6 @@ impl EventRenderer {
             AgentEvent::TextComplete { .. } => {
                 self.flush_buffer(source, profile);
             }
-            AgentEvent::RunStarted { .. } => {
-                self.flush_buffer(source, profile);
-                self.current_source = Some(source.clone());
-                self.emit(format!(
-                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mturn started\x1b[0m\r\n"
-                ));
-            }
-            AgentEvent::RunCompleted { .. } => {
-                self.flush_buffer(source, profile);
-                self.current_source = Some(source.clone());
-                self.emit(format!(
-                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mturn completed\x1b[0m\r\n\x1b[2m---\x1b[0m\r\n"
-                ));
-            }
             AgentEvent::RunFailed { error, .. } => {
                 self.flush_buffer(source, profile);
                 self.current_source = Some(source.clone());
@@ -90,16 +76,19 @@ impl EventRenderer {
                 ));
             }
             AgentEvent::ToolCallRequested { name, args, .. } => {
+                if !format::should_show_tool(name) {
+                    return self.serialize(event);
+                }
                 self.flush_buffer(source, profile);
                 self.current_source = Some(source.clone());
                 let preview = format::tool_args_preview(name, args);
                 if preview.is_empty() {
                     self.emit(format!(
-                        "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[33mtool: {name}\x1b[0m\r\n"
+                        "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[33m{name}\x1b[0m\r\n"
                     ));
                 } else {
                     self.emit(format!(
-                        "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[33mtool: {name}\x1b[0m {preview}\r\n"
+                        "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[33m{name}\x1b[0m {preview}\r\n"
                     ));
                 }
             }
@@ -110,6 +99,9 @@ impl EventRenderer {
                 duration_ms,
                 ..
             } => {
+                if !format::should_show_tool(name) {
+                    return self.serialize(event);
+                }
                 let status = if *is_error {
                     "\x1b[31mERR\x1b[0m"
                 } else {
@@ -127,23 +119,15 @@ impl EventRenderer {
                     ));
                 }
             }
-            AgentEvent::TurnStarted { turn_number } => {
-                self.flush_buffer(source, profile);
-                self.current_source = Some(source.clone());
-                self.emit(format!(
-                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mLLM turn {turn_number}\x1b[0m\r\n"
-                ));
-            }
-            AgentEvent::TurnCompleted { usage, .. } => {
-                let total = usage.input_tokens + usage.output_tokens;
-                self.current_source = Some(source.clone());
-                self.emit(format!(
-                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[2mturn done ({total} tokens)\x1b[0m\r\n"
-                ));
-            }
+            // Suppress noisy lifecycle events:
+            // RunStarted, RunCompleted, TurnStarted, TurnCompleted
             _ => {}
         }
 
+        self.serialize(event)
+    }
+
+    fn serialize(&self, event: &AttributedEvent) -> String {
         match serde_json::to_string(event) {
             Ok(line) => line,
             Err(e) => {
