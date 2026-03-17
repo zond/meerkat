@@ -16,7 +16,12 @@ pub fn tool_args_preview(name: &str, args: &Value) -> String {
         "shell" | "bash" | "execute_command" => args
             .get("command")
             .and_then(|v| v.as_str())
-            .map(|s| format!("\x1b[2m$ {s}\x1b[0m"))
+            .map(|s| {
+                // For multi-line commands, show just the first line.
+                let first_line = s.lines().next().unwrap_or(s);
+                let suffix = if s.contains('\n') { " ..." } else { "" };
+                format!("\x1b[2m$ {}{suffix}\x1b[0m", truncate(first_line, 120))
+            })
             .unwrap_or_default(),
         "read_file" | "read" => args
             .get("path")
