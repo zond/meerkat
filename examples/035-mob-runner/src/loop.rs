@@ -138,8 +138,9 @@ pub async fn run_mob_loop(
 
                         // Default: send to orchestrator.
                         if let Some(ref orch) = orch_id {
-                            if let Err(e) = handle.send_message(orch.clone(), line).await {
-                                input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[Failed to send to orchestrator: {e}]\x1b[0m"));
+                            match handle.send_message(orch.clone(), line).await {
+                                Ok(_) => input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[Sent to {orch}]\x1b[0m")),
+                                Err(e) => input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[Failed to send to orchestrator: {e}]\x1b[0m")),
                             }
                         } else {
                             input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[No orchestrator defined -- use /send <agent> <msg>]\x1b[0m"));
