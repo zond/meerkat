@@ -39,8 +39,8 @@ pub fn tool_args_preview(name: &str, args: &Value) -> String {
             .map(|s| format!("\x1b[2m{s}\x1b[0m"))
             .unwrap_or_default(),
         "send" => {
-            let target = args
-                .get("target")
+            let to = args
+                .get("to")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
             let body = args
@@ -48,7 +48,7 @@ pub fn tool_args_preview(name: &str, args: &Value) -> String {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let preview = truncate(body, 120);
-            format!("\x1b[2m-> {target}: {preview}\x1b[0m")
+            format!("\x1b[2m-> {to}: {preview}\x1b[0m")
         }
         "wire_peers" => {
             let a = args.get("a").and_then(|v| v.as_str()).unwrap_or("?");
