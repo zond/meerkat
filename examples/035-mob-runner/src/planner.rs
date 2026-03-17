@@ -193,7 +193,7 @@ async fn run_turn_streaming(
             svc.start_turn(
                 &sid,
                 StartTurnRequest {
-                    prompt,
+                    prompt: prompt.into(),
                     event_tx: Some(turn_tx),
                     host_mode: false,
                     skill_references: None,
@@ -348,7 +348,7 @@ async fn create_planner_session(
     let result = session_service
         .create_session(CreateSessionRequest {
             model: model.to_string(),
-            prompt: String::new(),
+            prompt: String::new().into(),
             system_prompt: Some(planner_system_prompt()),
             max_tokens: None,
             event_tx: None,
