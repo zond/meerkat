@@ -158,6 +158,39 @@ content = "You are a worker. Implement assigned tasks, report progress via comms
 - Define enough profiles upfront: the orchestrator can spawn/retire agents at runtime but cannot define new profiles
 - `memory = true` in `[profiles.<name>.tools]` enables semantic memory tools for that agent
 
+## Available tools (use these exact names in skill content)
+
+Agents have these tools depending on their `[profiles.X.tools]` config:
+
+**comms = true:**
+- `send` — Send message to a peer. Args: `to` (peer name), `body` (text), `kind` ("peer_message")
+- `peers` — List connected peers
+
+**mob_tasks = true:**
+- `mob_task_create` — Create a task. Args: `subject` (short title), `description` (details), `blocked_by` (optional list of task IDs)
+- `mob_task_list` — List all tasks with status
+- `mob_task_update` — Update task status. Args: `task_id`, `status` ("in_progress"/"completed"/"blocked"), `owner` (optional)
+
+**mob = true (orchestrator only):**
+- `spawn_meerkat` — Spawn a new agent
+- `retire_meerkat` — Remove an agent
+- `wire_peers` — Connect two agents for direct communication. Args: `a`, `b`
+- `list_meerkats` — List all agents
+
+**shell = true:**
+- `shell` — Run a shell command. Args: `command` (string)
+
+**builtins = true:**
+- `read_file`, `write_file`, `list_directory` — File operations
+
+## Skill content guidelines
+
+- ALWAYS reference exact tool names (e.g. `mob_task_create`, NOT `task_create`)
+- Workers should NOT passively wait. They should poll `mob_task_list` periodically to find assigned tasks
+- Workers should use `send` with `kind: "peer_message"` to report progress
+- The orchestrator should create tasks with `mob_task_create`, assign them by setting `owner` via `mob_task_update`, and send instructions via `send`
+- Reviewers should poll `mob_task_list` for tasks assigned to them
+
 ## {provider_ctx}
 
 When the user says "go", "deploy", "let's do it", or similar — finalize and output the TOML definition."#
