@@ -187,14 +187,28 @@ async fn run() -> color_eyre::Result<()> {
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
-    // Initialize tracing (controlled via RUST_LOG).
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    // Initialize tracing. Logs go to .mob-runner/mob-runner.log to avoid
+    // interfering with the input box. Falls back to stderr if the file
+    // can't be opened.
+    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+
+    if let Ok(log_file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(".mob-runner/mob-runner.log")
+    {
+        tracing_subscriber::fmt()
+            .with_env_filter(log_filter)
+            .with_writer(std::sync::Mutex::new(log_file))
+            .with_ansi(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(log_filter)
+            .with_writer(std::io::stderr)
+            .init();
+    }
 
     let result = run().await;
 
