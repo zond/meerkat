@@ -173,20 +173,15 @@ pub async fn run_mob_loop(
         }
     }
 
-    // Clean shutdown — hide box permanently for final messages.
+    // Don't retire agents — just stop the event router and exit.
+    // Retiring writes MeerkatRetired events which would cause the next
+    // resume to lose all agent conversation history (since reconcile_resume
+    // archives "orphan" sessions and creates fresh ones). By leaving the
+    // agents un-retired, resume reconnects to their existing sessions.
     input::hide_box(&output_tx);
     router_handle.cancel();
-    raw_eprintln!("\x1b[2m[Retiring all agents (5s timeout)...]\x1b[0m");
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        handle.retire_all(),
-    ).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => raw_eprintln!("\x1b[33m[Warning: failed to retire agents: {e}]\x1b[0m"),
-        Err(_) => raw_eprintln!("\x1b[33m[Timed out retiring agents — forcing exit]\x1b[0m"),
-    }
     raw_eprintln!(
-        "\x1b[2m[Mob runner stopped. State saved in {}]\x1b[0m",
+        "\x1b[2m[Mob runner stopped. Sessions preserved in {}]\x1b[0m",
         state.root().display()
     );
 
