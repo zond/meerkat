@@ -19,6 +19,8 @@ pub struct EventRenderer {
     text_buffers: HashMap<MeerkatId, String>,
     current_source: Option<MeerkatId>,
     output_tx: std_mpsc::Sender<OutputSignal>,
+    /// Whether the last displayed event was a rate-limit error.
+    last_was_rate_limited: bool,
 }
 
 impl EventRenderer {
@@ -27,6 +29,7 @@ impl EventRenderer {
             text_buffers: HashMap::new(),
             current_source: None,
             output_tx,
+            last_was_rate_limited: false,
         }
     }
 
@@ -67,13 +70,28 @@ impl EventRenderer {
             }
             AgentEvent::TextComplete { .. } => {
                 self.flush_buffer(source, profile);
+                self.last_was_rate_limited = false;
             }
             AgentEvent::RunFailed { error, .. } => {
-                self.flush_buffer(source, profile);
-                self.current_source = Some(source.clone());
-                self.emit(format!(
-                    "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[31mFAILED: {error}\x1b[0m\r\n"
-                ));
+                let is_rate_limited = error.contains("Rate limited")
+                    || error.contains("rate_limit")
+                    || error.contains("429");
+                if is_rate_limited {
+                    if !self.last_was_rate_limited {
+                        self.flush_buffer(source, profile);
+                        self.emit(
+                            "\x1b[33m[rate limited]\x1b[0m\r\n".to_string(),
+                        );
+                    }
+                    self.last_was_rate_limited = true;
+                } else {
+                    self.last_was_rate_limited = false;
+                    self.flush_buffer(source, profile);
+                    self.current_source = Some(source.clone());
+                    self.emit(format!(
+                        "\x1b[36m[{profile}/{source}]\x1b[0m \x1b[31mFAILED: {error}\x1b[0m\r\n"
+                    ));
+                }
             }
             AgentEvent::ToolCallRequested { name, args, .. } => {
                 if !format::should_show_tool(name) {
