@@ -33,6 +33,11 @@ impl EventRenderer {
         }
     }
 
+    /// Reset rate-limit dedup so the next rate limit is shown.
+    pub fn reset_rate_limit_flag(&mut self) {
+        self.last_was_rate_limited = false;
+    }
+
     fn emit(&self, msg: String) {
         crate::input::with_output(&self.output_tx, || eprint!("{msg}"));
     }

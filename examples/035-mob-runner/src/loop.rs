@@ -66,6 +66,9 @@ pub async fn run_mob_loop(
                         if line.is_empty() {
                             continue;
                         }
+                        // Reset rate-limit dedup so user sees if their
+                        // message triggers a rate limit response.
+                        renderer.reset_rate_limit_flag();
 
                         if line == "/quit" {
                             input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[Shutting down mob]\x1b[0m"));
