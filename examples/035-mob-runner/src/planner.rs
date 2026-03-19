@@ -190,6 +190,8 @@ Agents have these tools depending on their `[profiles.X.tools]` config:
 - Workers should use `send` with `kind: "peer_message"` to report progress
 - The orchestrator should create tasks with `mob_task_create`, assign them by setting `owner` via `mob_task_update`, and send instructions via `send`
 - Reviewers should poll `mob_task_list` for tasks assigned to them
+- The orchestrator's TEXT OUTPUT (not `send`) is what the user sees. To reply to the user, just output text — do NOT use `send` to target "user" (there is no peer named "user")
+- Only use `send` to communicate with other agents in the mob
 
 ## {provider_ctx}
 
