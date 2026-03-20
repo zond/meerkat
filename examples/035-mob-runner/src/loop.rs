@@ -151,25 +151,32 @@ pub async fn run_mob_loop(
                                 .and_then(|e| e.session_id().cloned());
                             match orch_session {
                                 Some(sid) => {
-                                    let req = meerkat_core::service::StartTurnRequest {
-                                        prompt: line.clone().into(),
-                                        event_tx: None,
-                                        host_mode: true,
-                                        skill_references: None,
-                                        flow_tool_overlay: None,
-                                        additional_instructions: None,
-                                    };
-                                    match session_service.start_turn(&sid, req).await {
-                                        Ok(_) => {}
-                                        Err(meerkat_core::service::SessionError::Busy { .. }) => {
-                                            // Turn already in progress — fall back to inject.
-                                            match handle.send_message(orch.clone(), line).await {
-                                                Ok(_) => input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[Sent to {orch} (queued)]\x1b[0m")),
-                                                Err(e) => input::with_output(&output_tx, || raw_eprintln!("\x1b[33m[Failed: {e}]\x1b[0m")),
+                                    // Spawn the turn in the background so the input
+                                    // loop stays responsive. The lead's response will
+                                    // appear via the event router as usual.
+                                    let svc = session_service.clone();
+                                    let orch_clone = orch.clone();
+                                    let handle_clone = handle.clone();
+                                    tokio::spawn(async move {
+                                        let req = meerkat_core::service::StartTurnRequest {
+                                            prompt: line.clone().into(),
+                                            event_tx: None,
+                                            host_mode: true,
+                                            skill_references: None,
+                                            flow_tool_overlay: None,
+                                            additional_instructions: None,
+                                        };
+                                        match svc.start_turn(&sid, req).await {
+                                            Ok(_) => {}
+                                            Err(meerkat_core::service::SessionError::Busy { .. }) => {
+                                                // Turn already in progress — fall back to inject.
+                                                let _ = handle_clone.send_message(orch_clone, line).await;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("start_turn for orchestrator failed: {e}");
                                             }
                                         }
-                                        Err(e) => input::with_output(&output_tx, || raw_eprintln!("\x1b[33m[Failed: {e}]\x1b[0m")),
-                                    }
+                                    });
                                 }
                                 None => input::with_output(&output_tx, || raw_eprintln!("\x1b[33m[Orchestrator session not found]\x1b[0m")),
                             }
