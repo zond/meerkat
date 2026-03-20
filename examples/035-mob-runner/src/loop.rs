@@ -39,7 +39,7 @@ pub async fn run_mob_loop(
         if let Some(ref id) = orch_id {
             raw_eprintln!("Orchestrator: \x1b[36m{id}\x1b[0m");
         }
-        raw_eprintln!("\x1b[2mCommands: /status, /members, /tasks, /send <agent> <msg>, /quit\x1b[0m");
+        raw_eprintln!("\x1b[2mCommands: /status, /members, /tasks, /send <agent> <msg>, /retire <agent>, /quit\x1b[0m");
         raw_eprintln!("\x1b[2mType a message to send to the orchestrator.\x1b[0m");
         raw_eprintln!();
     });
@@ -123,6 +123,15 @@ pub async fn run_mob_loop(
                                     raw_eprintln!("\x1b[2m[No tasks yet]\x1b[0m");
                                 }
                             });
+                            continue;
+                        }
+
+                        if let Some(rest) = line.strip_prefix("/retire ") {
+                            let target = MeerkatId::from(rest.trim());
+                            match handle.retire(target.clone()).await {
+                                Ok(_) => input::with_output(&output_tx, || raw_eprintln!("\x1b[32m[Retired {target}]\x1b[0m")),
+                                Err(e) => input::with_output(&output_tx, || raw_eprintln!("\x1b[33m[Failed to retire {target}: {e}]\x1b[0m")),
+                            }
                             continue;
                         }
 
