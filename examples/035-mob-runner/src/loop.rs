@@ -8,6 +8,7 @@ use crate::render::EventRenderer;
 use crate::state::StateDir;
 use meerkat_mob::{MeerkatId, MobHandle};
 use std::io::Write;
+use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use tokio::sync::mpsc;
 
@@ -25,6 +26,7 @@ fn orchestrator_id(handle: &MobHandle) -> Option<MeerkatId> {
 pub async fn run_mob_loop(
     handle: MobHandle,
     state: &StateDir,
+    session_service: Arc<dyn meerkat_mob::MobSessionService>,
     mut input_rx: mpsc::Receiver<InputResult>,
     output_tx: std_mpsc::Sender<OutputSignal>,
 ) -> color_eyre::Result<()> {
@@ -139,11 +141,37 @@ pub async fn run_mob_loop(
                             continue;
                         }
 
-                        // Default: send to orchestrator.
+                        // Default: send to orchestrator as a direct user turn.
+                        // Using start_turn so the message appears as Message::User
+                        // (top-level instruction the LLM must obey) rather than a
+                        // PlainEvent in the comms inbox (easily ignored by the LLM).
+                        // Falls back to send_message if a turn is already in progress.
                         if let Some(ref orch) = orch_id {
-                            match handle.send_message(orch.clone(), line).await {
-                                Ok(_) => input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[Sent to {orch}]\x1b[0m")),
-                                Err(e) => input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[Failed to send to orchestrator: {e}]\x1b[0m")),
+                            let orch_session = handle.get_member(orch).await
+                                .and_then(|e| e.session_id().cloned());
+                            match orch_session {
+                                Some(sid) => {
+                                    let req = meerkat_core::service::StartTurnRequest {
+                                        prompt: line.clone().into(),
+                                        event_tx: None,
+                                        host_mode: true,
+                                        skill_references: None,
+                                        flow_tool_overlay: None,
+                                        additional_instructions: None,
+                                    };
+                                    match session_service.start_turn(&sid, req).await {
+                                        Ok(_) => {}
+                                        Err(meerkat_core::service::SessionError::Busy { .. }) => {
+                                            // Turn already in progress — fall back to inject.
+                                            match handle.send_message(orch.clone(), line).await {
+                                                Ok(_) => input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[Sent to {orch} (queued)]\x1b[0m")),
+                                                Err(e) => input::with_output(&output_tx, || raw_eprintln!("\x1b[33m[Failed: {e}]\x1b[0m")),
+                                            }
+                                        }
+                                        Err(e) => input::with_output(&output_tx, || raw_eprintln!("\x1b[33m[Failed: {e}]\x1b[0m")),
+                                    }
+                                }
+                                None => input::with_output(&output_tx, || raw_eprintln!("\x1b[33m[Orchestrator session not found]\x1b[0m")),
                             }
                         } else {
                             input::with_output(&output_tx, || raw_eprintln!("\x1b[2m[No orchestrator defined -- use /send <agent> <msg>]\x1b[0m"));

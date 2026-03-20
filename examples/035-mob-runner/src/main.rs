@@ -156,8 +156,8 @@ async fn run() -> color_eyre::Result<()> {
 
     if state.has_mob() {
         // Resume existing mob.
-        let handle = deploy::resume_mob(session_service, &state, &output_tx).await?;
-        event_loop::run_mob_loop(handle, &state, input_rx, output_tx).await?;
+        let handle = deploy::resume_mob(session_service.clone(), &state, &output_tx).await?;
+        event_loop::run_mob_loop(handle, &state, session_service, input_rx, output_tx).await?;
     } else {
         // Planning phase.
         let (mob_toml, input_rx, output_tx) = planner::run_planner(
@@ -174,10 +174,10 @@ async fn run() -> color_eyre::Result<()> {
         // Parse and deploy.
         let definition = MobDefinition::from_toml(&mob_toml)
             .wrap_err("failed to parse mob definition")?;
-        let handle = deploy::deploy_mob(definition, session_service, &state, &output_tx).await?;
+        let handle = deploy::deploy_mob(definition, session_service.clone(), &state, &output_tx).await?;
 
         // Execution phase.
-        event_loop::run_mob_loop(handle, &state, input_rx, output_tx).await?;
+        event_loop::run_mob_loop(handle, &state, session_service, input_rx, output_tx).await?;
     }
 
     Ok(())
