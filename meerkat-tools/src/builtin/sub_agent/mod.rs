@@ -20,6 +20,7 @@
 //! Note: For sending messages to sub-agents, use `comms_send` instead of a dedicated steer tool.
 
 mod config;
+mod resolver;
 mod runner;
 mod state;
 
@@ -28,11 +29,14 @@ mod fork;
 mod list;
 mod spawn;
 mod status;
+#[cfg(test)]
+mod test_support;
 mod tool_set;
 
 pub use config::{SubAgentConfig, SubAgentError};
 #[cfg(feature = "comms")]
 pub use meerkat_comms::runtime::ParentCommsContext;
+pub use resolver::DefaultSubAgentModelResolver;
 pub use runner::{
     DynSubAgentSpec, SubAgentHandle, SubAgentRunnerError, SubAgentSpec, create_fork_session,
     create_spawn_session, spawn_sub_agent, spawn_sub_agent_dyn,

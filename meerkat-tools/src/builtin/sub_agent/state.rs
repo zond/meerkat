@@ -1,15 +1,20 @@
 //! Shared state for sub-agent tools
 
 use super::config::SubAgentConfig;
+use super::resolver::DefaultSubAgentModelResolver;
+use crate::builtin::BuiltinToolError;
 use meerkat_client::LlmClientFactory;
 #[cfg(feature = "comms")]
 use meerkat_comms::TrustedPeers;
 #[cfg(feature = "comms")]
 use meerkat_comms::runtime::ParentCommsContext;
+use meerkat_core::config::HookRunOverrides;
 use meerkat_core::session::Session;
 use meerkat_core::sub_agent::SubAgentManager;
 use meerkat_core::{
-    AgentSessionStore, AgentToolDispatcher, HookEngine, ScopedAgentEvent, StreamScopeFrame,
+    AgentSessionStore, AgentToolDispatcher, HookEngine, Provider, ResolvedSubAgentModel,
+    ScopedAgentEvent, StreamScopeFrame, SubAgentModelError, SubAgentModelRequest,
+    SubAgentModelResolver, UsageObserver,
 };
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
@@ -22,8 +27,14 @@ pub struct SubAgentToolState {
     /// Sub-agent manager for tracking and controlling sub-agents
     pub manager: Arc<SubAgentManager>,
 
-    /// Factory for creating LLM clients for different providers
-    pub client_factory: Arc<dyn LlmClientFactory>,
+    /// Resolves provider/model and builds the LLM client for each child.
+    pub model_resolver: Arc<dyn SubAgentModelResolver>,
+
+    /// Provider of the agent owning these tools (passed to the resolver).
+    pub parent_provider: Provider,
+
+    /// Model of the agent owning these tools (empty when unknown).
+    pub parent_model: String,
 
     /// Tool dispatcher for providing tools to sub-agents
     pub tool_dispatcher: Arc<dyn AgentToolDispatcher>,
@@ -67,6 +78,13 @@ pub struct SubAgentToolState {
     /// Parent's hook engine, propagated to spawned/forked sub-agents so
     /// guardrail hooks (e.g. `PreToolExecution`) also fire inside them.
     pub hook_engine: Option<Arc<dyn HookEngine>>,
+
+    /// Parent's run-scoped hook overrides, applied to every child.
+    pub hook_run_overrides: HookRunOverrides,
+
+    /// Observer receiving per-call usage of every child (children only; the
+    /// owning agent is not metered).
+    pub usage_observer: Option<Arc<dyn UsageObserver>>,
 }
 
 impl SubAgentToolState {
@@ -80,9 +98,13 @@ impl SubAgentToolState {
         config: SubAgentConfig,
         current_depth: u32,
     ) -> Self {
+        let model_resolver: Arc<dyn SubAgentModelResolver> =
+            Arc::new(DefaultSubAgentModelResolver::new(client_factory, &config));
         Self {
             manager,
-            client_factory,
+            model_resolver,
+            parent_provider: Provider::Other,
+            parent_model: String::new(),
             tool_dispatcher,
             session_store,
             parent_session,
@@ -98,6 +120,8 @@ impl SubAgentToolState {
             scoped_event_tx: RwLock::new(None),
             scoped_event_path: RwLock::new(Vec::new()),
             hook_engine: None,
+            hook_run_overrides: HookRunOverrides::default(),
+            usage_observer: None,
         }
     }
 
@@ -105,6 +129,35 @@ impl SubAgentToolState {
     #[must_use]
     pub fn with_hook_engine(mut self, engine: Arc<dyn HookEngine>) -> Self {
         self.hook_engine = Some(engine);
+        self
+    }
+
+    /// Replace the model resolver (default: allowlist + client factory).
+    #[must_use]
+    pub fn with_model_resolver(mut self, resolver: Arc<dyn SubAgentModelResolver>) -> Self {
+        self.model_resolver = resolver;
+        self
+    }
+
+    /// Record the owning agent's provider and model (passed to the resolver).
+    #[must_use]
+    pub fn with_parent_model(mut self, provider: Provider, model: impl Into<String>) -> Self {
+        self.parent_provider = provider;
+        self.parent_model = model.into();
+        self
+    }
+
+    /// Apply the parent's run-scoped hook overrides to every child.
+    #[must_use]
+    pub fn with_hook_run_overrides(mut self, overrides: HookRunOverrides) -> Self {
+        self.hook_run_overrides = overrides;
+        self
+    }
+
+    /// Meter every child's LLM calls into `observer`.
+    #[must_use]
+    pub fn with_usage_observer(mut self, observer: Arc<dyn UsageObserver>) -> Self {
+        self.usage_observer = Some(observer);
         self
     }
 
@@ -149,9 +202,13 @@ impl SubAgentToolState {
         parent_trusted_peers: Arc<parking_lot::RwLock<TrustedPeers>>,
         parent_classification_peers: Arc<parking_lot::RwLock<TrustedPeers>>,
     ) -> Self {
+        let model_resolver: Arc<dyn SubAgentModelResolver> =
+            Arc::new(DefaultSubAgentModelResolver::new(client_factory, &config));
         Self {
             manager,
-            client_factory,
+            model_resolver,
+            parent_provider: Provider::Other,
+            parent_model: String::new(),
             tool_dispatcher,
             session_store,
             parent_session,
@@ -164,6 +221,8 @@ impl SubAgentToolState {
             scoped_event_tx: RwLock::new(None),
             scoped_event_path: RwLock::new(Vec::new()),
             hook_engine: None,
+            hook_run_overrides: HookRunOverrides::default(),
+            usage_observer: None,
         }
     }
 
@@ -194,6 +253,36 @@ impl SubAgentToolState {
         (tx, path)
     }
 
+    /// Resolve the model and client for a child spawned from these tools.
+    ///
+    /// Unknown providers and unavailable models are invalid tool arguments;
+    /// client construction failures are execution failures.
+    pub async fn resolve_child_model(
+        &self,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<ResolvedSubAgentModel, BuiltinToolError> {
+        let request = SubAgentModelRequest {
+            provider,
+            model,
+            parent_provider: self.parent_provider,
+            parent_model: &self.parent_model,
+            depth: self.current_depth + 1,
+        };
+        self.model_resolver
+            .resolve(request)
+            .await
+            .map_err(|e| match e {
+                SubAgentModelError::InvalidProvider(_)
+                | SubAgentModelError::ModelNotAvailable { .. } => {
+                    BuiltinToolError::invalid_args(e.to_string())
+                }
+                SubAgentModelError::Client(_) => {
+                    BuiltinToolError::execution_failed(format!("Failed to create LLM client: {e}"))
+                }
+            })
+    }
+
     /// Check if we can spawn more sub-agents
     pub async fn can_spawn(&self) -> bool {
         self.manager.can_spawn().await
@@ -216,6 +305,9 @@ impl std::fmt::Debug for SubAgentToolState {
         f.debug_struct("SubAgentToolState")
             .field("current_depth", &self.current_depth)
             .field("config", &self.config)
+            .field("parent_provider", &self.parent_provider)
+            .field("parent_model", &self.parent_model)
+            .field("usage_observer", &self.usage_observer.is_some())
             .field(
                 "hook_engine",
                 &if self.hook_engine.is_some() {

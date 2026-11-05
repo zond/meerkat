@@ -1,6 +1,5 @@
 //! agent_spawn tool - Spawn a new sub-agent with clean context
 
-use super::config::SubAgentError;
 #[cfg(feature = "comms")]
 use super::runner::SubAgentCommsConfig;
 use super::runner::{DynSubAgentSpec, create_spawn_session, spawn_sub_agent_dyn};
@@ -8,7 +7,6 @@ use super::state::SubAgentToolState;
 use crate::builtin::{BuiltinTool, BuiltinToolError, ToolOutput};
 use crate::dispatcher::FilteredDispatcher;
 use async_trait::async_trait;
-use meerkat_client::LlmProvider;
 use meerkat_core::ToolDef;
 use meerkat_core::budget::BudgetLimits;
 use meerkat_core::ops::{OperationId, ToolAccessPolicy};
@@ -211,80 +209,6 @@ impl AgentSpawnTool {
         Self { state }
     }
 
-    fn resolve_provider(&self, provider_str: Option<&str>) -> Result<LlmProvider, SubAgentError> {
-        if let Some(name) = provider_str {
-            return LlmProvider::parse(name).ok_or_else(|| SubAgentError::invalid_provider(name));
-        }
-        // Use resolved policy if available
-        if let Some(ref policy) = self.state.config.resolved_policy {
-            return match policy.default_provider {
-                meerkat_core::Provider::Anthropic => Ok(LlmProvider::Anthropic),
-                meerkat_core::Provider::OpenAI => Ok(LlmProvider::OpenAi),
-                meerkat_core::Provider::Gemini => Ok(LlmProvider::Gemini),
-                meerkat_core::Provider::Other => Err(SubAgentError::invalid_provider("other")),
-            };
-        }
-        let provider_name = &self.state.config.default_provider;
-        LlmProvider::parse(provider_name)
-            .ok_or_else(|| SubAgentError::invalid_provider(provider_name))
-    }
-
-    fn resolve_model(&self, provider: LlmProvider, model: Option<&str>) -> String {
-        if let Some(m) = model {
-            return m.to_string();
-        }
-        // Use resolved policy default if available
-        if let Some(ref policy) = self.state.config.resolved_policy {
-            return policy.default_model.clone();
-        }
-        if let Some(ref default) = self.state.config.default_model {
-            return default.clone();
-        }
-        let core_provider = match provider {
-            LlmProvider::Anthropic => meerkat_core::Provider::Anthropic,
-            LlmProvider::OpenAi => meerkat_core::Provider::OpenAI,
-            LlmProvider::Gemini => meerkat_core::Provider::Gemini,
-        };
-        meerkat_models::catalog::default_model(core_provider.as_str())
-            .unwrap_or_default()
-            .to_string()
-    }
-
-    /// Validate that a model is in the allowlist for the given provider
-    pub fn validate_model(&self, provider: LlmProvider, model: &str) -> Result<(), SubAgentError> {
-        let core_provider = match provider {
-            LlmProvider::Anthropic => meerkat_core::Provider::Anthropic,
-            LlmProvider::OpenAi => meerkat_core::Provider::OpenAI,
-            LlmProvider::Gemini => meerkat_core::Provider::Gemini,
-        };
-
-        // Use resolved policy if available, otherwise fall back to defaults
-        let allowed = if let Some(ref policy) = self.state.config.resolved_policy {
-            policy
-                .allowed_models
-                .get(core_provider.as_str())
-                .cloned()
-                .unwrap_or_default()
-        } else {
-            let defaults = meerkat_core::config::SubAgentsConfig::default();
-            defaults
-                .allowed_models
-                .get(core_provider.as_str())
-                .cloned()
-                .unwrap_or_default()
-        };
-
-        if allowed.iter().any(|m| m == model) {
-            Ok(())
-        } else {
-            Err(SubAgentError::InvalidModel {
-                model: model.to_string(),
-                provider: provider.to_string(),
-                allowed,
-            })
-        }
-    }
-
     fn resolve_budget(&self, budget: Option<BudgetInput>) -> BudgetLimits {
         let default_tokens = self.state.config.default_budget;
         let max_tokens = self.state.config.max_budget_per_agent;
@@ -330,15 +254,14 @@ impl AgentSpawnTool {
             ));
         }
 
-        // Resolve provider and model
-        let provider = self
-            .resolve_provider(params.provider.as_deref())
-            .map_err(|e| BuiltinToolError::invalid_args(e.to_string()))?;
-        let model = self.resolve_model(provider, params.model.as_deref());
-
-        // Validate model is in allowlist
-        self.validate_model(provider, &model)
-            .map_err(|e| BuiltinToolError::invalid_args(e.to_string()))?;
+        // Resolve provider/model, validate it and create the child's client
+        let resolved = self
+            .state
+            .resolve_child_model(params.provider.as_deref(), params.model.as_deref())
+            .await?;
+        let provider = resolved.provider;
+        let model = resolved.model;
+        let client = resolved.client;
 
         // Resolve tool access policy and apply filtering
         let tool_access: ToolAccessPolicy = params
@@ -355,15 +278,6 @@ impl AgentSpawnTool {
 
         // Resolve budget
         let budget = self.resolve_budget(params.budget);
-
-        // Create client for the sub-agent
-        let client = self
-            .state
-            .client_factory
-            .create_client(provider, None)
-            .map_err(|e| {
-                BuiltinToolError::execution_failed(format!("Failed to create LLM client: {e}"))
-            })?;
 
         // Generate operation ID and name
         // Use first 12 hex chars (8 + 4 after dash) to avoid collision with UUIDv7
@@ -445,6 +359,8 @@ impl AgentSpawnTool {
             scoped_event_tx,
             parent_scope_path,
             hook_engine: self.state.hook_engine.clone(),
+            hook_run_overrides: self.state.hook_run_overrides.clone(),
+            usage_observer: self.state.usage_observer.clone(),
         };
 
         #[cfg(not(feature = "comms"))]
@@ -461,6 +377,8 @@ impl AgentSpawnTool {
             scoped_event_tx,
             parent_scope_path,
             hook_engine: self.state.hook_engine.clone(),
+            hook_run_overrides: self.state.hook_run_overrides.clone(),
+            usage_observer: self.state.usage_observer.clone(),
         };
 
         // Spawn the sub-agent (this registers it and starts execution in a background task)
@@ -478,7 +396,7 @@ impl AgentSpawnTool {
         Ok(SpawnResponse {
             agent_id: op_id.to_string(),
             name,
-            provider: provider.to_string(),
+            provider: provider.as_str().to_string(),
             model,
             state: "running".to_string(),
             message: "Sub-agent spawned successfully. Use agent_status to check progress."
@@ -506,27 +424,8 @@ impl BuiltinTool for AgentSpawnTool {
             }
         };
 
-        // Enrich model description with allowed values (dynamic from config)
-        let models_desc = if let Some(ref policy) = self.state.config.resolved_policy {
-            policy.allowed_models_description()
-        } else {
-            // Fallback to defaults
-            let defaults = meerkat_core::config::SubAgentsConfig::default();
-            let parts: Vec<String> = defaults
-                .allowed_models
-                .iter()
-                .map(|(provider, models)| {
-                    let title = match provider.as_str() {
-                        "anthropic" => "Anthropic",
-                        "openai" => "OpenAI",
-                        "gemini" => "Gemini",
-                        other => other,
-                    };
-                    format!("{}: {}", title, models.join(", "))
-                })
-                .collect();
-            format!("Allowed models - {}", parts.join("; "))
-        };
+        // Enrich model description with the selectable models
+        let models_desc = self.state.model_resolver.describe();
 
         if let Some(model_prop) = schema
             .get_mut("properties")
@@ -576,7 +475,10 @@ impl BuiltinTool for AgentSpawnTool {
 mod tests {
     use super::*;
     use crate::builtin::sub_agent::config::SubAgentConfig;
-    use meerkat_client::{FactoryError, LlmClient, LlmClientFactory};
+    use crate::builtin::sub_agent::test_support::{
+        COUNTING_RESOLVER_DESCRIPTION, CountingResolver,
+    };
+    use meerkat_client::{FactoryError, LlmClient, LlmClientFactory, LlmProvider};
     use meerkat_core::error::{AgentError, ToolError};
     use meerkat_core::ops::ConcurrencyLimits;
     use meerkat_core::session::Session;
@@ -719,63 +621,6 @@ mod tests {
         let state = create_test_state();
         let tool = AgentSpawnTool::new(state);
         assert!(!tool.default_enabled());
-    }
-
-    #[test]
-    fn test_resolve_provider_default() {
-        let state = create_test_state();
-        let tool = AgentSpawnTool::new(state);
-        let provider = tool.resolve_provider(None).unwrap();
-        assert_eq!(provider, LlmProvider::Anthropic);
-    }
-
-    #[test]
-    fn test_resolve_provider_explicit() {
-        let state = create_test_state();
-        let tool = AgentSpawnTool::new(state);
-
-        assert_eq!(
-            tool.resolve_provider(Some("openai")).unwrap(),
-            LlmProvider::OpenAi
-        );
-        assert_eq!(
-            tool.resolve_provider(Some("gemini")).unwrap(),
-            LlmProvider::Gemini
-        );
-        assert_eq!(
-            tool.resolve_provider(Some("claude")).unwrap(),
-            LlmProvider::Anthropic
-        );
-    }
-
-    #[test]
-    fn test_resolve_provider_invalid() {
-        let state = create_test_state();
-        let tool = AgentSpawnTool::new(state);
-        assert!(tool.resolve_provider(Some("unknown")).is_err());
-    }
-
-    #[test]
-    fn test_resolve_model_default() {
-        let state = create_test_state();
-        let tool = AgentSpawnTool::new(state);
-
-        let model = tool.resolve_model(LlmProvider::Anthropic, None);
-        assert!(model.contains("claude"));
-
-        let model = tool.resolve_model(LlmProvider::OpenAi, None);
-        assert!(model.contains("gpt"));
-
-        let model = tool.resolve_model(LlmProvider::Gemini, None);
-        assert!(model.contains("gemini"));
-    }
-
-    #[test]
-    fn test_resolve_model_explicit() {
-        let state = create_test_state();
-        let tool = AgentSpawnTool::new(state);
-        let model = tool.resolve_model(LlmProvider::Anthropic, Some("claude-opus-4-20250514"));
-        assert_eq!(model, "claude-opus-4-20250514");
     }
 
     #[tokio::test]
@@ -929,60 +774,109 @@ mod tests {
     mod model_validation {
         use super::*;
 
-        #[test]
-        fn test_allowed_model_passes_validation() {
+        #[tokio::test]
+        async fn test_disallowed_model_is_invalid_args() {
             let state = create_test_state();
             let tool = AgentSpawnTool::new(state);
 
-            // These should all pass validation
-            assert!(
-                tool.validate_model(LlmProvider::Anthropic, "claude-opus-4-6")
-                    .is_ok()
-            );
-            assert!(
-                tool.validate_model(LlmProvider::Anthropic, "claude-sonnet-4-5")
-                    .is_ok()
-            );
-            assert!(
-                tool.validate_model(LlmProvider::Anthropic, "claude-opus-4-5")
-                    .is_ok()
-            );
-            assert!(tool.validate_model(LlmProvider::OpenAi, "gpt-5.2").is_ok());
-            assert!(
-                tool.validate_model(LlmProvider::OpenAi, "gpt-5.2-pro")
-                    .is_ok()
-            );
-            assert!(
-                tool.validate_model(LlmProvider::Gemini, "gemini-3-flash-preview")
-                    .is_ok()
-            );
-            assert!(
-                tool.validate_model(LlmProvider::Gemini, "gemini-3-pro-preview")
-                    .is_ok()
-            );
+            // Old/wrong model names should fail before any client is created
+            let err = tool
+                .call(json!({"prompt": "x", "provider": "openai", "model": "gpt-4o"}))
+                .await
+                .unwrap_err();
+            match err {
+                BuiltinToolError::InvalidArgs(msg) => {
+                    assert!(msg.contains("not in allowlist"), "{msg}");
+                    assert!(
+                        msg.contains("gpt-5.2"),
+                        "should suggest allowed models: {msg}"
+                    );
+                }
+                other => panic!("expected InvalidArgs, got {other:?}"),
+            }
         }
 
-        #[test]
-        fn test_disallowed_model_fails_validation() {
+        #[tokio::test]
+        async fn test_allowed_model_reaches_client_creation() {
             let state = create_test_state();
             let tool = AgentSpawnTool::new(state);
-
-            // Old/wrong model names should fail
+            // The mock factory fails, so an allowed model gets past validation
+            // and fails at client creation instead.
             let err = tool
-                .validate_model(LlmProvider::OpenAi, "gpt-4o")
+                .call(json!({"prompt": "x", "provider": "openai", "model": "gpt-5.2"}))
+                .await
                 .unwrap_err();
-            assert!(err.to_string().contains("not in allowlist"));
-            assert!(err.to_string().contains("gpt-5.2")); // Should suggest allowed models
+            match err {
+                BuiltinToolError::ExecutionFailed(msg) => {
+                    assert!(msg.starts_with("Failed to create LLM client: "), "{msg}");
+                }
+                other => panic!("expected ExecutionFailed, got {other:?}"),
+            }
+        }
 
-            let err = tool
-                .validate_model(LlmProvider::Anthropic, "claude-3-5-sonnet-20241022")
-                .unwrap_err();
-            assert!(err.to_string().contains("not in allowlist"));
+        #[tokio::test]
+        async fn test_injected_resolver_is_used() {
+            let resolver = CountingResolver::ok();
+            let state = Arc::new(
+                SubAgentToolState::new(
+                    Arc::new(SubAgentManager::new(ConcurrencyLimits::default(), 0)),
+                    Arc::new(MockClientFactory::failing()),
+                    Arc::new(MockToolDispatcher),
+                    Arc::new(MockSessionStore),
+                    Arc::new(RwLock::new(Session::new())),
+                    SubAgentConfig::default(),
+                    0,
+                )
+                .with_parent_model(meerkat_core::Provider::OpenAI, "parent-model")
+                .with_model_resolver(Arc::clone(&resolver) as _),
+            );
+            let tool = AgentSpawnTool::new(Arc::clone(&state));
 
+            let out = tool
+                .call(json!({"prompt": "x", "provider": "litellm", "model": "any-model"}))
+                .await
+                .unwrap();
+            let ToolOutput::Json(out) = out else {
+                panic!("expected JSON output");
+            };
+            assert_eq!(out["model"], "any-model");
+            assert_eq!(resolver.calls(), 1);
+            let seen = resolver.last_request();
+            assert_eq!(seen.provider.as_deref(), Some("litellm"));
+            assert_eq!(seen.model.as_deref(), Some("any-model"));
+            assert_eq!(seen.parent_provider, meerkat_core::Provider::OpenAI);
+            assert_eq!(seen.parent_model, "parent-model");
+            assert_eq!(seen.depth, 1);
+
+            let def = tool.def();
+            let desc = def.input_schema["properties"]["model"]["description"]
+                .as_str()
+                .unwrap();
+            assert!(desc.contains(COUNTING_RESOLVER_DESCRIPTION), "{desc}");
+        }
+
+        #[tokio::test]
+        async fn test_resolver_model_not_available_is_invalid_args() {
+            let resolver = CountingResolver::unavailable();
+            let state = Arc::new(
+                SubAgentToolState::new(
+                    Arc::new(SubAgentManager::new(ConcurrencyLimits::default(), 0)),
+                    Arc::new(MockClientFactory::new()),
+                    Arc::new(MockToolDispatcher),
+                    Arc::new(MockSessionStore),
+                    Arc::new(RwLock::new(Session::new())),
+                    SubAgentConfig::default(),
+                    0,
+                )
+                .with_model_resolver(Arc::clone(&resolver) as _),
+            );
+            let tool = AgentSpawnTool::new(state);
             let err = tool
-                .validate_model(LlmProvider::Gemini, "gemini-1.5-flash")
+                .call(json!({"prompt": "x", "model": "nope"}))
+                .await
                 .unwrap_err();
-            assert!(err.to_string().contains("not in allowlist"));
+            assert!(matches!(err, BuiltinToolError::InvalidArgs(_)), "{err:?}");
+            assert_eq!(resolver.calls(), 1);
         }
 
         #[test]

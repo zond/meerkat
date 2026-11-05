@@ -52,6 +52,7 @@ pub mod time_compat;
 pub mod tool_scope;
 pub mod turn_boundary;
 pub mod types;
+pub mod usage;
 pub mod wait_interrupt;
 
 // Re-export main types at crate root
@@ -143,7 +144,10 @@ pub use session::{
     SessionMetadata, SessionSystemContextState, SessionTooling, SystemContextStageError,
 };
 pub use state::LoopState;
-pub use sub_agent::{SubAgentCommsInfo, SubAgentCompletion, SubAgentInfo, SubAgentManager};
+pub use sub_agent::{
+    ResolvedSubAgentModel, SubAgentCommsInfo, SubAgentCompletion, SubAgentInfo, SubAgentManager,
+    SubAgentModelError, SubAgentModelRequest, SubAgentModelResolver,
+};
 pub use tool_scope::{
     ComposedToolFilter, EXTERNAL_TOOL_FILTER_METADATA_KEY, ToolFilter, ToolScope, ToolScopeHandle,
     ToolScopeRevision, ToolScopeStageError,
@@ -155,4 +159,5 @@ pub use types::{
     StopReason, SystemMessage, ToolCall, ToolCallIter, ToolCallView, ToolDef, ToolResult, Usage,
     UserMessage, has_images,
 };
+pub use usage::{MeteredLlmClient, UsageEntry, UsageLedger, UsageObserver};
 pub use wait_interrupt::{WaitInterrupt, WaitInterruptBindError, WaitInterruptReceiver};

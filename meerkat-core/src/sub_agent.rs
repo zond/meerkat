@@ -2,17 +2,20 @@
 //!
 //! Handles fork/spawn operations and result collection.
 
+use crate::agent::AgentLlmClient;
 use crate::budget::BudgetLimits;
 use crate::error::AgentError;
 use crate::ops::{
     ConcurrencyLimits, ContextStrategy, ForkBudgetPolicy, OperationId, OperationResult,
     SubAgentState, ToolAccessPolicy,
 };
+use crate::provider::Provider;
 use crate::session::Session;
 use crate::time_compat::Instant;
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
 use crate::types::{Message, ToolDef};
+use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, watch};
@@ -504,6 +507,89 @@ impl SubAgentManager {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
+}
+
+// ── Sub-agent model resolution ──────────────────────────────────────────
+
+/// What a sub-agent tool call asked for, plus the parent's model context.
+///
+/// Handed to a [`SubAgentModelResolver`] when `agent_spawn` / `agent_fork`
+/// creates a child. `provider` and `model` are the raw (unvalidated) tool
+/// arguments; `None` means "use the resolver's default".
+#[derive(Debug, Clone, Copy)]
+pub struct SubAgentModelRequest<'a> {
+    /// Provider/endpoint name requested by the tool call, if any.
+    pub provider: Option<&'a str>,
+    /// Model name requested by the tool call, if any.
+    pub model: Option<&'a str>,
+    /// Provider of the agent that is spawning the child.
+    pub parent_provider: Provider,
+    /// Model of the agent that is spawning the child (empty when unknown).
+    pub parent_model: &'a str,
+    /// Depth the child will run at (parent depth + 1).
+    pub depth: u32,
+}
+
+/// A fully resolved, ready-to-use LLM client for a sub-agent.
+pub struct ResolvedSubAgentModel {
+    /// Client the child agent runs against.
+    pub client: Arc<dyn AgentLlmClient>,
+    /// Provider family of the resolved model.
+    pub provider: Provider,
+    /// Model name passed to the agent (and reported by usage metering).
+    pub model: String,
+    /// Human-readable label for the resolved model (e.g. `endpoint:model`).
+    pub display: String,
+}
+
+impl std::fmt::Debug for ResolvedSubAgentModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedSubAgentModel")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("display", &self.display)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a sub-agent model could not be resolved.
+///
+/// `InvalidProvider` and `ModelNotAvailable` are caller mistakes (surfaced as
+/// invalid tool arguments); `Client` is an infrastructure failure.
+#[derive(Debug, thiserror::Error)]
+pub enum SubAgentModelError {
+    /// The requested provider/endpoint is unknown.
+    #[error("Invalid provider: {0}")]
+    InvalidProvider(String),
+    /// The model is not available on the selected provider/endpoint.
+    #[error("Model '{model}' is not in allowlist for provider '{endpoint}'. {hint}")]
+    ModelNotAvailable {
+        model: String,
+        endpoint: String,
+        hint: String,
+    },
+    /// Creating the client failed.
+    #[error("{0}")]
+    Client(String),
+}
+
+/// Resolves the provider, model and LLM client for a sub-agent.
+///
+/// The default implementation (in `meerkat-tools`) validates against the
+/// configured allowlists and builds clients from environment credentials;
+/// embedders inject their own to route children through the same endpoints
+/// as the parent.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait SubAgentModelResolver: Send + Sync {
+    /// Resolve (and validate) the model for one child agent.
+    async fn resolve(
+        &self,
+        req: SubAgentModelRequest<'_>,
+    ) -> Result<ResolvedSubAgentModel, SubAgentModelError>;
+
+    /// Short description of the selectable models, used in tool descriptions.
+    fn describe(&self) -> String;
 }
 
 #[cfg(test)]

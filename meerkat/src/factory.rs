@@ -37,7 +37,7 @@ const DEFAULT_WASM_SYSTEM_PROMPT: &str = r"You are an autonomous agent. Your tas
 use meerkat_core::{
     Agent, AgentBuilder, AgentEvent, AgentLlmClient, AgentSessionStore, AgentToolDispatcher,
     BudgetLimits, Config, HookRunOverrides, OutputSchema, Provider, ScopedAgentEvent, Session,
-    SessionMetadata, SessionTooling, StreamScopeFrame,
+    SessionMetadata, SessionTooling, StreamScopeFrame, SubAgentModelResolver, UsageObserver,
 };
 #[cfg(feature = "sub-agents")]
 use meerkat_core::{ConcurrencyLimits, SubAgentManager};
@@ -170,6 +170,31 @@ struct SubAgentCommsWiring {
     parent_classification_peers: Arc<parking_lot::RwLock<meerkat_comms::TrustedPeers>>,
 }
 
+/// Sub-agent plumbing threaded from [`AgentFactory::build_agent`] into the
+/// builtin dispatcher and from there into `SubAgentToolState`.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Default)]
+#[cfg_attr(not(feature = "sub-agents"), allow(dead_code))]
+pub(crate) struct SubAgentWiring {
+    /// Scoped event sink for attributed child events.
+    scoped_event_tx: Option<mpsc::Sender<ScopedAgentEvent>>,
+    /// Parent scope path children are attributed under.
+    scope_path: Option<Vec<StreamScopeFrame>>,
+    /// Parent's hook engine, inherited by children.
+    hook_engine: Option<Arc<dyn meerkat_core::HookEngine>>,
+    /// Parent's run-scoped hook overrides, inherited by children.
+    hook_run_overrides: HookRunOverrides,
+    /// Injected model resolver (default: allowlist + env-keyed clients).
+    model_resolver: Option<Arc<dyn SubAgentModelResolver>>,
+    /// Observer metering every child's LLM usage.
+    usage_observer: Option<Arc<dyn UsageObserver>>,
+    /// The parent's provider and model, handed to the resolver.
+    parent_model: Option<(Provider, String)>,
+    /// Comms wiring for children of a comms-enabled parent.
+    #[cfg(all(feature = "sub-agents", feature = "comms"))]
+    comms: Option<SubAgentCommsWiring>,
+}
+
 /// Encode an LLM client override for transport in `SessionBuildOptions`.
 ///
 /// `SessionBuildOptions` lives in `meerkat-core` and cannot depend directly on
@@ -291,6 +316,15 @@ pub struct AgentBuildConfig {
     /// Pre-built skill engine. Skips filesystem/git repository resolution.
     pub skill_engine_override: Option<Arc<meerkat_core::skills::SkillRuntime>>,
 
+    /// Resolver for sub-agent provider/model/client. When `None`, children
+    /// are validated against the `sub_agents` allowlist and get clients from
+    /// environment credentials.
+    pub sub_agent_model_resolver: Option<Arc<dyn SubAgentModelResolver>>,
+
+    /// Observer receiving the per-call LLM usage of every sub-agent (the
+    /// agent being built is not metered; account for it via `TurnCompleted`).
+    pub usage_observer: Option<Arc<dyn UsageObserver>>,
+
     /// Opaque application context for custom `SessionAgentBuilder` implementations.
     /// Not consumed by the standard build pipeline.
     pub app_context: Option<serde_json::Value>,
@@ -362,6 +396,11 @@ impl std::fmt::Debug for AgentBuildConfig {
                 "skill_engine_override",
                 &self.skill_engine_override.is_some(),
             )
+            .field(
+                "sub_agent_model_resolver",
+                &self.sub_agent_model_resolver.is_some(),
+            )
+            .field("usage_observer", &self.usage_observer.is_some())
             .field("app_context", &self.app_context.is_some())
             .field("additional_instructions", &self.additional_instructions)
             .field("wait_for_mcp", &self.wait_for_mcp)
@@ -408,6 +447,8 @@ impl AgentBuildConfig {
             session_store_override: None,
             hook_engine_override: None,
             skill_engine_override: None,
+            sub_agent_model_resolver: None,
+            usage_observer: None,
             app_context: None,
             additional_instructions: None,
             wait_for_mcp: false,
@@ -983,11 +1024,7 @@ impl AgentFactory {
             external,
             session_id,
             skill_engine,
-            None,
-            None,
-            None,
-            #[cfg(all(feature = "sub-agents", feature = "comms"))]
-            None,
+            SubAgentWiring::default(),
             // Public API defaults to true (all tools visible).
             true,
         )
@@ -1010,14 +1047,7 @@ impl AgentFactory {
             Arc<meerkat_core::skills::SkillRuntime>,
         >,
         #[cfg_attr(not(feature = "sub-agents"), allow(unused_variables))]
-        sub_agent_scoped_event_tx: Option<mpsc::Sender<ScopedAgentEvent>>,
-        #[cfg_attr(not(feature = "sub-agents"), allow(unused_variables))]
-        sub_agent_scope_path: Option<Vec<StreamScopeFrame>>,
-        #[cfg_attr(not(feature = "sub-agents"), allow(unused_variables))]
-        sub_agent_hook_engine: Option<Arc<dyn meerkat_core::HookEngine>>,
-        #[cfg(all(feature = "sub-agents", feature = "comms"))] sub_agent_comms: Option<
-            SubAgentCommsWiring,
-        >,
+        sub_agent_wiring: SubAgentWiring,
         image_tool_results: bool,
     ) -> Result<Arc<dyn AgentToolDispatcher>, CompositeDispatcherError> {
         let builder = BuiltinDispatcherConfig {
@@ -1137,6 +1167,17 @@ impl AgentFactory {
             );
 
             let parent_session = Arc::new(RwLock::new(Session::new()));
+            let SubAgentWiring {
+                scoped_event_tx: sub_agent_scoped_event_tx,
+                scope_path: sub_agent_scope_path,
+                hook_engine: sub_agent_hook_engine,
+                hook_run_overrides: sub_agent_hook_run_overrides,
+                model_resolver: sub_agent_model_resolver,
+                usage_observer: sub_agent_usage_observer,
+                parent_model: sub_agent_parent_model,
+                #[cfg(all(feature = "sub-agents", feature = "comms"))]
+                    comms: sub_agent_comms,
+            } = sub_agent_wiring;
             #[cfg_attr(not(feature = "comms"), allow(unused_mut))]
             let mut sub_agent_config = SubAgentConfig::default();
             #[cfg(all(feature = "sub-agents", feature = "comms"))]
@@ -1181,16 +1222,26 @@ impl AgentFactory {
                 sub_agent_config,
                 0,
             );
-            // Propagate the parent's hook engine so guardrail hooks
-            // (e.g. PreToolExecution) also fire inside sub-agents.
-            let state = Arc::new(match sub_agent_hook_engine {
-                Some(engine) => state.with_hook_engine(engine),
-                None => state,
-            });
+            // Propagate the parent's hook engine and run overrides so guardrail
+            // hooks (e.g. PreToolExecution) also fire inside sub-agents.
+            let mut state = state.with_hook_run_overrides(sub_agent_hook_run_overrides);
+            if let Some(engine) = sub_agent_hook_engine {
+                state = state.with_hook_engine(engine);
+            }
+            if let Some(resolver) = sub_agent_model_resolver {
+                state = state.with_model_resolver(resolver);
+            }
+            if let Some(observer) = sub_agent_usage_observer {
+                state = state.with_usage_observer(observer);
+            }
+            if let Some((provider, model)) = sub_agent_parent_model {
+                state = state.with_parent_model(provider, model);
+            }
+            let state = Arc::new(state);
             state
                 .set_scoped_stream(
-                    sub_agent_scoped_event_tx.clone(),
-                    sub_agent_scope_path.clone().unwrap_or_default(),
+                    sub_agent_scoped_event_tx,
+                    sub_agent_scope_path.unwrap_or_default(),
                 )
                 .await;
 
@@ -1470,6 +1521,17 @@ impl AgentFactory {
             } else {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
+                    let sub_agent_wiring = SubAgentWiring {
+                        scoped_event_tx: build_config.scoped_event_tx.clone(),
+                        scope_path: build_config.scoped_event_path.clone(),
+                        hook_engine: hook_engine.clone(),
+                        hook_run_overrides: build_config.hooks_override.clone(),
+                        model_resolver: build_config.sub_agent_model_resolver.take(),
+                        usage_observer: build_config.usage_observer.take(),
+                        parent_model: Some((provider, model.clone())),
+                        #[cfg(all(feature = "sub-agents", feature = "comms"))]
+                        comms: sub_agent_comms,
+                    };
                     self.build_tool_dispatcher_for_agent_with_overrides(
                         config,
                         build_config.external_tools,
@@ -1477,11 +1539,7 @@ impl AgentFactory {
                         effective_shell,
                         effective_subagents,
                         skill_engine.clone(),
-                        build_config.scoped_event_tx.clone(),
-                        build_config.scoped_event_path.clone(),
-                        hook_engine.clone(),
-                        #[cfg(all(feature = "sub-agents", feature = "comms"))]
-                        sub_agent_comms,
+                        sub_agent_wiring,
                         build_config.shell_env.take(),
                         image_tool_results,
                     )
@@ -2016,12 +2074,7 @@ impl AgentFactory {
         effective_shell: bool,
         effective_subagents: bool,
         skill_engine: Option<Arc<meerkat_core::skills::SkillRuntime>>,
-        sub_agent_scoped_event_tx: Option<mpsc::Sender<ScopedAgentEvent>>,
-        sub_agent_scope_path: Option<Vec<StreamScopeFrame>>,
-        sub_agent_hook_engine: Option<Arc<dyn meerkat_core::HookEngine>>,
-        #[cfg(all(feature = "sub-agents", feature = "comms"))] sub_agent_comms: Option<
-            SubAgentCommsWiring,
-        >,
+        sub_agent_wiring: SubAgentWiring,
         shell_env: Option<std::collections::HashMap<String, String>>,
         image_tool_results: bool,
     ) -> Result<(Arc<dyn AgentToolDispatcher>, String), BuildAgentError> {
@@ -2085,11 +2138,7 @@ impl AgentFactory {
                 external,
                 None,
                 skill_engine,
-                sub_agent_scoped_event_tx,
-                sub_agent_scope_path,
-                sub_agent_hook_engine,
-                #[cfg(all(feature = "sub-agents", feature = "comms"))]
-                sub_agent_comms,
+                sub_agent_wiring,
                 image_tool_results,
             )
             .await?;

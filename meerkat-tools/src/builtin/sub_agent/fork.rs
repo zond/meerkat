@@ -1,6 +1,5 @@
 //! agent_fork tool - Fork current agent with continued context
 
-use super::config::SubAgentError;
 #[cfg(feature = "comms")]
 use super::runner::SubAgentCommsConfig;
 use super::runner::{DynSubAgentSpec, create_fork_session, spawn_sub_agent_dyn};
@@ -8,7 +7,6 @@ use super::state::SubAgentToolState;
 use crate::builtin::{BuiltinTool, BuiltinToolError, ToolOutput};
 use crate::dispatcher::FilteredDispatcher;
 use async_trait::async_trait;
-use meerkat_client::LlmProvider;
 use meerkat_core::ToolDef;
 use meerkat_core::ops::{ForkBudgetPolicy, OperationId, ToolAccessPolicy};
 use serde::de;
@@ -25,11 +23,11 @@ enum ProviderName {
 }
 
 impl ProviderName {
-    fn to_provider(self) -> LlmProvider {
+    fn as_str(self) -> &'static str {
         match self {
-            ProviderName::Anthropic => LlmProvider::Anthropic,
-            ProviderName::Openai => LlmProvider::OpenAi,
-            ProviderName::Gemini => LlmProvider::Gemini,
+            ProviderName::Anthropic => "anthropic",
+            ProviderName::Openai => "openai",
+            ProviderName::Gemini => "gemini",
         }
     }
 }
@@ -158,55 +156,6 @@ impl AgentForkTool {
         Self { state }
     }
 
-    fn resolve_provider(
-        &self,
-        provider: Option<ProviderName>,
-    ) -> Result<LlmProvider, SubAgentError> {
-        if let Some(provider) = provider {
-            return Ok(provider.to_provider());
-        }
-
-        // Use resolved policy if available
-        if let Some(ref policy) = self.state.config.resolved_policy {
-            return match policy.default_provider {
-                meerkat_core::Provider::Anthropic => Ok(LlmProvider::Anthropic),
-                meerkat_core::Provider::OpenAI => Ok(LlmProvider::OpenAi),
-                meerkat_core::Provider::Gemini => Ok(LlmProvider::Gemini),
-                meerkat_core::Provider::Other => Err(SubAgentError::invalid_provider("other")),
-            };
-        }
-
-        let provider_name = self.state.config.default_provider.as_str();
-        LlmProvider::parse(provider_name)
-            .ok_or_else(|| SubAgentError::invalid_provider(provider_name))
-    }
-
-    fn resolve_model(&self, provider: LlmProvider, model: Option<&str>) -> String {
-        if let Some(m) = model {
-            return m.to_string();
-        }
-        // Use resolved policy default if available
-        if let Some(ref policy) = self.state.config.resolved_policy {
-            return policy.default_model.clone();
-        }
-        if let Some(ref default) = self.state.config.default_model {
-            return default.clone();
-        }
-        // Fallback: first model in provider-specific default allowlist
-        let core_provider = match provider {
-            LlmProvider::Anthropic => meerkat_core::Provider::Anthropic,
-            LlmProvider::OpenAi => meerkat_core::Provider::OpenAI,
-            LlmProvider::Gemini => meerkat_core::Provider::Gemini,
-        };
-        let defaults = meerkat_core::config::SubAgentsConfig::default();
-        defaults
-            .allowed_models
-            .get(core_provider.as_str())
-            .and_then(|v| v.first())
-            .cloned()
-            .unwrap_or_default()
-    }
-
     fn resolve_budget_policy(&self, policy_str: Option<&str>) -> ForkBudgetPolicy {
         match policy_str {
             Some("equal") => ForkBudgetPolicy::Equal,
@@ -274,11 +223,17 @@ impl AgentForkTool {
             ));
         }
 
-        // Resolve provider and model
-        let provider = self
-            .resolve_provider(params.provider)
-            .map_err(|e| BuiltinToolError::invalid_args(e.to_string()))?;
-        let model = self.resolve_model(provider, params.model.as_deref());
+        // Resolve provider/model, validate it and create the fork's client
+        let resolved = self
+            .state
+            .resolve_child_model(
+                params.provider.map(ProviderName::as_str),
+                params.model.as_deref(),
+            )
+            .await?;
+        let provider = resolved.provider;
+        let model = resolved.model;
+        let client = resolved.client;
 
         // Resolve tool access policy and apply filtering
         let tool_access: ToolAccessPolicy = params
@@ -296,15 +251,6 @@ impl AgentForkTool {
         // Resolve budget policy and calculate budget
         let budget_policy = self.resolve_budget_policy(params.budget_policy.as_deref());
         let budget = self.resolve_fork_budget(budget_policy);
-
-        // Create client for the forked agent
-        let client = self
-            .state
-            .client_factory
-            .create_client(provider, None)
-            .map_err(|e| {
-                BuiltinToolError::execution_failed(format!("Failed to create LLM client: {e}"))
-            })?;
 
         // Get parent session and create forked session
         let parent_session = self.state.parent_session.read().await;
@@ -355,6 +301,8 @@ impl AgentForkTool {
             scoped_event_tx,
             parent_scope_path,
             hook_engine: self.state.hook_engine.clone(),
+            hook_run_overrides: self.state.hook_run_overrides.clone(),
+            usage_observer: self.state.usage_observer.clone(),
         };
         #[cfg(not(feature = "comms"))]
         let spec = DynSubAgentSpec {
@@ -370,6 +318,8 @@ impl AgentForkTool {
             scoped_event_tx,
             parent_scope_path,
             hook_engine: self.state.hook_engine.clone(),
+            hook_run_overrides: self.state.hook_run_overrides.clone(),
+            usage_observer: self.state.usage_observer.clone(),
         };
 
         // Spawn the forked agent
@@ -387,7 +337,7 @@ impl AgentForkTool {
         Ok(ForkResponse {
             agent_id: op_id.to_string(),
             name,
-            provider: provider.to_string(),
+            provider: provider.as_str().to_string(),
             model,
             state: "running".to_string(),
             messages_inherited,
@@ -433,7 +383,8 @@ impl BuiltinTool for AgentForkTool {
 mod tests {
     use super::*;
     use crate::builtin::sub_agent::config::SubAgentConfig;
-    use meerkat_client::{FactoryError, LlmClient, LlmClientFactory};
+    use crate::builtin::sub_agent::test_support::CountingResolver;
+    use meerkat_client::{FactoryError, LlmClient, LlmClientFactory, LlmProvider};
     use meerkat_core::error::{AgentError, ToolError};
     use meerkat_core::ops::ConcurrencyLimits;
     use meerkat_core::session::Session;
@@ -687,28 +638,75 @@ mod tests {
         assert!(result.is_err()); // Fails at client creation
     }
 
-    #[test]
-    fn test_resolve_provider() {
+    #[tokio::test]
+    async fn test_fork_validates_model() {
         let state = create_test_state();
         let tool = AgentForkTool::new(state);
-
-        assert_eq!(tool.resolve_provider(None).unwrap(), LlmProvider::Anthropic);
-        assert_eq!(
-            tool.resolve_provider(Some(ProviderName::Openai)).unwrap(),
-            LlmProvider::OpenAi
-        );
+        let err = tool
+            .call(json!({"prompt": "Continue", "provider": "openai", "model": "gpt-4o"}))
+            .await
+            .unwrap_err();
+        match err {
+            BuiltinToolError::InvalidArgs(msg) => {
+                assert!(msg.contains("not in allowlist"), "{msg}");
+            }
+            other => panic!("expected InvalidArgs, got {other:?}"),
+        }
     }
 
-    #[test]
-    fn test_resolve_model() {
-        let state = create_test_state();
+    #[tokio::test]
+    async fn test_fork_uses_injected_resolver() {
+        let resolver = CountingResolver::ok();
+        let state = Arc::new(
+            SubAgentToolState::new(
+                Arc::new(SubAgentManager::new(ConcurrencyLimits::default(), 0)),
+                Arc::new(MockClientFactory::failing()),
+                Arc::new(MockToolDispatcher),
+                Arc::new(MockSessionStore),
+                Arc::new(RwLock::new(Session::new())),
+                SubAgentConfig::default(),
+                0,
+            )
+            .with_parent_model(meerkat_core::Provider::Gemini, "parent-model")
+            .with_model_resolver(Arc::clone(&resolver) as _),
+        );
         let tool = AgentForkTool::new(state);
+        let out = tool
+            .call(json!({"prompt": "Continue", "provider": "gemini", "model": "m1"}))
+            .await
+            .unwrap();
+        let ToolOutput::Json(out) = out else {
+            panic!("expected JSON output");
+        };
+        assert_eq!(out["model"], "m1");
+        assert_eq!(resolver.calls(), 1);
+        let seen = resolver.last_request();
+        assert_eq!(seen.provider.as_deref(), Some("gemini"));
+        assert_eq!(seen.model.as_deref(), Some("m1"));
+        assert_eq!(seen.parent_provider, meerkat_core::Provider::Gemini);
+        assert_eq!(seen.parent_model, "parent-model");
+        assert_eq!(seen.depth, 1);
+    }
 
-        let model = tool.resolve_model(LlmProvider::Anthropic, None);
-        assert!(model.contains("claude"));
-
-        let model = tool.resolve_model(LlmProvider::Anthropic, Some("custom-model"));
-        assert_eq!(model, "custom-model");
+    #[tokio::test]
+    async fn test_fork_resolver_model_not_available_is_invalid_args() {
+        let resolver = CountingResolver::unavailable();
+        let state = Arc::new(
+            SubAgentToolState::new(
+                Arc::new(SubAgentManager::new(ConcurrencyLimits::default(), 0)),
+                Arc::new(MockClientFactory::new()),
+                Arc::new(MockToolDispatcher),
+                Arc::new(MockSessionStore),
+                Arc::new(RwLock::new(Session::new())),
+                SubAgentConfig::default(),
+                0,
+            )
+            .with_model_resolver(Arc::clone(&resolver) as _),
+        );
+        let tool = AgentForkTool::new(state);
+        let err = tool.call(json!({"prompt": "Continue"})).await.unwrap_err();
+        assert!(matches!(err, BuiltinToolError::InvalidArgs(_)), "{err:?}");
+        assert_eq!(resolver.calls(), 1);
     }
 
     #[test]

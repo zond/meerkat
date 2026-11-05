@@ -13,13 +13,14 @@ use meerkat_comms::agent::wrap_with_comms;
 use meerkat_comms::runtime::{CommsBootstrap, CommsRuntime, CoreCommsConfig, ParentCommsContext};
 #[cfg(feature = "comms")]
 use meerkat_comms::{PubKey, TrustedPeer, TrustedPeers};
+use meerkat_core::config::HookRunOverrides;
 use meerkat_core::ops::{OperationId, OperationResult};
 use meerkat_core::session::Session;
 use meerkat_core::sub_agent::SubAgentManager;
 use meerkat_core::types::{Message, SystemMessage, UserMessage};
 use meerkat_core::{
-    AgentBuilder, AgentEvent, AgentSessionStore, AgentToolDispatcher, BudgetLimits, HookEngine,
-    ScopedAgentEvent, StreamScopeFrame,
+    AgentBuilder, AgentEvent, AgentLlmClient, AgentSessionStore, AgentToolDispatcher, BudgetLimits,
+    HookEngine, MeteredLlmClient, ScopedAgentEvent, StreamScopeFrame, UsageObserver,
 };
 #[cfg(feature = "comms")]
 use std::path::PathBuf;
@@ -111,24 +112,50 @@ pub fn create_fork_session(parent_session: &Session, fork_prompt: &str) -> Sessi
     session
 }
 
-fn spawn_scoped_forwarder(
-    mut child_event_rx: mpsc::Receiver<AgentEvent>,
-    scoped_tx: mpsc::Sender<ScopedAgentEvent>,
-    parent_scope_path: Arc<Vec<StreamScopeFrame>>,
+/// Scope path of a child: the parent's path (or an unknown primary when the
+/// parent has none) followed by the child's own frame.
+fn child_scope_path(
+    parent_scope_path: &[StreamScopeFrame],
     child_scope_frame: StreamScopeFrame,
-) -> tokio::task::JoinHandle<()> {
-    let mut base_scope_path = if parent_scope_path.is_empty() {
+) -> Vec<StreamScopeFrame> {
+    let mut path = if parent_scope_path.is_empty() {
         vec![StreamScopeFrame::Primary {
             session_id: "unknown".to_string(),
         }]
     } else {
-        (*parent_scope_path).clone()
+        parent_scope_path.to_vec()
     };
-    base_scope_path.push(child_scope_frame);
+    path.push(child_scope_frame);
+    path
+}
 
+/// The client a child runs against: metered under `scope_path` when an
+/// observer is set, otherwise the given client unchanged.
+fn child_llm_client(
+    client: Arc<dyn AgentLlmClient>,
+    usage_observer: Option<Arc<dyn UsageObserver>>,
+    scope_path: &[StreamScopeFrame],
+    model: &str,
+) -> Arc<dyn AgentLlmClient> {
+    match usage_observer {
+        Some(observer) => Arc::new(MeteredLlmClient::new(
+            client,
+            observer,
+            scope_path.to_vec(),
+            model,
+        )),
+        None => client,
+    }
+}
+
+fn spawn_scoped_forwarder(
+    mut child_event_rx: mpsc::Receiver<AgentEvent>,
+    scoped_tx: mpsc::Sender<ScopedAgentEvent>,
+    scope_path: Vec<StreamScopeFrame>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = child_event_rx.recv().await {
-            let scoped = ScopedAgentEvent::new(base_scope_path.clone(), event);
+            let scoped = ScopedAgentEvent::new(scope_path.clone(), event);
             if scoped_tx.send(scoped).await.is_err() {
                 break;
             }
@@ -239,11 +266,11 @@ where
 /// Specification for spawning a sub-agent (trait object version)
 ///
 /// This is used when the concrete types aren't known at compile time,
-/// such as when using LlmClientFactory which returns trait objects.
+/// such as when the client comes from a `SubAgentModelResolver`.
 pub struct DynSubAgentSpec {
-    /// LLM client to use (trait object)
-    pub client: Arc<dyn LlmClient>,
-    /// Model name
+    /// Agent-ready LLM client (already adapted for `model`).
+    pub client: Arc<dyn AgentLlmClient>,
+    /// Model name (also the model usage is attributed to)
     pub model: String,
     /// Tool dispatcher (trait object)
     pub tools: Arc<dyn AgentToolDispatcher>,
@@ -277,12 +304,17 @@ pub struct DynSubAgentSpec {
     /// Hook engine inherited from the parent so guardrail hooks (e.g.
     /// `PreToolExecution`) also apply inside the sub-agent.
     pub hook_engine: Option<Arc<dyn HookEngine>>,
+    /// Run-scoped hook overrides inherited from the parent.
+    pub hook_run_overrides: HookRunOverrides,
+    /// When set, the child's client is wrapped in a [`MeteredLlmClient`]
+    /// reporting under the child's scope path.
+    pub usage_observer: Option<Arc<dyn UsageObserver>>,
 }
 
 /// Spawn and run a sub-agent in a background task (trait object version)
 ///
-/// This version works with trait objects as returned by LlmClientFactory.
-/// It internally uses LlmClientAdapter to bridge to AgentLlmClient.
+/// The client in `spec` is used as-is (it is already an `AgentLlmClient`);
+/// when `spec.usage_observer` is set it is wrapped in a [`MeteredLlmClient`].
 ///
 /// ## Comms Setup
 ///
@@ -301,17 +333,23 @@ pub async fn spawn_sub_agent_dyn(
 
     let started_at = Instant::now();
     let scoped_event_tx = spec.scoped_event_tx.clone();
-    let parent_scope_path = spec.parent_scope_path.clone();
+    let scope_path = child_scope_path(
+        &spec.parent_scope_path,
+        StreamScopeFrame::SubAgent {
+            agent_id: id.to_string(),
+            tool_call_id: None,
+            label: Some(name.clone()),
+        },
+    );
 
-    // Create the LLM client adapter (bridges LlmClient -> AgentLlmClient)
-    let client: Arc<dyn LlmClient> = spec.client;
-    let llm_adapter = Arc::new(LlmClientAdapter::new(client, spec.model.clone()));
+    let llm_client = child_llm_client(spec.client, spec.usage_observer, &scope_path, &spec.model);
 
     // Build the agent - now supports trait objects directly via ?Sized bounds
     let mut builder = AgentBuilder::new()
         .model(&spec.model)
         .depth(spec.depth)
-        .resume_session(spec.session);
+        .resume_session(spec.session)
+        .with_hook_run_overrides(spec.hook_run_overrides);
 
     if let Some(sys_prompt) = &spec.system_prompt {
         builder = builder.system_prompt(sys_prompt);
@@ -388,7 +426,7 @@ pub async fn spawn_sub_agent_dyn(
     let (tools, comms_info) = (spec.tools, None);
 
     // Pass trait objects directly - no wrappers needed thanks to ?Sized bounds
-    let mut agent = builder.build(llm_adapter, tools, spec.store).await;
+    let mut agent = builder.build(llm_client, tools, spec.store).await;
 
     // Register the sub-agent with the manager BEFORE spawning the task
     // This is critical - without registration, status/steer/cancel won't find the agent
@@ -404,23 +442,12 @@ pub async fn spawn_sub_agent_dyn(
     let _name_for_task = name.clone();
     let manager_for_task = manager.clone();
     let host_mode = spec.host_mode;
-    let child_agent_id = id.to_string();
-    let child_label = name.clone();
 
     // Spawn the agent execution task
     tokio::spawn(async move {
         let (result, forwarder_task) = if let Some(scoped_tx) = scoped_event_tx {
             let (child_event_tx, child_event_rx) = mpsc::channel::<AgentEvent>(64);
-            let forwarder = spawn_scoped_forwarder(
-                child_event_rx,
-                scoped_tx,
-                Arc::new(parent_scope_path.clone()),
-                StreamScopeFrame::SubAgent {
-                    agent_id: child_agent_id.clone(),
-                    tool_call_id: None,
-                    label: Some(child_label.clone()),
-                },
-            );
+            let forwarder = spawn_scoped_forwarder(child_event_rx, scoped_tx, scope_path);
 
             let result = if host_mode {
                 #[cfg(feature = "comms")]
@@ -673,10 +700,127 @@ mod tests {
         assert!(err.to_string().contains("execution error"));
     }
 
+    mod usage_metering {
+        use super::hook_propagation::{base_spec, run_to_end};
+        use super::*;
+        use crate::builtin::sub_agent::test_support::FixedUsageClient;
+        use async_trait::async_trait;
+        use meerkat_core::error::ToolError;
+        use meerkat_core::ops::SubAgentState;
+        use meerkat_core::{ToolCallView, ToolDef, ToolResult, Usage, UsageLedger};
+
+        struct NoTools;
+
+        #[async_trait]
+        impl AgentToolDispatcher for NoTools {
+            fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+                Arc::from([Arc::new(ToolDef {
+                    name: "noop".to_string(),
+                    description: "noop".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                })])
+            }
+
+            async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolResult, ToolError> {
+                Ok(ToolResult::new(
+                    call.id.to_string(),
+                    "ok".to_string(),
+                    false,
+                ))
+            }
+        }
+
+        fn usage() -> Usage {
+            Usage {
+                input_tokens: 1000,
+                output_tokens: 200,
+                cache_creation_tokens: Some(30),
+                cache_read_tokens: Some(400),
+            }
+        }
+
+        fn parent_path() -> Vec<StreamScopeFrame> {
+            vec![StreamScopeFrame::Primary {
+                session_id: "root".to_string(),
+            }]
+        }
+
+        #[tokio::test]
+        async fn completed_child_usage_is_metered_with_scope_and_model() {
+            let ledger = Arc::new(UsageLedger::new());
+            let mut spec = base_spec(Arc::new(FixedUsageClient::new(usage())), Arc::new(NoTools));
+            spec.model = "child-model".to_string();
+            spec.parent_scope_path = parent_path();
+            spec.usage_observer = Some(Arc::clone(&ledger) as Arc<dyn UsageObserver>);
+
+            let (id, state) = run_to_end(spec).await;
+            assert_eq!(state, SubAgentState::Completed);
+
+            let rows = ledger.snapshot();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].scope_id, format!("primary/sub:{id}"));
+            assert_eq!(rows[0].model, "child-model");
+            assert_eq!(rows[0].usage, usage());
+        }
+
+        #[tokio::test]
+        async fn failed_child_usage_is_retained() {
+            let ledger = Arc::new(UsageLedger::new());
+            let mut spec = base_spec(
+                Arc::new(FixedUsageClient::tool_then_fail(usage(), "noop")),
+                Arc::new(NoTools),
+            );
+            spec.usage_observer = Some(Arc::clone(&ledger) as Arc<dyn UsageObserver>);
+
+            let (id, state) = run_to_end(spec).await;
+            assert_eq!(state, SubAgentState::Failed);
+
+            let rows = ledger.snapshot();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            // No parent path: the child is attributed under an unknown primary.
+            assert_eq!(rows[0].scope_id, format!("primary/sub:{id}"));
+            assert_eq!(rows[0].usage, usage());
+        }
+
+        #[test]
+        fn without_observer_the_spec_client_is_used_unwrapped() {
+            let client: Arc<dyn AgentLlmClient> = Arc::new(FixedUsageClient::new(usage()));
+            let used = child_llm_client(Arc::clone(&client), None, &parent_path(), "m");
+            assert!(Arc::ptr_eq(&used, &client));
+
+            let ledger: Arc<dyn UsageObserver> = Arc::new(UsageLedger::new());
+            let used = child_llm_client(Arc::clone(&client), Some(ledger), &parent_path(), "m");
+            assert!(!Arc::ptr_eq(&used, &client));
+        }
+
+        #[test]
+        fn child_scope_path_appends_frame_to_parent_or_unknown_primary() {
+            let frame = StreamScopeFrame::SubAgent {
+                agent_id: "a".to_string(),
+                tool_call_id: None,
+                label: None,
+            };
+            let path = child_scope_path(&parent_path(), frame.clone());
+            assert_eq!(path, vec![parent_path()[0].clone(), frame.clone()]);
+            let path = child_scope_path(&[], frame.clone());
+            assert_eq!(
+                path,
+                vec![
+                    StreamScopeFrame::Primary {
+                        session_id: "unknown".to_string()
+                    },
+                    frame
+                ]
+            );
+        }
+    }
+
     mod hook_propagation {
         use super::*;
         use async_trait::async_trait;
-        use meerkat_client::{LlmDoneOutcome, LlmError, LlmEvent, LlmRequest};
+        use meerkat_client::{
+            LlmClient, LlmClientAdapter, LlmDoneOutcome, LlmError, LlmEvent, LlmRequest,
+        };
         use meerkat_core::error::{AgentError, ToolError};
         use meerkat_core::hooks::{
             HookDecision, HookEngineError, HookExecutionReport, HookId, HookInvocation, HookPoint,
@@ -804,19 +948,14 @@ mod tests {
             }
         }
 
-        /// Spawn a sub-agent that makes one tool call; returns how often the
-        /// tool was actually dispatched.
-        async fn run_sub_agent(hook_engine: Option<Arc<dyn HookEngine>>) -> usize {
-            let dispatched = Arc::new(AtomicUsize::new(0));
-            let manager = Arc::new(SubAgentManager::new(ConcurrencyLimits::default(), 0));
-            let spec = DynSubAgentSpec {
-                client: Arc::new(ToolCallingClient {
-                    calls: AtomicUsize::new(0),
-                }),
+        pub(super) fn base_spec(
+            client: Arc<dyn AgentLlmClient>,
+            tools: Arc<dyn AgentToolDispatcher>,
+        ) -> DynSubAgentSpec {
+            DynSubAgentSpec {
+                client,
                 model: "mock-model".to_string(),
-                tools: Arc::new(CountingDispatcher {
-                    dispatched: Arc::clone(&dispatched),
-                }),
+                tools,
                 store: Arc::new(NoopStore),
                 session: create_spawn_session("use the tool", None),
                 budget: None,
@@ -831,8 +970,16 @@ mod tests {
                 host_mode: false,
                 scoped_event_tx: None,
                 parent_scope_path: Vec::new(),
-                hook_engine,
-            };
+                hook_engine: None,
+                hook_run_overrides: HookRunOverrides::default(),
+                usage_observer: None,
+            }
+        }
+
+        /// Spawn `spec`, wait until the child leaves `Running`, return the
+        /// operation id and final state.
+        pub(super) async fn run_to_end(spec: DynSubAgentSpec) -> (OperationId, SubAgentState) {
+            let manager = Arc::new(SubAgentManager::new(ConcurrencyLimits::default(), 0));
             let id = OperationId::new();
             spawn_sub_agent_dyn(id.clone(), "child".to_string(), spec, Arc::clone(&manager))
                 .await
@@ -847,7 +994,36 @@ mod tests {
             })
             .await
             .expect("sub-agent finished in time");
-            assert_eq!(manager.get_state(&id).await, Some(SubAgentState::Completed));
+            let state = manager.get_state(&id).await.expect("sub-agent registered");
+            (id, state)
+        }
+
+        pub(super) fn tool_calling_client() -> Arc<dyn AgentLlmClient> {
+            Arc::new(LlmClientAdapter::new(
+                Arc::new(ToolCallingClient {
+                    calls: AtomicUsize::new(0),
+                }),
+                "mock-model".to_string(),
+            ))
+        }
+
+        /// Spawn a sub-agent that makes one tool call; returns how often the
+        /// tool was actually dispatched.
+        async fn run_sub_agent(
+            hook_engine: Option<Arc<dyn HookEngine>>,
+            hook_run_overrides: HookRunOverrides,
+        ) -> usize {
+            let dispatched = Arc::new(AtomicUsize::new(0));
+            let mut spec = base_spec(
+                tool_calling_client(),
+                Arc::new(CountingDispatcher {
+                    dispatched: Arc::clone(&dispatched),
+                }),
+            );
+            spec.hook_engine = hook_engine;
+            spec.hook_run_overrides = hook_run_overrides;
+            let (_, state) = run_to_end(spec).await;
+            assert_eq!(state, SubAgentState::Completed);
             dispatched.load(Ordering::SeqCst)
         }
 
@@ -858,7 +1034,7 @@ mod tests {
                 pre_tool_calls: Arc::clone(&pre_tool_calls),
             });
 
-            let dispatched = run_sub_agent(Some(engine)).await;
+            let dispatched = run_sub_agent(Some(engine), HookRunOverrides::default()).await;
 
             assert_eq!(pre_tool_calls.load(Ordering::SeqCst), 1);
             assert_eq!(dispatched, 0, "denied tool must not be dispatched");
@@ -866,7 +1042,45 @@ mod tests {
 
         #[tokio::test]
         async fn sub_agent_without_hook_engine_dispatches_tool_call() {
-            assert_eq!(run_sub_agent(None).await, 1);
+            assert_eq!(run_sub_agent(None, HookRunOverrides::default()).await, 1);
+        }
+
+        /// Records the run overrides handed to every hook invocation.
+        struct OverrideSpy {
+            seen: Arc<parking_lot::Mutex<Vec<Option<HookRunOverrides>>>>,
+        }
+
+        #[async_trait]
+        impl HookEngine for OverrideSpy {
+            async fn execute(
+                &self,
+                _invocation: HookInvocation,
+                overrides: Option<&HookRunOverrides>,
+            ) -> Result<HookExecutionReport, HookEngineError> {
+                self.seen.lock().push(overrides.cloned());
+                Ok(HookExecutionReport::empty())
+            }
+        }
+
+        #[tokio::test]
+        async fn sub_agent_receives_parent_hook_run_overrides() {
+            let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let engine: Arc<dyn HookEngine> = Arc::new(OverrideSpy {
+                seen: Arc::clone(&seen),
+            });
+            let overrides = HookRunOverrides {
+                entries: Vec::new(),
+                disable: vec![HookId::new("parent-disabled")],
+            };
+
+            run_sub_agent(Some(engine), overrides.clone()).await;
+
+            let seen = seen.lock();
+            assert!(!seen.is_empty(), "hooks were invoked");
+            assert!(
+                seen.iter().all(|o| o.as_ref() == Some(&overrides)),
+                "every hook call sees the parent's overrides: {seen:?}"
+            );
         }
     }
 }

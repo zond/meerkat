@@ -166,8 +166,29 @@ pub use meerkat_core::{
     StreamScope,
 };
 
+// Sub-agent model resolution and usage metering
+pub use meerkat_core::{
+    MeteredLlmClient, ResolvedSubAgentModel, SubAgentModelError, SubAgentModelRequest,
+    SubAgentModelResolver, UsageEntry, UsageLedger, UsageObserver,
+};
+#[cfg(all(feature = "sub-agents", not(target_arch = "wasm32")))]
+pub use meerkat_tools::builtin::sub_agent::DefaultSubAgentModelResolver;
+
 // Re-export client types
-pub use meerkat_client::{LlmClient, LlmDoneOutcome, LlmError, LlmEvent, LlmRequest, LlmResponse};
+pub use meerkat_client::{
+    LlmClient, LlmClientAdapter, LlmDoneOutcome, LlmError, LlmEvent, LlmRequest, LlmResponse,
+};
+
+/// Adapt a provider [`LlmClient`] into an [`AgentLlmClient`] for `model`.
+///
+/// Used by [`SubAgentModelResolver`] implementations to hand back
+/// agent-ready clients.
+pub fn adapt_llm_client(
+    client: std::sync::Arc<dyn LlmClient>,
+    model: impl Into<String>,
+) -> std::sync::Arc<dyn AgentLlmClient> {
+    std::sync::Arc::new(LlmClientAdapter::new(client, model.into()))
+}
 pub use meerkat_tools::ToolError;
 
 // AgentFactory and build_agent types
