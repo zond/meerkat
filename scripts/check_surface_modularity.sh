@@ -8,5 +8,6 @@ cargo run -p rkat --no-default-features --features session-store -- --help >/dev
 cargo run -p meerkat-rpc --no-default-features --bin rkat-rpc -- --help >/dev/null
 cargo run -p meerkat-rest --no-default-features --bin rkat-rest -- --help >/dev/null
 cargo run -p meerkat-mcp-server --no-default-features --bin rkat-mcp -- --help >/dev/null
+cargo run -p meerkat-tui --no-default-features --bin rkat-tui -- --help >/dev/null
 
 echo "Surface modularity checks passed"

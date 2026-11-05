@@ -1,0 +1,831 @@
+//! Transcript model: the list of rendered blocks and the agent-event → block mapping.
+//!
+//! The mapping mirrors `meerkat-cli/src/stream_renderer.rs` but produces structured
+//! blocks instead of ANSI text. Each block has a per-width layout cache that is
+//! invalidated whenever the block mutates.
+
+use std::time::Instant;
+
+use indexmap::IndexMap;
+use meerkat_core::{AgentEvent, HookPoint, ScopedAgentEvent, StreamScopeFrame, Usage};
+use ratatui::text::Line;
+use serde_json::Value;
+
+use super::markdown::truncate_chars;
+use super::render::block_lines;
+
+/// Maximum tool-result lines kept in the preview (matches the CLI stream renderer).
+pub const MAX_TOOL_RESULT_LINES: usize = 20;
+/// Maximum characters of serialized tool args shown in a header (matches the CLI).
+pub const MAX_TOOL_ARGS_PREVIEW: usize = 200;
+
+/// Index of a block in the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlockId(pub usize);
+
+/// Severity of a notice block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeLevel {
+    /// Informational chrome.
+    Info,
+    /// Something degraded but the run continues.
+    Warn,
+    /// A failure.
+    Error,
+}
+
+/// Lifecycle state of a tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolState {
+    /// The model asked for the call; approval/dispatch pending.
+    Requested,
+    /// The tool is executing.
+    Running {
+        /// When execution started.
+        since: Instant,
+    },
+    /// Execution finished.
+    Done {
+        /// Whether the tool reported an error.
+        is_error: bool,
+        /// Wall-clock execution time.
+        duration_ms: u64,
+    },
+    /// A hook (approval engine) denied the call.
+    Denied {
+        /// Human-readable reason.
+        reason: String,
+    },
+}
+
+/// A file diff attached to a tool block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffView {
+    /// File the diff applies to.
+    pub path: String,
+    /// Unified diff text.
+    pub unified: String,
+    /// Added line count.
+    pub added: usize,
+    /// Removed line count.
+    pub removed: usize,
+}
+
+/// One rendered unit of the transcript.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Block {
+    /// A prompt typed by the user.
+    User {
+        /// Prompt text.
+        text: String,
+    },
+    /// Assistant output (markdown source).
+    Assistant {
+        /// Markdown source accumulated from text deltas.
+        md: String,
+    },
+    /// Model reasoning / thinking.
+    Reasoning {
+        /// Reasoning text.
+        text: String,
+        /// Whether only a one-line summary is shown.
+        collapsed: bool,
+    },
+    /// A tool call and its lifecycle.
+    Tool {
+        /// Tool name (sub-agent calls carry a scope label prefix).
+        name: String,
+        /// Arguments as requested by the model.
+        args: Value,
+        /// Lifecycle state.
+        state: ToolState,
+        /// Truncated result preview.
+        result_preview: Option<String>,
+        /// Attached file diff, if the tool edited a file.
+        diff: Option<DiffView>,
+        /// Nesting depth (0 for the primary agent, >0 for sub-agents).
+        depth: usize,
+    },
+    /// An approval decision.
+    Approval {
+        /// Tool the decision applies to.
+        tool: String,
+        /// Tier / mechanism that decided.
+        tier: String,
+        /// Whether the call was allowed.
+        allowed: bool,
+        /// Optional explanation.
+        reason: Option<String>,
+    },
+    /// Chrome line (retry, budget, compaction, errors, command output).
+    Notice {
+        /// Severity.
+        level: NoticeLevel,
+        /// Text.
+        text: String,
+    },
+}
+
+/// Cached wrapped lines for one block at one width.
+#[derive(Debug, Clone)]
+pub struct CachedLayout {
+    /// Width the lines were computed for.
+    pub width: u16,
+    /// Wrapped lines (including the trailing spacer line).
+    pub lines: Vec<Line<'static>>,
+}
+
+/// The transcript: blocks, tool-id index and per-block layout cache.
+#[derive(Debug, Default)]
+pub struct Transcript {
+    blocks: Vec<Block>,
+    by_tool_id: IndexMap<String, BlockId>,
+    layout: Vec<Option<CachedLayout>>,
+    open_assistant: Option<BlockId>,
+    open_reasoning: Option<BlockId>,
+    text_seen_this_turn: bool,
+    reasoning_seen_this_turn: bool,
+}
+
+impl Transcript {
+    /// Create an empty transcript.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// All blocks in order.
+    pub fn blocks(&self) -> &[Block] {
+        &self.blocks
+    }
+
+    /// Number of blocks.
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Whether the transcript has no blocks.
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    /// Block by id.
+    pub fn block(&self, id: BlockId) -> Option<&Block> {
+        self.blocks.get(id.0)
+    }
+
+    /// Block id registered for a tool-use id.
+    pub fn tool_block(&self, tool_use_id: &str) -> Option<BlockId> {
+        self.by_tool_id.get(tool_use_id).copied()
+    }
+
+    /// Append a block and return its id. Closes any open streaming blocks.
+    pub fn push(&mut self, block: Block) -> BlockId {
+        self.close_streams();
+        self.push_raw(block)
+    }
+
+    /// Append a notice block.
+    pub fn push_notice(&mut self, level: NoticeLevel, text: impl Into<String>) -> BlockId {
+        self.push(Block::Notice {
+            level,
+            text: text.into(),
+        })
+    }
+
+    /// Remove every block.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Replace the whole transcript with `blocks` (e.g. after resuming a session).
+    pub fn reset(&mut self, blocks: Vec<Block>) {
+        self.clear();
+        for block in blocks {
+            self.push_raw(block);
+        }
+    }
+
+    /// Mutable access to a block; invalidates its layout.
+    pub fn block_mut(&mut self, id: BlockId) -> Option<&mut Block> {
+        if let Some(slot) = self.layout.get_mut(id.0) {
+            *slot = None;
+        }
+        self.blocks.get_mut(id.0)
+    }
+
+    /// Drop every cached layout (e.g. on resize).
+    pub fn invalidate_all(&mut self) {
+        for slot in &mut self.layout {
+            *slot = None;
+        }
+    }
+
+    /// Toggle collapse on the most recent reasoning block. Returns whether one existed.
+    pub fn toggle_last_reasoning(&mut self) -> bool {
+        let Some(idx) = self
+            .blocks
+            .iter()
+            .rposition(|b| matches!(b, Block::Reasoning { .. }))
+        else {
+            return false;
+        };
+        if let Some(Block::Reasoning { collapsed, .. }) = self.block_mut(BlockId(idx)) {
+            *collapsed = !*collapsed;
+        }
+        true
+    }
+
+    /// Attach a diff to the tool block for `tool_use_id`. Returns whether the block was found.
+    pub fn attach_diff(&mut self, tool_use_id: &str, view: DiffView) -> bool {
+        let Some(id) = self.tool_block(tool_use_id) else {
+            return false;
+        };
+        if let Some(Block::Tool { diff, .. }) = self.block_mut(id) {
+            *diff = Some(view);
+            return true;
+        }
+        false
+    }
+
+    /// Ensure every block has a layout at `width`; returns the total line count.
+    pub fn ensure_layout(&mut self, width: u16) -> usize {
+        let mut total = 0;
+        for (block, slot) in self.blocks.iter().zip(self.layout.iter_mut()) {
+            let stale = slot.as_ref().is_none_or(|c| c.width != width);
+            if stale {
+                *slot = Some(CachedLayout {
+                    width,
+                    lines: block_lines(block, width),
+                });
+            }
+            total += slot.as_ref().map_or(0, |c| c.lines.len());
+        }
+        total
+    }
+
+    /// Lines `[start, start + len)` of the laid-out transcript. Call [`Self::ensure_layout`] first.
+    pub fn visible_lines(&self, start: usize, len: usize) -> Vec<Line<'static>> {
+        self.layout
+            .iter()
+            .flatten()
+            .flat_map(|c| c.lines.iter())
+            .skip(start)
+            .take(len)
+            .cloned()
+            .collect()
+    }
+
+    /// Apply a primary-agent event. Returns the usage of a completed LLM turn, if any.
+    pub fn apply_agent_event(&mut self, event: &AgentEvent) -> Option<Usage> {
+        self.apply_agent_event_at(event, Instant::now())
+    }
+
+    /// [`Self::apply_agent_event`] with an explicit clock (for tests).
+    pub fn apply_agent_event_at(&mut self, event: &AgentEvent, now: Instant) -> Option<Usage> {
+        match event {
+            AgentEvent::TurnStarted { .. } => {
+                self.close_streams();
+                self.text_seen_this_turn = false;
+                self.reasoning_seen_this_turn = false;
+            }
+            AgentEvent::TurnCompleted { usage, .. } => {
+                self.close_streams();
+                return Some(usage.clone());
+            }
+            AgentEvent::ReasoningDelta { delta } => self.append_reasoning(delta),
+            AgentEvent::ReasoningComplete { content } => {
+                if self.open_reasoning.is_none()
+                    && !self.reasoning_seen_this_turn
+                    && !content.is_empty()
+                {
+                    self.append_reasoning(content);
+                }
+                self.open_reasoning = None;
+            }
+            AgentEvent::TextDelta { delta } => self.append_text(delta),
+            AgentEvent::TextComplete { content } => {
+                if self.open_assistant.is_none() && !self.text_seen_this_turn && !content.is_empty()
+                {
+                    self.append_text(content);
+                }
+                self.open_assistant = None;
+            }
+            AgentEvent::ToolCallRequested { id, name, args } => {
+                self.request_tool(id.clone(), name.clone(), args.clone(), 0);
+            }
+            AgentEvent::ToolExecutionStarted { id, .. } => self.start_tool(id, now),
+            AgentEvent::ToolExecutionCompleted {
+                id,
+                result,
+                is_error,
+                duration_ms,
+                ..
+            } => self.complete_tool(id, *is_error, *duration_ms, Some(result)),
+            AgentEvent::ToolExecutionTimedOut { id, timeout_ms, .. } => {
+                let text = format!("timed out after {timeout_ms}ms");
+                self.complete_tool(id, true, *timeout_ms, Some(&text));
+            }
+            AgentEvent::HookDenied {
+                hook_id,
+                point,
+                message,
+                payload,
+                ..
+            } => self.hook_denied(hook_id, *point, message, payload.as_ref()),
+            AgentEvent::HookFailed { hook_id, error, .. } => {
+                self.push_notice(
+                    NoticeLevel::Warn,
+                    format!("hook failed: {hook_id}: {error}"),
+                );
+            }
+            AgentEvent::Retrying {
+                attempt,
+                max_attempts,
+                error,
+                delay_ms,
+            } => {
+                self.push_notice(
+                    NoticeLevel::Warn,
+                    format!("⟳ retry {attempt}/{max_attempts}: {error} ({delay_ms}ms)"),
+                );
+            }
+            AgentEvent::BudgetWarning {
+                budget_type,
+                used,
+                limit,
+                percent,
+            } => {
+                self.push_notice(
+                    NoticeLevel::Warn,
+                    format!(
+                        "⚠ budget: {budget_type:?} at {:.0}% ({used}/{limit})",
+                        percent * 100.0
+                    ),
+                );
+            }
+            AgentEvent::CompactionStarted {
+                message_count,
+                estimated_history_tokens,
+                ..
+            } => {
+                self.push_notice(
+                    NoticeLevel::Info,
+                    format!(
+                        "⟳ compacting context ({message_count} messages, ~{estimated_history_tokens} tokens)…"
+                    ),
+                );
+            }
+            AgentEvent::CompactionCompleted {
+                summary_tokens,
+                messages_before,
+                messages_after,
+            } => {
+                self.push_notice(
+                    NoticeLevel::Info,
+                    format!(
+                        "✓ compacted: {messages_before} → {messages_after} messages ({summary_tokens} summary tokens)"
+                    ),
+                );
+            }
+            AgentEvent::CompactionFailed { error } => {
+                self.push_notice(NoticeLevel::Warn, format!("✗ compaction failed: {error}"));
+            }
+            AgentEvent::RunFailed { error, .. } => {
+                self.push_notice(NoticeLevel::Error, format!("error: {error}"));
+            }
+            AgentEvent::StreamTruncated { reason } => {
+                self.push_notice(
+                    NoticeLevel::Warn,
+                    format!("some stream events were dropped: {reason}"),
+                );
+            }
+            AgentEvent::SkillResolutionFailed { reference, error } => {
+                self.push_notice(
+                    NoticeLevel::Warn,
+                    format!("⚠ skill failed: {reference}: {error}"),
+                );
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Apply a scoped (sub-agent) event. Primary-scope events are ignored because they
+    /// already arrive on the primary channel.
+    pub fn apply_scoped_event(&mut self, scoped: &ScopedAgentEvent) {
+        self.apply_scoped_event_at(scoped, Instant::now());
+    }
+
+    /// [`Self::apply_scoped_event`] with an explicit clock (for tests).
+    pub fn apply_scoped_event_at(&mut self, scoped: &ScopedAgentEvent, now: Instant) {
+        let mut depth = 0usize;
+        let mut label = None;
+        for frame in &scoped.scope_path {
+            if let StreamScopeFrame::SubAgent {
+                agent_id,
+                label: frame_label,
+                ..
+            } = frame
+            {
+                depth += 1;
+                label = Some(frame_label.clone().unwrap_or_else(|| agent_id.clone()));
+            }
+        }
+        let Some(label) = label else {
+            return;
+        };
+        let key = |id: &str| format!("{}/{id}", scoped.scope_id);
+        match &scoped.event {
+            AgentEvent::ToolCallRequested { id, name, args } => {
+                self.request_tool(key(id), format!("[{label}] {name}"), args.clone(), depth);
+            }
+            AgentEvent::ToolExecutionStarted { id, .. } => self.start_tool(&key(id), now),
+            AgentEvent::ToolExecutionCompleted {
+                id,
+                result,
+                is_error,
+                duration_ms,
+                ..
+            } => self.complete_tool(&key(id), *is_error, *duration_ms, Some(result)),
+            AgentEvent::ToolExecutionTimedOut { id, timeout_ms, .. } => {
+                let text = format!("timed out after {timeout_ms}ms");
+                self.complete_tool(&key(id), true, *timeout_ms, Some(&text));
+            }
+            AgentEvent::RunFailed { error, .. } => {
+                self.push_notice(NoticeLevel::Error, format!("[{label}] error: {error}"));
+            }
+            _ => {}
+        }
+    }
+
+    fn push_raw(&mut self, block: Block) -> BlockId {
+        let id = BlockId(self.blocks.len());
+        self.blocks.push(block);
+        self.layout.push(None);
+        id
+    }
+
+    fn close_streams(&mut self) {
+        self.open_assistant = None;
+        self.open_reasoning = None;
+    }
+
+    fn append_text(&mut self, delta: &str) {
+        self.open_reasoning = None;
+        self.text_seen_this_turn = true;
+        if let Some(id) = self.open_assistant
+            && let Some(Block::Assistant { md }) = self.block_mut(id)
+        {
+            md.push_str(delta);
+            return;
+        }
+        let id = self.push_raw(Block::Assistant {
+            md: delta.to_string(),
+        });
+        self.open_assistant = Some(id);
+    }
+
+    fn append_reasoning(&mut self, delta: &str) {
+        self.open_assistant = None;
+        self.reasoning_seen_this_turn = true;
+        if let Some(id) = self.open_reasoning
+            && let Some(Block::Reasoning { text, .. }) = self.block_mut(id)
+        {
+            text.push_str(delta);
+            return;
+        }
+        let id = self.push_raw(Block::Reasoning {
+            text: delta.to_string(),
+            collapsed: true,
+        });
+        self.open_reasoning = Some(id);
+    }
+
+    fn request_tool(&mut self, key: String, name: String, args: Value, depth: usize) {
+        let id = self.push(Block::Tool {
+            name,
+            args,
+            state: ToolState::Requested,
+            result_preview: None,
+            diff: None,
+            depth,
+        });
+        self.by_tool_id.insert(key, id);
+    }
+
+    fn start_tool(&mut self, key: &str, now: Instant) {
+        let Some(id) = self.tool_block(key) else {
+            return;
+        };
+        if let Some(Block::Tool { state, .. }) = self.block_mut(id) {
+            *state = ToolState::Running { since: now };
+        }
+    }
+
+    fn complete_tool(&mut self, key: &str, is_error: bool, duration_ms: u64, result: Option<&str>) {
+        let Some(id) = self.tool_block(key) else {
+            return;
+        };
+        if let Some(Block::Tool {
+            state,
+            result_preview,
+            ..
+        }) = self.block_mut(id)
+        {
+            *state = ToolState::Done {
+                is_error,
+                duration_ms,
+            };
+            *result_preview = result.filter(|r| !r.is_empty()).map(preview_result);
+        }
+    }
+
+    fn hook_denied(
+        &mut self,
+        hook_id: &str,
+        point: HookPoint,
+        message: &str,
+        payload: Option<&Value>,
+    ) {
+        if point != HookPoint::PreToolExecution {
+            self.push_notice(
+                NoticeLevel::Warn,
+                format!("⊘ hook denied ({point:?}): {hook_id}: {message}"),
+            );
+            return;
+        }
+        let payload_str = |key: &str| {
+            payload
+                .and_then(|p| p.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        let target = payload_str("tool_use_id")
+            .and_then(|tid| self.tool_block(&tid))
+            .or_else(|| {
+                self.by_tool_id.values().copied().find(|id| {
+                    matches!(
+                        self.block(*id),
+                        Some(Block::Tool {
+                            state: ToolState::Requested,
+                            ..
+                        })
+                    )
+                })
+            });
+        let mut tool = payload_str("tool").unwrap_or_default();
+        if let Some(id) = target
+            && let Some(Block::Tool { name, state, .. }) = self.block_mut(id)
+        {
+            *state = ToolState::Denied {
+                reason: message.to_string(),
+            };
+            if tool.is_empty() {
+                tool.clone_from(name);
+            }
+        }
+        let tier = payload_str("tier").unwrap_or_else(|| hook_id.to_string());
+        self.push(Block::Approval {
+            tool,
+            tier,
+            allowed: false,
+            reason: Some(message.to_string()),
+        });
+    }
+}
+
+/// Serialized, truncated tool arguments for headers.
+pub fn args_preview(args: &Value) -> String {
+    let raw = serde_json::to_string(args).unwrap_or_default();
+    truncate_chars(&raw, MAX_TOOL_ARGS_PREVIEW)
+}
+
+fn preview_result(result: &str) -> String {
+    let total = result.lines().count();
+    let mut out: Vec<&str> = result.lines().take(MAX_TOOL_RESULT_LINES).collect();
+    let more;
+    if total > MAX_TOOL_RESULT_LINES {
+        more = format!("... ({} more lines)", total - MAX_TOOL_RESULT_LINES);
+        out.push(&more);
+    }
+    out.join("\n")
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use meerkat_core::StopReason;
+    use serde_json::json;
+
+    fn text(d: &str) -> AgentEvent {
+        AgentEvent::TextDelta {
+            delta: d.to_string(),
+        }
+    }
+
+    #[test]
+    fn text_deltas_accumulate_into_one_assistant_block() {
+        let mut t = Transcript::new();
+        t.apply_agent_event(&AgentEvent::TurnStarted { turn_number: 0 });
+        t.apply_agent_event(&text("Hel"));
+        t.apply_agent_event(&text("lo"));
+        t.apply_agent_event(&AgentEvent::TextComplete {
+            content: "Hello".into(),
+        });
+        assert_eq!(t.blocks(), &[Block::Assistant { md: "Hello".into() }]);
+    }
+
+    #[test]
+    fn text_complete_without_deltas_creates_block() {
+        let mut t = Transcript::new();
+        t.apply_agent_event(&AgentEvent::TurnStarted { turn_number: 0 });
+        t.apply_agent_event(&AgentEvent::TextComplete {
+            content: "whole".into(),
+        });
+        assert_eq!(t.blocks(), &[Block::Assistant { md: "whole".into() }]);
+    }
+
+    #[test]
+    fn tool_splits_assistant_blocks_and_tracks_lifecycle() {
+        let mut t = Transcript::new();
+        let now = Instant::now();
+        t.apply_agent_event(&text("before"));
+        t.apply_agent_event(&AgentEvent::ToolCallRequested {
+            id: "t1".into(),
+            name: "read_file".into(),
+            args: json!({"path": "a.rs"}),
+        });
+        let id = t.tool_block("t1");
+        assert_eq!(id, Some(BlockId(1)));
+        t.apply_agent_event_at(
+            &AgentEvent::ToolExecutionStarted {
+                id: "t1".into(),
+                name: "read_file".into(),
+            },
+            now,
+        );
+        assert!(matches!(
+            t.block(BlockId(1)),
+            Some(Block::Tool { state: ToolState::Running { since }, .. }) if *since == now
+        ));
+        let long = (0..30)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        t.apply_agent_event(&AgentEvent::ToolExecutionCompleted {
+            id: "t1".into(),
+            name: "read_file".into(),
+            result: long,
+            is_error: false,
+            duration_ms: 7,
+            has_images: false,
+        });
+        match t.block(BlockId(1)) {
+            Some(Block::Tool {
+                state,
+                result_preview: Some(preview),
+                ..
+            }) => {
+                assert_eq!(
+                    *state,
+                    ToolState::Done {
+                        is_error: false,
+                        duration_ms: 7
+                    }
+                );
+                assert_eq!(preview.lines().count(), MAX_TOOL_RESULT_LINES + 1);
+                assert!(preview.ends_with("... (10 more lines)"));
+            }
+            other => panic!("unexpected block {other:?}"),
+        }
+        t.apply_agent_event(&text("after"));
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.blocks()[2], Block::Assistant { md: "after".into() });
+    }
+
+    #[test]
+    fn hook_denied_marks_tool_and_adds_approval_block() {
+        let mut t = Transcript::new();
+        t.apply_agent_event(&AgentEvent::ToolCallRequested {
+            id: "t9".into(),
+            name: "shell".into(),
+            args: json!({"command": "rm -rf /"}),
+        });
+        t.apply_agent_event(&AgentEvent::HookDenied {
+            hook_id: "tui-auto-mode".into(),
+            point: HookPoint::PreToolExecution,
+            reason_code: meerkat_core::HookReasonCode::PolicyViolation,
+            message: "destructive".into(),
+            payload: Some(json!({"tool_use_id": "t9", "tier": "classifier"})),
+        });
+        assert!(matches!(
+            t.block(BlockId(0)),
+            Some(Block::Tool { state: ToolState::Denied { reason }, .. }) if reason == "destructive"
+        ));
+        assert_eq!(
+            t.blocks()[1],
+            Block::Approval {
+                tool: "shell".into(),
+                tier: "classifier".into(),
+                allowed: false,
+                reason: Some("destructive".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn turn_completed_returns_usage_and_reasoning_is_collapsed() {
+        let mut t = Transcript::new();
+        t.apply_agent_event(&AgentEvent::ReasoningDelta {
+            delta: "hmm".into(),
+        });
+        assert!(matches!(
+            t.blocks()[0],
+            Block::Reasoning {
+                collapsed: true,
+                ..
+            }
+        ));
+        assert!(t.toggle_last_reasoning());
+        assert!(matches!(
+            t.blocks()[0],
+            Block::Reasoning {
+                collapsed: false,
+                ..
+            }
+        ));
+        let usage = t.apply_agent_event(&AgentEvent::TurnCompleted {
+            stop_reason: StopReason::EndTurn,
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 3,
+                ..Usage::default()
+            },
+        });
+        assert_eq!(usage.map(|u| u.output_tokens), Some(3));
+    }
+
+    #[test]
+    fn notices_for_retry_and_run_failed() {
+        let mut t = Transcript::new();
+        t.apply_agent_event(&AgentEvent::Retrying {
+            attempt: 1,
+            max_attempts: 3,
+            error: "boom".into(),
+            delay_ms: 10,
+        });
+        t.apply_agent_event(&AgentEvent::RunFailed {
+            session_id: meerkat_core::SessionId::new(),
+            error: "dead".into(),
+        });
+        assert!(matches!(
+            &t.blocks()[0],
+            Block::Notice { level: NoticeLevel::Warn, text } if text.contains("retry 1/3")
+        ));
+        assert!(matches!(
+            &t.blocks()[1],
+            Block::Notice { level: NoticeLevel::Error, text } if text.contains("dead")
+        ));
+    }
+
+    #[test]
+    fn scoped_sub_agent_tools_are_nested() {
+        let mut t = Transcript::new();
+        let ev = ScopedAgentEvent::new(
+            vec![
+                StreamScopeFrame::Primary {
+                    session_id: "s".into(),
+                },
+                StreamScopeFrame::SubAgent {
+                    agent_id: "a1".into(),
+                    tool_call_id: None,
+                    label: Some("helper".into()),
+                },
+            ],
+            AgentEvent::ToolCallRequested {
+                id: "x".into(),
+                name: "glob".into(),
+                args: json!({}),
+            },
+        );
+        t.apply_scoped_event(&ev);
+        assert!(matches!(
+            &t.blocks()[0],
+            Block::Tool { name, depth: 1, .. } if name == "[helper] glob"
+        ));
+        // Primary-only scope is ignored.
+        t.apply_scoped_event(&ScopedAgentEvent::primary("s", text("dup")));
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn layout_cache_invalidates_on_mutation() {
+        let mut t = Transcript::new();
+        t.apply_agent_event(&text("one"));
+        let h1 = t.ensure_layout(40);
+        t.apply_agent_event(&text("\ntwo\nthree"));
+        let h2 = t.ensure_layout(40);
+        assert_eq!(h2, h1 + 2);
+    }
+}

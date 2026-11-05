@@ -52,6 +52,7 @@ SCAN_PATHS=(
   "meerkat-comms"
   "meerkat-rest"
   "meerkat-rpc"
+  "meerkat-tui"
   "meerkat-session"
   "meerkat-tools"
   "meerkat-contracts/src/version.rs"

@@ -23,6 +23,7 @@ members = [
     "meerkat-web-runtime",
     "meerkat-mob-mcp",
     "meerkat-runtime",
+    "meerkat-tui",
     "test-fixtures/mcp-test-server",
     "tests/integration",
 ]
@@ -129,6 +130,7 @@ meerkat-skills = { version = "0.4.13", path = "meerkat-skills" }
 meerkat-mob = { version = "0.4.13", path = "meerkat-mob" }
 meerkat-mob-pack = { version = "0.4.13", path = "meerkat-mob-pack" }
 meerkat-mob-mcp = { version = "0.4.13", path = "meerkat-mob-mcp" }
+meerkat-tui = { version = "0.4.13", path = "meerkat-tui" }
 
 
 [workspace.lints.rust]

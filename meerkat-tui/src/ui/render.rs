@@ -1,0 +1,529 @@
+//! Drawing: transcript blocks, input box, status bar and modal overlay.
+
+use std::time::Instant;
+
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block as BorderBlock, Borders, Paragraph};
+
+use super::markdown::{display_width, render_markdown, sanitize, truncate_to_width, wrap_text};
+use super::modal::draw_modal;
+use super::transcript::{Block, NoticeLevel, ToolState, args_preview};
+use super::{App, StatusInfo};
+
+/// Maximum visible input lines.
+pub const MAX_INPUT_LINES: usize = 6;
+/// Maximum diff lines shown under a tool block.
+const MAX_DIFF_LINES: usize = 40;
+/// Braille spinner frames.
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// Milliseconds per spinner frame.
+const SPINNER_FRAME_MS: u128 = 80;
+/// Status-bar segment separator.
+const SEP: &str = " │ ";
+
+/// Draw the whole application.
+pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
+    draw_at(frame, app, Instant::now());
+}
+
+/// [`draw`] with an explicit clock (for deterministic tests).
+pub fn draw_at(frame: &mut Frame<'_>, app: &mut App, now: Instant) {
+    let area = frame.area();
+    let input_rows = app.input.lines().len().clamp(1, MAX_INPUT_LINES) as u16;
+    let [transcript_area, input_area, status_area] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(input_rows + 1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    draw_transcript(frame, app, transcript_area);
+    draw_input(frame, app, input_area, now);
+    // The paragraph does not wrap, so an over-long status bar is clipped.
+    frame.render_widget(
+        Paragraph::new(status_bar(&app.status, now))
+            .style(Style::default().add_modifier(Modifier::REVERSED)),
+        status_area,
+    );
+    if let Some(modal) = &app.modal {
+        draw_modal(frame, area, modal);
+    }
+}
+
+fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let height = usize::from(area.height);
+    app.set_viewport_height(height);
+    let total = app.transcript.ensure_layout(area.width);
+    let start = app.scroll.window(total, height);
+    let lines = app.transcript.visible_lines(start, height);
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect, now: Instant) {
+    let title = if app.quit_armed(now) {
+        " press Ctrl-C again to quit "
+    } else if app.is_running() {
+        " Enter queues · Esc/Ctrl-C interrupts "
+    } else {
+        ""
+    };
+    let block = BorderBlock::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let prefix_w = 2usize;
+    let avail = usize::from(inner.width).saturating_sub(prefix_w).max(1);
+    let (row, _) = app.input.cursor();
+    let rows = usize::from(inner.height).max(1);
+    let first = row.saturating_sub(rows - 1);
+    let cursor_dc = app.input.cursor_display_col();
+    let hscroll = cursor_dc.saturating_sub(avail - 1);
+
+    let prompt_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let lines: Vec<Line<'static>> = app
+        .input
+        .lines()
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+        .map(|(i, raw)| {
+            let clean = sanitize(raw);
+            let shown = if i == row {
+                truncate_to_width(&skip_columns(&clean, hscroll), avail)
+            } else {
+                truncate_to_width(&clean, avail)
+            };
+            let prefix = if i == 0 { "› " } else { "  " };
+            Line::from(vec![Span::styled(prefix, prompt_style), Span::raw(shown)])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    if app.modal.is_none() {
+        let x = inner.x + (prefix_w + cursor_dc - hscroll) as u16;
+        let y = inner.y + (row - first) as u16;
+        frame.set_cursor_position(Position::new(x.min(inner.right().saturating_sub(1)), y));
+    }
+}
+
+fn skip_columns(s: &str, cols: usize) -> String {
+    let mut skipped = 0;
+    let mut out = String::new();
+    for ch in s.chars() {
+        if skipped < cols {
+            skipped += display_width(ch.encode_utf8(&mut [0; 4]));
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Compact token count: `950`, `12.3k`, `1.2M`.
+pub fn fmt_tokens(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}
+
+/// Spinner glyph for the elapsed time since `since` (first frame when `None`).
+fn spinner_frame(since: Option<Instant>, now: Instant) -> char {
+    let elapsed = since.map_or(0, |s| now.saturating_duration_since(s).as_millis());
+    SPINNER
+        .get((elapsed / SPINNER_FRAME_MS) as usize % SPINNER.len())
+        .copied()
+        .unwrap_or('⠋')
+}
+
+/// Style of the `auto:` segment for a display state.
+fn auto_style(state: &str) -> Style {
+    if state.eq_ignore_ascii_case("paused") {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+            .remove_modifier(Modifier::REVERSED)
+    } else if state.eq_ignore_ascii_case("off") {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+    }
+}
+
+/// The styled status bar (drawn on a reversed background).
+pub fn status_bar(status: &StatusInfo, now: Instant) -> Line<'static> {
+    let mut segs: Vec<Span<'static>> = Vec::new();
+    if !status.provider.is_empty() || !status.model.is_empty() {
+        segs.push(Span::raw(format!("{}/{}", status.provider, status.model)));
+    }
+    if !status.session_short.is_empty() {
+        segs.push(Span::raw(format!("session {}", status.session_short)));
+    }
+    segs.push(Span::raw(format!(
+        "↑{} ↓{}",
+        fmt_tokens(status.input_tokens),
+        fmt_tokens(status.output_tokens)
+    )));
+    if !status.auto_state.is_empty() {
+        let (c, cm, t, tm) = status.denials;
+        let text = if status.auto_state.eq_ignore_ascii_case("off") {
+            format!("auto: {}", status.auto_state)
+        } else {
+            format!("auto: {} (deny {c}/{cm}, {t}/{tm})", status.auto_state)
+        };
+        segs.push(Span::styled(text, auto_style(&status.auto_state)));
+    }
+    if status.classifying {
+        let frame = spinner_frame(status.running_since, now);
+        segs.push(Span::styled(
+            format!("{frame} classifying…"),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    if let Some(since) = status.running_since {
+        let elapsed = now.saturating_duration_since(since);
+        let frame = spinner_frame(Some(since), now);
+        segs.push(Span::raw(format!("{frame} running {}s", elapsed.as_secs())));
+    }
+    if status.queued > 0 {
+        segs.push(Span::raw(format!("queued {}", status.queued)));
+    }
+    let mut spans = Vec::with_capacity(segs.len() * 2 + 1);
+    spans.push(Span::raw(" "));
+    for (i, seg) in segs.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(SEP));
+        }
+        spans.push(seg);
+    }
+    Line::from(spans)
+}
+
+/// The status-bar text (unstyled [`status_bar`]).
+pub fn status_line(status: &StatusInfo, now: Instant) -> String {
+    status_bar(status, now)
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect()
+}
+
+/// Style for one line of a unified diff.
+pub fn diff_line_style(line: &str) -> Style {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    if line.starts_with("+++") || line.starts_with("---") || line.starts_with("diff ") {
+        dim.add_modifier(Modifier::BOLD)
+    } else if line.starts_with("@@") {
+        dim.fg(Color::Cyan)
+    } else if line.starts_with('+') {
+        Style::default().fg(Color::Green)
+    } else if line.starts_with('-') {
+        Style::default().fg(Color::Red)
+    } else if line.starts_with('\\') || line.starts_with("index ") {
+        dim
+    } else {
+        Style::default()
+    }
+}
+
+fn prefixed(
+    text: &str,
+    width: usize,
+    first: &str,
+    rest: &str,
+    style: Style,
+    out: &mut Vec<Line<'static>>,
+) {
+    let prefix_w = display_width(first).max(display_width(rest));
+    for (i, l) in wrap_text(text, width.saturating_sub(prefix_w))
+        .into_iter()
+        .enumerate()
+    {
+        let p = if i == 0 { first } else { rest };
+        out.push(Line::from(vec![
+            Span::styled(p.to_string(), style),
+            Span::styled(l, style),
+        ]));
+    }
+}
+
+/// Lay out one block at `width` (including a trailing spacer line).
+pub fn block_lines(block: &Block, width: u16) -> Vec<Line<'static>> {
+    let w = usize::from(width).max(4);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut out = Vec::new();
+    match block {
+        Block::User { text } => {
+            let style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
+            prefixed(text, w, "› ", "  ", style, &mut out);
+        }
+        Block::Assistant { md } => {
+            for (i, line) in render_markdown(md, (w - 2) as u16).into_iter().enumerate() {
+                let p = if i == 0 { "• " } else { "  " };
+                let mut spans = vec![Span::raw(p)];
+                spans.extend(line.spans);
+                out.push(Line::from(spans));
+            }
+        }
+        Block::Reasoning { text, collapsed } => {
+            let style = dim.add_modifier(Modifier::ITALIC);
+            if *collapsed {
+                let n = text.chars().count();
+                out.push(Line::styled(
+                    truncate_to_width(&format!("✻ thinking ({n} chars, Ctrl-R to expand)"), w),
+                    style.fg(Color::Magenta),
+                ));
+            } else {
+                out.push(Line::styled("✻ thinking", style.fg(Color::Magenta)));
+                prefixed(text, w, "  ", "  ", style, &mut out);
+            }
+        }
+        Block::Tool {
+            name,
+            args,
+            state,
+            result_preview,
+            diff,
+            depth,
+        } => {
+            let indent = "  ".repeat(*depth);
+            let (marker, status, color) = match state {
+                ToolState::Requested => ("○", String::new(), Color::DarkGray),
+                ToolState::Running { .. } => ("◐", " running…".to_string(), Color::Yellow),
+                ToolState::Done {
+                    is_error: false,
+                    duration_ms,
+                } => ("✓", format!(" ({duration_ms}ms)"), Color::Green),
+                ToolState::Done {
+                    is_error: true,
+                    duration_ms,
+                } => ("✗", format!(" ({duration_ms}ms)"), Color::Red),
+                ToolState::Denied { reason } => ("⊘", format!(" denied: {reason}"), Color::Red),
+            };
+            let header = format!("{indent}{marker} {name}({})", args_preview(args));
+            let header_w = w.saturating_sub(display_width(&status));
+            out.push(Line::from(vec![
+                Span::styled(
+                    truncate_to_width(&sanitize(&header), header_w),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(truncate_to_width(&sanitize(&status), w), dim),
+            ]));
+            let body_prefix = format!("{indent}  │ ");
+            if let Some(preview) = result_preview {
+                prefixed(preview, w, &body_prefix, &body_prefix, dim, &mut out);
+            }
+            if let Some(d) = diff {
+                out.push(Line::styled(
+                    truncate_to_width(
+                        &format!("{indent}  {} (+{} -{})", d.path, d.added, d.removed),
+                        w,
+                    ),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+                let total = d.unified.lines().count();
+                for l in d.unified.lines().take(MAX_DIFF_LINES) {
+                    out.push(Line::styled(
+                        truncate_to_width(&sanitize(&format!("{indent}  {l}")), w),
+                        diff_line_style(l),
+                    ));
+                }
+                if total > MAX_DIFF_LINES {
+                    out.push(Line::styled(
+                        format!("{indent}  … {} more lines", total - MAX_DIFF_LINES),
+                        dim,
+                    ));
+                }
+            }
+        }
+        Block::Approval {
+            tool,
+            tier,
+            allowed,
+            reason,
+        } => {
+            let (marker, verb, color) = if *allowed {
+                ("✓", "allowed", Color::Green)
+            } else {
+                ("⊘", "blocked", Color::Red)
+            };
+            let mut text = format!("{marker} {verb} {tool} [{tier}]");
+            if let Some(r) = reason {
+                text.push_str(": ");
+                text.push_str(r);
+            }
+            prefixed(&text, w, "", "  ", Style::default().fg(color), &mut out);
+        }
+        Block::Notice { level, text } => {
+            let style = match level {
+                NoticeLevel::Info => dim,
+                NoticeLevel::Warn => Style::default().fg(Color::Yellow),
+                NoticeLevel::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            };
+            prefixed(text, w, "", "", style, &mut out);
+        }
+    }
+    out.push(Line::default());
+    out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_formatting() {
+        assert_eq!(fmt_tokens(950), "950");
+        assert_eq!(fmt_tokens(12_345), "12.3k");
+        assert_eq!(fmt_tokens(1_200_000), "1.2M");
+    }
+
+    #[test]
+    fn status_line_segments() {
+        let now = Instant::now();
+        let mut s = StatusInfo::default();
+        s.set_model("anthropic", "claude-sonnet-4-6");
+        s.set_session("abc12345-ffff");
+        s.set_tokens(1500, 20);
+        s.set_auto("active", (1, 3, 4, 20));
+        s.running_since = Some(now);
+        s.queued = 2;
+        let line = status_line(&s, now);
+        assert_eq!(
+            line,
+            " anthropic/claude-sonnet-4-6 │ session abc12345 │ ↑1.5k ↓20 │ auto: active (deny 1/3, 4/20) │ ⠋ running 0s │ queued 2"
+        );
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn tool_block_layout() {
+        let block = Block::Tool {
+            name: "read_file".into(),
+            args: serde_json::json!({"path": "a.rs"}),
+            state: ToolState::Done {
+                is_error: false,
+                duration_ms: 3,
+            },
+            result_preview: Some("fn main() {}".into()),
+            diff: None,
+            depth: 0,
+        };
+        let lines: Vec<String> = block_lines(&block, 40).iter().map(line_text).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "✓ read_file({\"path\":\"a.rs\"}) (3ms)".to_string(),
+                "  │ fn main() {}".to_string(),
+                String::new(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collapsed_reasoning_is_one_line() {
+        let block = Block::Reasoning {
+            text: "a\nb\nc".into(),
+            collapsed: true,
+        };
+        assert_eq!(block_lines(&block, 60).len(), 2);
+    }
+
+    fn seg_style(line: &Line<'_>, needle: &str) -> Style {
+        line.spans
+            .iter()
+            .find(|s| s.content.contains(needle))
+            .map(|s| s.style)
+            .unwrap_or_else(|| panic!("no segment {needle:?}"))
+    }
+
+    #[test]
+    fn status_bar_auto_states_and_classifying() {
+        let now = Instant::now();
+        let mut s = StatusInfo::default();
+        s.set_auto("PAUSED", (3, 3, 5, 20));
+        s.set_classifying(true);
+        let bar = status_bar(&s, now);
+        assert_eq!(seg_style(&bar, "auto: PAUSED").bg, Some(Color::Yellow));
+        assert!(status_line(&s, now).ends_with("auto: PAUSED (deny 3/3, 5/20) │ ⠋ classifying…"));
+        s.set_auto("off", (0, 3, 0, 20));
+        s.set_classifying(false);
+        let bar = status_bar(&s, now);
+        assert!(
+            seg_style(&bar, "auto: off")
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(status_line(&s, now).ends_with("│ auto: off"));
+    }
+
+    #[test]
+    fn diff_lines_are_colored_and_capped() {
+        use super::super::transcript::DiffView;
+        let mut unified =
+            String::from("--- a/x.rs\n+++ b/x.rs\n@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n");
+        for i in 0..50 {
+            unified.push_str(&format!("+l{i}\n"));
+        }
+        let block = Block::Tool {
+            name: "edit_file".into(),
+            args: serde_json::json!({}),
+            state: ToolState::Done {
+                is_error: false,
+                duration_ms: 1,
+            },
+            result_preview: None,
+            diff: Some(DiffView {
+                path: "x.rs".into(),
+                unified,
+                added: 51,
+                removed: 1,
+            }),
+            depth: 0,
+        };
+        let lines = block_lines(&block, 60);
+        let find = |t: &str| {
+            lines
+                .iter()
+                .find(|l| line_text(l) == t)
+                .unwrap_or_else(|| panic!("missing {t:?}"))
+        };
+        assert_eq!(find("  +new").style.fg, Some(Color::Green));
+        assert_eq!(find("  -old").style.fg, Some(Color::Red));
+        assert_eq!(find("  @@ -1,2 +1,2 @@").style.fg, Some(Color::Cyan));
+        assert!(
+            find("  --- a/x.rs")
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(find("  +++ b/x.rs").style.fg.is_none());
+        assert!(
+            find("  … 16 more lines")
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+        // header + path line + 40 diff lines + trailer + spacer
+        assert_eq!(lines.len(), 44);
+    }
+}

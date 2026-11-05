@@ -1,0 +1,229 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+//! Render the UI into a `TestBackend` and assert on specific rows.
+
+use std::time::Instant;
+
+use meerkat_core::{AgentEvent, EventEnvelope};
+use meerkat_tui::ui::render::draw_at;
+use meerkat_tui::ui::{
+    App, Block, DiffView, EscalationId, EscalationPrompt, Msg, StatusInfo, ToolState,
+};
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::style::{Color, Modifier};
+use serde_json::json;
+
+const W: u16 = 60;
+const H: u16 = 12;
+
+fn rows(buffer: &Buffer) -> Vec<String> {
+    let area = buffer.area;
+    (0..area.height)
+        .map(|y| {
+            let mut row = String::new();
+            for x in 0..area.width {
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            row.trim_end().to_string()
+        })
+        .collect()
+}
+
+fn agent(ev: AgentEvent) -> Msg {
+    Msg::Agent(EventEnvelope::new("s", 0, None, ev))
+}
+
+fn sample_app() -> App {
+    let mut status = StatusInfo::default();
+    status.set_model("anthropic", "claude-sonnet-4-6");
+    status.set_session("abc123ef-0000");
+    status.set_tokens(1200, 345);
+    let mut app = App::new(status);
+    app.transcript.push(Block::User {
+        text: "list files".into(),
+    });
+    app.update(agent(AgentEvent::TurnStarted { turn_number: 0 }));
+    app.update(agent(AgentEvent::TextDelta {
+        delta: "Sure, let me look.".into(),
+    }));
+    app.update(agent(AgentEvent::ToolCallRequested {
+        id: "t1".into(),
+        name: "glob".into(),
+        args: json!({"pattern": "*.rs"}),
+    }));
+    app.update(agent(AgentEvent::ToolExecutionStarted {
+        id: "t1".into(),
+        name: "glob".into(),
+    }));
+    app
+}
+
+fn render(app: &mut App, now: Instant) -> Vec<String> {
+    render_sized(app, now, W)
+}
+
+fn render_sized(app: &mut App, now: Instant, width: u16) -> Vec<String> {
+    let mut terminal = Terminal::new(TestBackend::new(width, H)).unwrap();
+    terminal.draw(|f| draw_at(f, app, now)).unwrap();
+    rows(terminal.backend().buffer())
+}
+
+#[test]
+fn renders_blocks_input_and_status_bar() {
+    let mut app = sample_app();
+    let rows = render(&mut app, Instant::now());
+    assert_eq!(rows.len(), usize::from(H));
+    // Transcript is short, so it starts at the top.
+    assert_eq!(rows[0], "› list files");
+    assert_eq!(rows[1], "");
+    assert_eq!(rows[2], "• Sure, let me look.");
+    assert_eq!(rows[3], "");
+    assert_eq!(rows[4], "◐ glob({\"pattern\":\"*.rs\"}) running…");
+    // Input box: top border then the prompt line.
+    assert!(rows[9].starts_with("────"), "border row: {:?}", rows[9]);
+    assert_eq!(rows[10], "›");
+    assert_eq!(
+        rows[11],
+        " anthropic/claude-sonnet-4-6 │ session abc123ef │ ↑1.2k ↓345"
+    );
+}
+
+#[test]
+fn running_turn_shows_spinner_and_queue_in_status() {
+    let mut app = sample_app();
+    let now = Instant::now();
+    for c in "go".chars() {
+        app.update(Msg::Key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char(c),
+        )));
+    }
+    app.update_at(
+        Msg::Key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Enter,
+        )),
+        now,
+    );
+    let rows = render_sized(&mut app, now, 100);
+    assert!(
+        rows[11].ends_with("⠋ running 0s"),
+        "status row: {:?}",
+        rows[11]
+    );
+    assert!(
+        rows[9].contains("Enter queues"),
+        "input title: {:?}",
+        rows[9]
+    );
+}
+
+#[test]
+fn long_transcript_follows_bottom_and_scrolls_back() {
+    let mut app = sample_app();
+    for i in 0..20 {
+        app.transcript.push(Block::User {
+            text: format!("prompt {i}"),
+        });
+    }
+    let now = Instant::now();
+    let rows = render(&mut app, now);
+    // 9 transcript rows; last block's spacer is the bottom row.
+    assert_eq!(rows[7], "› prompt 19");
+    assert_eq!(rows[8], "");
+    app.update(Msg::Key(ratatui::crossterm::event::KeyEvent::from(
+        ratatui::crossterm::event::KeyCode::PageUp,
+    )));
+    let rows = render(&mut app, now);
+    // PgUp moves by viewport height - 2 = 7 lines.
+    assert_eq!(rows[0], "› prompt 12");
+    assert_eq!(rows[8], "› prompt 16");
+    assert!(!app.scroll.follow);
+}
+
+#[test]
+fn escalation_modal_is_drawn_over_the_transcript() {
+    let mut app = sample_app();
+    app.update(Msg::Escalation(
+        EscalationPrompt {
+            tool: "shell".into(),
+            args_preview: "rm -rf build".into(),
+            hint: None,
+        },
+        EscalationId(1),
+    ));
+    let rows = render(&mut app, Instant::now());
+    let joined = rows.join("\n");
+    assert!(joined.contains("Approval needed"), "{joined}");
+    assert!(joined.contains("Tool: shell"), "{joined}");
+    assert!(joined.contains("rm -rf build"), "{joined}");
+    assert!(joined.contains("[y] allow once"), "{joined}");
+}
+
+fn render_buffer(app: &mut App, width: u16, height: u16) -> Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|f| draw_at(f, app, Instant::now())).unwrap();
+    terminal.backend().buffer().clone()
+}
+
+#[test]
+fn diff_block_snapshot() {
+    let mut app = App::new(StatusInfo::default());
+    app.transcript.push(Block::Tool {
+        name: "edit_file".into(),
+        args: json!({"path": "src/a.rs"}),
+        state: ToolState::Done {
+            is_error: false,
+            duration_ms: 4,
+        },
+        result_preview: None,
+        diff: Some(DiffView {
+            path: "src/a.rs".into(),
+            unified: "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,2 @@\n fn a() {}\n-let x = 1;\n+let x = 2;\n"
+                .into(),
+            added: 1,
+            removed: 1,
+        }),
+        depth: 0,
+    });
+    let buf = render_buffer(&mut app, W, 14);
+    let rows = rows(&buf);
+    assert_eq!(rows[0], "✓ edit_file({\"path\":\"src/a.rs\"}) (4ms)");
+    assert_eq!(rows[1], "  src/a.rs (+1 -1)");
+    assert_eq!(rows[2], "  --- a/src/a.rs");
+    assert_eq!(rows[3], "  +++ b/src/a.rs");
+    assert_eq!(rows[4], "  @@ -1,2 +1,2 @@");
+    assert_eq!(rows[5], "   fn a() {}");
+    assert_eq!(rows[6], "  -let x = 1;");
+    assert_eq!(rows[7], "  +let x = 2;");
+    assert_eq!(buf[(2, 6)].fg, Color::Red);
+    assert_eq!(buf[(2, 7)].fg, Color::Green);
+    assert_eq!(buf[(2, 4)].fg, Color::Cyan);
+    assert!(buf[(2, 2)].modifier.contains(Modifier::DIM));
+}
+
+#[test]
+fn markdown_assistant_block_snapshot() {
+    let mut app = App::new(StatusInfo::default());
+    app.update(agent(AgentEvent::TurnStarted { turn_number: 0 }));
+    app.update(agent(AgentEvent::TextDelta {
+        delta: "## Plan\n\nUse **bold** and `code` with a [link](https://e.x).\n\n- one\n  - two\n\n```sh\ncargo   test\n"
+            .into(),
+    }));
+    let buf = render_buffer(&mut app, 40, 16);
+    let rows = rows(&buf);
+    assert_eq!(rows[0], "• Plan");
+    assert_eq!(rows[1], "");
+    assert_eq!(rows[2], "  Use bold and code with a link");
+    assert_eq!(rows[3], "  (https://e.x).");
+    assert_eq!(rows[4], "");
+    assert_eq!(rows[5], "  • one");
+    assert_eq!(rows[6], "    ◦ two");
+    assert_eq!(rows[7], "");
+    // The fence is still open (streaming): code renders verbatim with a gutter.
+    assert_eq!(rows[8], "  ▎ cargo   test");
+    // Heading is bold cyan; `bold` is bold; `code` is yellow.
+    assert!(buf[(2, 0)].modifier.contains(Modifier::BOLD));
+    assert_eq!(buf[(2, 0)].fg, Color::Cyan);
+    assert!(buf[(6, 2)].modifier.contains(Modifier::BOLD));
+    assert_eq!(buf[(15, 2)].fg, Color::Yellow);
+}
