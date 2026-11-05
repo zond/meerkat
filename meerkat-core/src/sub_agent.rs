@@ -18,6 +18,7 @@ use crate::types::{Message, ToolDef};
 use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock, watch};
 
 const MAX_COMPLETED_AGENTS: usize = 256;
@@ -63,6 +64,66 @@ pub struct SubAgentInfo {
     pub comms: Option<SubAgentCommsInfo>,
 }
 
+/// Tree-wide cap on live sub-agents.
+///
+/// One limiter is shared by every [`SubAgentManager`] in a sub-agent tree,
+/// so `max_concurrent_agents` bounds the whole tree rather than each level.
+/// A slot is held by a [`TreePermit`] and released when the permit drops.
+#[derive(Debug)]
+pub struct SubAgentTreeLimiter {
+    live: AtomicUsize,
+    max: usize,
+}
+
+impl SubAgentTreeLimiter {
+    /// Create a limiter allowing at most `max` live agents.
+    pub fn new(max: usize) -> Arc<Self> {
+        Arc::new(Self {
+            live: AtomicUsize::new(0),
+            max,
+        })
+    }
+
+    /// Reserve a slot, or `None` when the tree is full.
+    pub fn try_acquire(self: &Arc<Self>) -> Option<TreePermit> {
+        self.live
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                (live < self.max).then_some(live + 1)
+            })
+            .ok()
+            .map(|_| TreePermit {
+                limiter: Arc::clone(self),
+            })
+    }
+
+    /// Number of slots currently held.
+    pub fn live(&self) -> usize {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// Maximum number of live agents.
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    /// Whether another agent could be admitted right now.
+    pub fn has_capacity(&self) -> bool {
+        self.live() < self.max
+    }
+}
+
+/// A held slot in a [`SubAgentTreeLimiter`]; released on drop.
+#[derive(Debug)]
+pub struct TreePermit {
+    limiter: Arc<SubAgentTreeLimiter>,
+}
+
+impl Drop for TreePermit {
+    fn drop(&mut self) {
+        self.limiter.live.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// A running sub-agent handle
 #[derive(Debug)]
 pub struct SubAgentHandle {
@@ -80,6 +141,8 @@ pub struct SubAgentHandle {
     pub result: Option<OperationResult>,
     /// Comms info for sending messages to this sub-agent
     pub comms: Option<SubAgentCommsInfo>,
+    /// Slot in the tree-wide limiter, released when the handle is dropped.
+    pub permit: Option<TreePermit>,
 }
 
 /// Manager for sub-agents
@@ -90,6 +153,8 @@ pub struct SubAgentManager {
     pub limits: ConcurrencyLimits,
     /// Current depth (for nested sub-agents)
     current_depth: u32,
+    /// Live-agent cap shared with every manager in the same tree.
+    tree: Arc<SubAgentTreeLimiter>,
     /// Completed results waiting to be collected
     completed_results: Mutex<Vec<OperationResult>>,
     /// Recently completed sub-agents (bounded to avoid unbounded growth)
@@ -101,13 +166,28 @@ pub struct SubAgentManager {
 }
 
 impl SubAgentManager {
-    /// Create a new sub-agent manager
+    /// Create a new sub-agent manager rooting its own tree (its live-agent
+    /// cap is `limits.max_concurrent_agents`).
     pub fn new(limits: ConcurrencyLimits, current_depth: u32) -> Self {
+        let tree = SubAgentTreeLimiter::new(limits.max_concurrent_agents);
+        Self::with_tree_limiter(limits, current_depth, tree)
+    }
+
+    /// Create a manager for one level of an existing sub-agent tree.
+    ///
+    /// `tree` is shared with the other managers of the tree so the live-agent
+    /// cap holds across levels.
+    pub fn with_tree_limiter(
+        limits: ConcurrencyLimits,
+        current_depth: u32,
+        tree: Arc<SubAgentTreeLimiter>,
+    ) -> Self {
         let (completion_tx, completion_rx) = watch::channel(None);
         Self {
             agents: RwLock::new(HashMap::new()),
             limits,
             current_depth,
+            tree,
             completed_results: Mutex::new(Vec::new()),
             completed_agents: Mutex::new(VecDeque::new()),
             completion_tx,
@@ -123,6 +203,16 @@ impl SubAgentManager {
         self.completion_rx.clone()
     }
 
+    /// The live-agent limiter shared by this manager's tree.
+    pub fn tree_limiter(&self) -> &Arc<SubAgentTreeLimiter> {
+        &self.tree
+    }
+
+    /// Depth of the agent owning this manager (0 = primary).
+    pub fn current_depth(&self) -> u32 {
+        self.current_depth
+    }
+
     /// Check if we can spawn more sub-agents
     pub async fn can_spawn(&self) -> bool {
         let agents = self.agents.read().await;
@@ -130,7 +220,10 @@ impl SubAgentManager {
             .values()
             .filter(|a| a.state == SubAgentState::Running)
             .count();
-        running < self.limits.max_concurrent_agents && self.current_depth < self.limits.max_depth
+        running < self.limits.max_concurrent_agents
+            && self.tree.has_capacity()
+            && (self.current_depth == 0 || running < self.limits.max_children_per_agent)
+            && self.current_depth < self.limits.max_depth
     }
 
     /// Apply ContextStrategy to create messages for sub-agent
@@ -291,6 +384,19 @@ impl SubAgentManager {
                 limit: self.limits.max_concurrent_agents,
             });
         }
+        // The primary keeps its historical per-manager cap only; nested
+        // agents are also bounded in how many children each may run.
+        if self.current_depth >= 1 && agents.len() >= self.limits.max_children_per_agent {
+            return Err(AgentError::SubAgentLimitExceeded {
+                limit: self.limits.max_children_per_agent,
+            });
+        }
+        let permit = self
+            .tree
+            .try_acquire()
+            .ok_or(AgentError::SubAgentLimitExceeded {
+                limit: self.tree.max(),
+            })?;
 
         let handle = SubAgentHandle {
             id: id.clone(),
@@ -300,6 +406,7 @@ impl SubAgentManager {
             depth: self.current_depth + 1,
             result: None,
             comms,
+            permit: Some(permit),
         };
 
         agents.insert(id, handle);
@@ -717,6 +824,78 @@ mod tests {
         let budgets = manager.allocate_fork_budget(1000, 4, &ForkBudgetPolicy::Equal);
         assert_eq!(budgets.len(), 4);
         assert_eq!(budgets[0].max_tokens, Some(250));
+    }
+
+    #[test]
+    fn tree_limiter_releases_on_permit_drop() {
+        let limiter = SubAgentTreeLimiter::new(2);
+        let a = limiter.try_acquire().expect("first slot");
+        let b = limiter.try_acquire().expect("second slot");
+        assert!(limiter.try_acquire().is_none());
+        assert_eq!(limiter.live(), 2);
+        drop(a);
+        assert_eq!(limiter.live(), 1);
+        let _c = limiter.try_acquire().expect("slot freed");
+        drop(b);
+        assert_eq!(limiter.live(), 1);
+    }
+
+    #[tokio::test]
+    async fn managers_sharing_a_tree_limiter_share_the_cap() {
+        let limits = ConcurrencyLimits {
+            max_concurrent_agents: 3,
+            ..ConcurrencyLimits::default()
+        };
+        let root = SubAgentManager::new(limits.clone(), 0);
+        let child = SubAgentManager::with_tree_limiter(
+            limits.clone(),
+            1,
+            Arc::clone(root.tree_limiter()),
+        );
+        root.register(OperationId::new(), "a".into()).await.unwrap();
+        let b = OperationId::new();
+        child.register(b.clone(), "b".into()).await.unwrap();
+        child.register(OperationId::new(), "c".into()).await.unwrap();
+        let err = root
+            .register(OperationId::new(), "d".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::SubAgentLimitExceeded { limit: 3 }
+        ));
+        assert!(!root.can_spawn().await);
+
+        child.cancel(&b).await;
+        assert_eq!(root.tree_limiter().live(), 2);
+        assert!(root.can_spawn().await);
+        root.register(OperationId::new(), "d".into()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn max_children_per_agent_applies_below_the_root_only() {
+        let limits = ConcurrencyLimits {
+            max_children_per_agent: 2,
+            ..ConcurrencyLimits::default()
+        };
+        let root = SubAgentManager::new(limits.clone(), 0);
+        for i in 0..3 {
+            root.register(OperationId::new(), format!("r{i}"))
+                .await
+                .unwrap();
+        }
+        let nested = SubAgentManager::new(limits, 1);
+        nested.register(OperationId::new(), "n0".into()).await.unwrap();
+        nested.register(OperationId::new(), "n1".into()).await.unwrap();
+        assert!(!nested.can_spawn().await);
+        let err = nested
+            .register(OperationId::new(), "n2".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::SubAgentLimitExceeded { limit: 2 }
+        ));
     }
 
     #[test]

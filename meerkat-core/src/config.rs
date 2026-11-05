@@ -520,15 +520,56 @@ pub struct SubAgentsConfig {
     /// Every concrete provider key (`anthropic`, `openai`, `gemini`) must be
     /// present and non-empty. Wildcards (`"*"`) are rejected at validation time.
     pub allowed_models: BTreeMap<String, Vec<String>>,
+    /// Whether sub-agents get `agent_*` tools themselves (sub-agent trees).
+    /// Off by default: only the primary agent can spawn.
+    pub allow_nested: bool,
+    /// Maximum nesting depth of the sub-agent tree (primary = 0). Agents at
+    /// this depth get no `agent_*` tools.
+    pub max_depth: u32,
+    /// Maximum number of live sub-agents across the whole tree.
+    pub max_concurrent_agents: usize,
+    /// Maximum number of live children of one sub-agent (depth >= 1; the
+    /// primary is bounded by `max_concurrent_agents` only).
+    pub max_children_per_agent: usize,
+    /// Abort the primary's running sub-agents when its sub-agent tools are
+    /// dropped (nested agents always abort their subtree when they end).
+    pub abort_children_on_drop: bool,
 }
 
 impl Default for SubAgentsConfig {
     fn default() -> Self {
+        let limits = crate::ops::ConcurrencyLimits::default();
         Self {
             default_provider: "inherit".to_string(),
             default_model: "inherit".to_string(),
             allowed_models: default_allowed_models(),
+            allow_nested: false,
+            max_depth: limits.max_depth,
+            max_concurrent_agents: limits.max_concurrent_agents,
+            max_children_per_agent: limits.max_children_per_agent,
+            abort_children_on_drop: false,
         }
+    }
+}
+
+impl SubAgentsConfig {
+    /// Concurrency limits for the sub-agent tree described by this config.
+    pub fn concurrency_limits(&self) -> crate::ops::ConcurrencyLimits {
+        crate::ops::ConcurrencyLimits {
+            max_depth: self.max_depth,
+            max_concurrent_agents: self.max_concurrent_agents,
+            max_children_per_agent: self.max_children_per_agent,
+            ..crate::ops::ConcurrencyLimits::default()
+        }
+    }
+
+    /// Whether the model policy (`default_provider`, `default_model`,
+    /// `allowed_models`) is untouched.
+    pub fn has_default_model_policy(&self) -> bool {
+        let default = Self::default();
+        self.default_provider == default.default_provider
+            && self.default_model == default.default_model
+            && self.allowed_models == default.allowed_models
     }
 }
 
@@ -2072,6 +2113,38 @@ initial_delay = "750ms"
         assert!(sa.allowed_models.contains_key("anthropic"));
         assert!(sa.allowed_models.contains_key("openai"));
         assert!(sa.allowed_models.contains_key("gemini"));
+    }
+
+    #[test]
+    fn test_sub_agents_tree_keys_default_and_parse() {
+        let sa = SubAgentsConfig::default();
+        assert!(!sa.allow_nested);
+        assert!(!sa.abort_children_on_drop);
+        let limits = sa.concurrency_limits();
+        let defaults = crate::ops::ConcurrencyLimits::default();
+        assert_eq!(limits.max_depth, defaults.max_depth);
+        assert_eq!(limits.max_concurrent_agents, defaults.max_concurrent_agents);
+        assert_eq!(limits.max_children_per_agent, defaults.max_children_per_agent);
+        assert!(sa.has_default_model_policy());
+
+        let config: Config = toml::from_str(
+            r#"
+[sub_agents]
+allow_nested = true
+max_depth = 2
+max_concurrent_agents = 4
+abort_children_on_drop = true
+"#,
+        )
+        .expect("should parse");
+        let sa = &config.sub_agents;
+        assert!(sa.allow_nested);
+        assert!(sa.abort_children_on_drop);
+        assert_eq!(sa.max_depth, 2);
+        assert_eq!(sa.max_concurrent_agents, 4);
+        assert_eq!(sa.max_children_per_agent, defaults.max_children_per_agent);
+        assert!(sa.has_default_model_policy());
+        config.validate().expect("tree keys validate");
     }
 
     #[test]

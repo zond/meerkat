@@ -146,7 +146,8 @@ pub use session::{
 pub use state::LoopState;
 pub use sub_agent::{
     ResolvedSubAgentModel, SubAgentCommsInfo, SubAgentCompletion, SubAgentInfo, SubAgentManager,
-    SubAgentModelError, SubAgentModelRequest, SubAgentModelResolver,
+    SubAgentModelError, SubAgentModelRequest, SubAgentModelResolver, SubAgentTreeLimiter,
+    TreePermit,
 };
 pub use tool_scope::{
     ComposedToolFilter, EXTERNAL_TOOL_FILTER_METADATA_KEY, ToolFilter, ToolScope, ToolScopeHandle,

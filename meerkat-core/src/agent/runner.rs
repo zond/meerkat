@@ -172,6 +172,14 @@ where
         &self.session
     }
 
+    /// Copy the current session into the mirror set via
+    /// `AgentBuilder::with_session_mirror` (no-op without one).
+    pub(crate) async fn sync_session_mirror(&self) {
+        if let Some(mirror) = &self.session_mirror {
+            *mirror.write().await = self.session.clone();
+        }
+    }
+
     /// Get mutable access to the session (for setting metadata)
     pub fn session_mut(&mut self) -> &mut Session {
         &mut self.session

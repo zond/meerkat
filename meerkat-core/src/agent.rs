@@ -557,6 +557,9 @@ where
     pub(crate) extraction_schema_warnings: Option<Vec<crate::schema::SchemaWarning>>,
     /// Last validation error (for retry prompt).
     pub(crate) extraction_last_error: Option<String>,
+    /// Shared copy of the conversation, refreshed before each batch of tool
+    /// calls so tools (e.g. `agent_fork`) can read the live history.
+    pub(crate) session_mirror: Option<Arc<tokio::sync::RwLock<Session>>>,
 }
 
 #[cfg(test)]

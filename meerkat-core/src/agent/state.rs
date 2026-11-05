@@ -511,6 +511,11 @@ where
 
                     // Check if we have tool calls
                     if assistant_msg.has_tool_calls() {
+                        // Publish the history up to this turn for tools that
+                        // read it (e.g. `agent_fork`), before the assistant
+                        // message with still-unanswered tool calls is added.
+                        self.sync_session_mirror().await;
+
                         // Add assistant message with ordered blocks
                         self.session
                             .push(Message::BlockAssistant(assistant_msg.clone()));
@@ -2258,6 +2263,117 @@ mod tests {
         assert_eq!(
             seen,
             vec![vec!["visible".to_string()], vec!["visible".to_string()]]
+        );
+    }
+
+    /// First call requests the `probe` tool, later calls end the turn.
+    struct ProbeOnceClient {
+        calls: Mutex<u32>,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentLlmClient for ProbeOnceClient {
+        async fn stream_response(
+            &self,
+            _messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&Value>,
+        ) -> Result<super::LlmStreamResult, AgentError> {
+            let first = {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                *calls == 1
+            };
+            if first {
+                let args = serde_json::value::RawValue::from_string("{}".to_string()).unwrap();
+                return Ok(super::LlmStreamResult::new(
+                    vec![AssistantBlock::ToolUse {
+                        id: "tc_probe".to_string(),
+                        name: "probe".to_string(),
+                        args,
+                        meta: None,
+                    }],
+                    StopReason::ToolUse,
+                    Usage::default(),
+                ));
+            }
+            Ok(super::LlmStreamResult::new(
+                Vec::new(),
+                StopReason::EndTurn,
+                Usage::default(),
+            ))
+        }
+
+        fn provider(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    /// Records the user texts visible in the mirror when `probe` runs.
+    struct MirrorProbe {
+        mirror: Arc<tokio::sync::RwLock<crate::session::Session>>,
+        seen: Mutex<Vec<String>>,
+        last_is_assistant: Mutex<Option<bool>>,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentToolDispatcher for MirrorProbe {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            Arc::from([Arc::new(ToolDef {
+                name: "probe".to_string(),
+                description: "probe".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            })])
+        }
+
+        async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolResult, ToolError> {
+            let session = self.mirror.read().await;
+            let users = session
+                .messages()
+                .iter()
+                .filter_map(|m| match m {
+                    Message::User(u) => Some(u.text_content()),
+                    _ => None,
+                })
+                .collect();
+            *self.seen.lock().unwrap() = users;
+            *self.last_is_assistant.lock().unwrap() = Some(matches!(
+                session.messages().last(),
+                Some(Message::BlockAssistant(_))
+            ));
+            Ok(ToolResult::new(call.id.to_string(), "ok".to_string(), false))
+        }
+    }
+
+    #[tokio::test]
+    async fn session_mirror_holds_history_before_tool_dispatch() {
+        let mirror = Arc::new(tokio::sync::RwLock::new(crate::session::Session::new()));
+        let probe = Arc::new(MirrorProbe {
+            mirror: Arc::clone(&mirror),
+            seen: Mutex::new(Vec::new()),
+            last_is_assistant: Mutex::new(None),
+        });
+        let mut agent = AgentBuilder::new()
+            .with_session_mirror(Arc::clone(&mirror))
+            .build(
+                Arc::new(ProbeOnceClient {
+                    calls: Mutex::new(0),
+                }),
+                Arc::clone(&probe),
+                Arc::new(NoopStore),
+            )
+            .await;
+        agent.run("hello mirror".to_string().into()).await.unwrap();
+
+        assert_eq!(*probe.seen.lock().unwrap(), vec!["hello mirror".to_string()]);
+        assert_eq!(
+            *probe.last_is_assistant.lock().unwrap(),
+            Some(false),
+            "the unanswered tool-call message is not mirrored"
         );
     }
 }

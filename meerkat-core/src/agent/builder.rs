@@ -47,6 +47,7 @@ pub struct AgentBuilder {
     pub(super) default_event_tx: Option<mpsc::Sender<crate::event::AgentEvent>>,
     pub(super) default_scoped_event_tx: Option<mpsc::Sender<crate::event::ScopedAgentEvent>>,
     pub(super) default_scope_path: Vec<crate::event::StreamScopeFrame>,
+    pub(super) session_mirror: Option<Arc<tokio::sync::RwLock<Session>>>,
 }
 
 impl AgentBuilder {
@@ -74,6 +75,7 @@ impl AgentBuilder {
             default_event_tx: None,
             default_scoped_event_tx: None,
             default_scope_path: Vec::new(),
+            session_mirror: None,
         }
     }
 
@@ -269,6 +271,7 @@ impl AgentBuilder {
             extraction_result: None,
             extraction_schema_warnings: None,
             extraction_last_error: None,
+            session_mirror: self.session_mirror,
         };
 
         if let Some(raw_filter) = agent
@@ -303,6 +306,9 @@ impl AgentBuilder {
             }
         }
 
+        if let Some(mirror) = &agent.session_mirror {
+            *mirror.write().await = agent.session.clone();
+        }
         agent
     }
 
@@ -371,6 +377,18 @@ impl AgentBuilder {
         scope_path: Vec<crate::event::StreamScopeFrame>,
     ) -> Self {
         self.default_scope_path = scope_path;
+        self
+    }
+
+    /// Keep `mirror` in sync with the agent's conversation.
+    ///
+    /// The agent copies its session into `mirror` when built and again right
+    /// before each batch of tool calls (before the assistant message that
+    /// requested them is appended), so tools reading the mirror see the
+    /// history up to the current turn. Copies are cheap: messages are shared
+    /// copy-on-write.
+    pub fn with_session_mirror(mut self, mirror: Arc<tokio::sync::RwLock<Session>>) -> Self {
+        self.session_mirror = Some(mirror);
         self
     }
 }
