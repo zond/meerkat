@@ -87,6 +87,15 @@ fn protected_set() -> &'static ProtectedSet {
     SET.get_or_init(|| ProtectedSet::build(PROTECTED_PATTERNS))
 }
 
+/// Whether `name` is an environment file that typically holds secrets:
+/// `.env`, `.env.<anything>` or `.envrc`. The approval classifier's
+/// read-only tools never read such files, nor anything below a directory of
+/// that name.
+pub fn is_secret_file_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|n| n == ".env" || n == ".envrc" || n.starts_with(".env."))
+}
+
 /// Errors from resolving a model-supplied path.
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {

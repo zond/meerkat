@@ -593,6 +593,7 @@ fn init_logging(realm_root: &std::path::Path) -> Result<(), TuiError> {
 
 /// The classifier for Tier-3 actions: the two-stage LLM classifier on the
 /// session's provider, or an always-escalating stub when no model is known.
+/// Stage 2 may read project files unless `auto.classifier_tools` is off.
 fn make_classifier(
     settings: &AutoSettings,
     llm: Arc<dyn LlmClient>,
@@ -604,11 +605,18 @@ fn make_classifier(
         .clone()
         .or_else(|| classifier_default_model(provider).map(str::to_string));
     match model {
-        // Stage 2 may read project files (read-only, bounded) to judge what a
-        // command will actually execute.
-        Some(model) => Arc::new(LlmClassifier::new(llm, provider, model).with_project_tools(
-            Arc::new(crate::tools::ReadOnlyProjectTools::new(project_root)),
-        )),
+        Some(model) => {
+            let classifier = LlmClassifier::new(llm, provider, model);
+            // Stage 2 may read project files (read-only, bounded) to judge
+            // what a command will actually execute.
+            Arc::new(if settings.classifier_tools {
+                classifier.with_project_tools(Arc::new(crate::tools::ReadOnlyProjectTools::new(
+                    project_root,
+                )))
+            } else {
+                classifier
+            })
+        }
         None => Arc::new(UnavailableClassifier),
     }
 }

@@ -32,6 +32,8 @@ pub const COMMUNITY_PRICES_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 /// Timeout of the community price-list fetch.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Largest community price list accepted (the file is ~3.4 MB in 2026).
+pub const MAX_PRICE_LIST_BYTES: usize = 32 * 1024 * 1024;
 /// Age after which the cached community list is refreshed (and its prices
 /// count as estimates until the refresh succeeds).
 pub const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -456,6 +458,9 @@ pub enum PricingError {
     /// The body is not the expected JSON.
     #[error("unexpected price list: {0}")]
     Decode(String),
+    /// The body exceeded [`MAX_PRICE_LIST_BYTES`].
+    #[error("price list larger than {} MiB", MAX_PRICE_LIST_BYTES / (1024 * 1024))]
+    TooLarge,
     /// Reading or writing the cache failed.
     #[error("price cache: {0}")]
     Io(String),
@@ -486,12 +491,26 @@ pub async fn fetch_community(
         builder = builder.no_proxy();
     }
     let client = builder.build().map_err(http)?;
-    let response = client.get(url).send().await.map_err(http)?;
+    let mut response = client.get(url).send().await.map_err(http)?;
     let status = response.status();
     if !status.is_success() {
         return Err(PricingError::Status(status.as_u16()));
     }
-    let body = response.text().await.map_err(http)?;
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_PRICE_LIST_BYTES as u64)
+    {
+        return Err(PricingError::TooLarge);
+    }
+    // Read in chunks so a missing or lying Content-Length cannot exhaust memory.
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(http)? {
+        if body.len() + chunk.len() > MAX_PRICE_LIST_BYTES {
+            return Err(PricingError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8(body).map_err(|err| PricingError::Decode(err.to_string()))?;
     CommunityPrices::decode(&body)
 }
 
@@ -821,5 +840,29 @@ mod tests {
         assert!(!fetched.is_stale());
         let cached = CommunityPrices::load_cache(&path, unix_now()).unwrap();
         assert_eq!(cached.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn oversized_price_list_is_refused() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/prices.json", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 4096];
+            let _ = socket.read(&mut buf).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{{",
+                MAX_PRICE_LIST_BYTES + 1
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CACHE_FILE);
+        let err = refresh_community(&url, Some(&path), FETCH_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert_eq!(err, PricingError::TooLarge);
+        assert!(!path.exists(), "nothing cached");
     }
 }

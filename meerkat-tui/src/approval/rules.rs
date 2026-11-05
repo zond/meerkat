@@ -655,6 +655,10 @@ pub struct AutoSettings {
     /// warn after every turn in warn mode. Never below `compact_warn_percent`
     /// after [`load_layered`].
     pub compact_auto_percent: u8,
+    /// Whether the stage-2 classifier may read project files (read-only,
+    /// bounded). On by default; off makes stage 2 decide from the attached
+    /// context only, so file contents never reach the classifier.
+    pub classifier_tools: bool,
 }
 
 impl Default for AutoSettings {
@@ -667,6 +671,7 @@ impl Default for AutoSettings {
             compact: compaction.mode,
             compact_warn_percent: compaction.warn_percent,
             compact_auto_percent: compaction.auto_percent,
+            classifier_tools: true,
         }
     }
 }
@@ -708,6 +713,9 @@ pub struct AutoSection {
     /// See [`AutoSettings::compact_auto_percent`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_auto_percent: Option<u8>,
+    /// See [`AutoSettings::classifier_tools`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_tools: Option<bool>,
 }
 
 /// One `[[allow]]` / `[[deny]]` entry.
@@ -1153,7 +1161,7 @@ pub fn load_layered(
 /// rules, `[auto]` settings or endpoints). The project layer contributes deny
 /// rules, `[auto]` settings the command line did not set, and new endpoints
 /// (which may not read keys from the environment); it can never turn
-/// `trust_project_builds` on, but may turn it off.
+/// `trust_project_builds` or `classifier_tools` on, but may turn them off.
 ///
 /// # Errors
 ///
@@ -1299,13 +1307,24 @@ pub fn load_layered_with(
             auto.trust_project_builds = None;
             notices.push(Notice::ProjectTrustIgnored { path: project_path });
         }
+        // File contents a cloned repository wrote must not reach the
+        // classifier against the user's choice: the project may only turn
+        // the classifier's file reads off.
+        if auto.classifier_tools == Some(true) {
+            auto.classifier_tools = None;
+        }
         // The command line wins over the project file, except that the
-        // project may always lower `trust_project_builds`.
+        // project may always lower `trust_project_builds` and turn off
+        // `classifier_tools`.
         if let Some(cli_auto) = cli.and_then(|c| c.auto.as_ref()) {
             let lower_trust = auto.trust_project_builds;
+            let tools_off = auto.classifier_tools;
             auto = project_auto_without(auto, cli_auto);
             if lower_trust == Some(false) {
                 auto.trust_project_builds = Some(false);
+            }
+            if tools_off == Some(false) {
+                auto.classifier_tools = Some(false);
             }
         }
         apply_auto(&mut settings, &auto);
@@ -1354,6 +1373,7 @@ fn project_auto_without(project: AutoSection, cli: &AutoSection) -> AutoSection 
             project.compact_auto_percent,
             cli.compact_auto_percent.is_some(),
         ),
+        classifier_tools: keep(project.classifier_tools, cli.classifier_tools.is_some()),
     }
 }
 
@@ -1375,6 +1395,9 @@ fn apply_auto(settings: &mut AutoSettings, auto: &AutoSection) {
     }
     if let Some(percent) = auto.compact_auto_percent {
         settings.compact_auto_percent = percent;
+    }
+    if let Some(tools) = auto.classifier_tools {
+        settings.classifier_tools = tools;
     }
 }
 
@@ -2014,6 +2037,32 @@ mod tests {
 
     fn cli(text: &str) -> RulesFile {
         toml::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn classifier_tools_default_on_and_project_can_only_turn_them_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (realm, project) = (tmp.path().join("realm"), tmp.path().join("p"));
+        assert!(AutoSettings::default().classifier_tools);
+        // The project may turn the classifier's file reads off, even over
+        // the command line...
+        write(&realm, "");
+        write(&project, "[auto]\nclassifier_tools = false\n");
+        let overlay = cli("[auto]\nclassifier_tools = true\n");
+        let layered =
+            load_layered_with(&realm, None, &project, RealmTrust::Owned, Some(&overlay)).unwrap();
+        assert!(!layered.settings.classifier_tools);
+        // ...but never back on once a user layer turned them off.
+        write(&realm, "[auto]\nclassifier_tools = false\n");
+        write(&project, "[auto]\nclassifier_tools = true\n");
+        let layered = load_layered_with(&realm, None, &project, RealmTrust::Owned, None).unwrap();
+        assert!(!layered.settings.classifier_tools);
+        // The command line may turn them off.
+        write(&realm, "");
+        let overlay = cli("[auto]\nclassifier_tools = false\n");
+        let layered =
+            load_layered_with(&realm, None, &project, RealmTrust::Owned, Some(&overlay)).unwrap();
+        assert!(!layered.settings.classifier_tools);
     }
 
     #[test]

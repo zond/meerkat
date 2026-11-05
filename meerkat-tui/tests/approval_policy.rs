@@ -30,6 +30,7 @@ struct ScriptedClassifier {
     calls: AtomicUsize,
     seen_transcripts: parking_lot::Mutex<Vec<String>>,
     seen_payloads: parking_lot::Mutex<Vec<Option<String>>>,
+    seen_written: parking_lot::Mutex<Vec<Vec<String>>>,
 }
 
 impl ScriptedClassifier {
@@ -56,6 +57,7 @@ impl ActionClassifier for ScriptedClassifier {
         self.seen_payloads
             .lock()
             .push(input.script_payload.map(str::to_string));
+        self.seen_written.lock().push(input.agent_written.to_vec());
         self.script
             .lock()
             .pop_front()
@@ -221,6 +223,46 @@ async fn in_project_edit_is_tier_two() {
     assert!(v.is_allowed());
     assert_eq!(tier_of(&v), Tier::InProjectEdit);
     assert_eq!(h.classifier.calls(), 0);
+}
+
+#[tokio::test]
+async fn allowed_writes_are_shown_to_the_classifier_as_agent_written() {
+    let h = harness(Options {
+        verdicts: vec![block("no"), Ok(ClassifierVerdict::Allow)],
+        ..Options::default()
+    });
+    // Tier-2 writes are recorded (apply_patch with every target).
+    h.decide(
+        "write_file",
+        json!({"path": "scripts/run.sh", "content": "#!/bin/sh\n"}),
+    )
+    .await;
+    h.decide(
+        "apply_patch",
+        json!({"patch": "*** Begin Patch\n*** Add File: a.txt\n+x\n*** Update File: src/main.rs\n@@\n-fn main() {}\n+fn main() { }\n*** End Patch"}),
+    )
+    .await;
+    // A denied write is not.
+    let denied = h
+        .decide(
+            "edit_file",
+            json!({"path": ".rkat/config.toml", "old_string": "", "new_string": "x"}),
+        )
+        .await;
+    assert!(!denied.is_allowed());
+    // A repeated write keeps its first position.
+    h.decide(
+        "write_file",
+        json!({"path": "scripts/run.sh", "content": "#!/bin/sh\necho\n"}),
+    )
+    .await;
+    h.decide("shell", json!({"command": "sh scripts/run.sh"}))
+        .await;
+    let seen = h.classifier.seen_written.lock().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0], ["scripts/run.sh", "a.txt", "src/main.rs"]);
+    assert_eq!(seen[1], seen[0]);
+    assert_eq!(h.engine.agent_written(), seen[0]);
 }
 
 #[tokio::test]

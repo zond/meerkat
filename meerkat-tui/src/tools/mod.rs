@@ -89,6 +89,9 @@ pub(crate) struct Shared {
     /// Absolute path → mtime observed when the file was last read or written by a tool.
     pub(crate) read_state: Mutex<HashMap<PathBuf, SystemTime>>,
     pub(crate) diff_tx: Option<mpsc::UnboundedSender<FileDiff>>,
+    /// Skip environment files ([`crate::paths::is_secret_file_name`]) when
+    /// walking for `glob`/`grep` (the classifier's read-only tools).
+    pub(crate) hide_secrets: bool,
 }
 
 impl Shared {
@@ -262,6 +265,20 @@ impl FileToolDispatcher {
     /// Create a dispatcher rooted at `root`. Diffs produced by `write_file` and
     /// `edit_file` are sent to `diff_tx` when provided.
     pub fn new(root: ProjectRoot, diff_tx: Option<mpsc::UnboundedSender<FileDiff>>) -> Self {
+        Self::build(root, diff_tx, false)
+    }
+
+    /// A dispatcher whose `glob`/`grep` never list or search environment
+    /// files (for the classifier; `read_file` refusals are the caller's job).
+    pub(crate) fn hiding_secrets(root: ProjectRoot) -> Self {
+        Self::build(root, None, true)
+    }
+
+    fn build(
+        root: ProjectRoot,
+        diff_tx: Option<mpsc::UnboundedSender<FileDiff>>,
+        hide_secrets: bool,
+    ) -> Self {
         let tools: Arc<[Arc<ToolDef>]> = vec![
             Arc::new(read::definition()),
             Arc::new(write::definition()),
@@ -275,6 +292,7 @@ impl FileToolDispatcher {
                 root,
                 read_state: Mutex::new(HashMap::new()),
                 diff_tx,
+                hide_secrets,
             }),
             tools,
         }

@@ -84,8 +84,9 @@ async fn git_output(root: &Path, args: &[&str]) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Everything the classifier may see. Deliberately excludes assistant prose,
-/// reasoning and tool outputs.
+/// Everything the classifier is given. Deliberately excludes assistant prose,
+/// reasoning and the agent's tool outputs; stage 2 may additionally read
+/// project files itself (see [`LlmClassifier::with_project_tools`]).
 #[derive(Debug, Clone, Copy)]
 pub struct ClassifierInput<'a> {
     /// Environment and trust boundary.
@@ -98,6 +99,11 @@ pub struct ClassifierInput<'a> {
     pub args: &'a Value,
     /// Content of an in-project script the action runs (≤ 8 KiB), if any.
     pub script_payload: Option<&'a str>,
+    /// Project files the agent created or modified through file-edit tools
+    /// during this run, as display paths, oldest first. Their content is
+    /// agent-authored, so the classifier must not take it as evidence of
+    /// user intent.
+    pub agent_written: &'a [String],
 }
 
 /// The classifier's verdict.
@@ -738,6 +744,7 @@ mod tests {
             tool: "x",
             args: &args,
             script_payload: None,
+            agent_written: &[],
         };
         assert!(matches!(
             UnavailableClassifier.classify(input).await,

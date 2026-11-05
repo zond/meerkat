@@ -55,8 +55,9 @@ pub(crate) fn search_root(
     Ok(resolved.abs)
 }
 
-/// A gitignore-aware walker that includes hidden files but never descends into `.git`.
-pub(crate) fn walker(root: &Path) -> WalkBuilder {
+/// A gitignore-aware walker that includes hidden files but never descends
+/// into `.git`; with `hide_secrets` it also skips environment files.
+pub(crate) fn walker(root: &Path, hide_secrets: bool) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
@@ -66,7 +67,10 @@ pub(crate) fn walker(root: &Path) -> WalkBuilder {
         .ignore(true)
         .parents(true)
         .require_git(false)
-        .filter_entry(|entry| entry.file_name() != ".git");
+        .filter_entry(move |entry| {
+            entry.file_name() != ".git"
+                && !(hide_secrets && crate::paths::is_secret_file_name(entry.file_name()))
+        });
     builder
 }
 
@@ -85,7 +89,7 @@ pub(crate) fn run(shared: &Shared, _id: String, args: GlobArgs) -> ToolOutcome {
     }
 
     let mut hits: Vec<(SystemTime, PathBuf)> = Vec::new();
-    for entry in walker(&root).build().flatten() {
+    for entry in walker(&root, shared.hide_secrets).build().flatten() {
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }

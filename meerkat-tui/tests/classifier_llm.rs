@@ -228,6 +228,7 @@ impl Fixture {
             tool: "shell",
             args: &self.args,
             script_payload: None,
+            agent_written: &[],
         }
     }
 }

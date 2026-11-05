@@ -45,6 +45,7 @@ async fn verdict(classifier: &LlmClassifier, command: &str) -> ClassifierVerdict
         tool: "shell",
         args: &args,
         script_payload: None,
+        agent_written: &[],
     };
     let verdict = classifier.classify(input).await.unwrap();
     eprintln!("{} `{command}` => {verdict}", classifier.model());

@@ -28,12 +28,28 @@ Every tool call passes through a `PreToolExecution` hook. First match wins:
 | 2 | `write_file` / `edit_file` / `apply_patch` where every target is inside the project and not protected (`.rkat/`, `.git/`, `.env*`, …) | allowed |
 | 3 | Everything else: other shell commands, MCP tools, sub-agent spawns, out-of-project paths, protected paths | classifier |
 
-The classifier is a separate LLM call on the session's provider. It sees only the
+The classifier is a separate LLM call on the session's provider. It is given the
 user's messages and the agent's prior tool calls, never the agent's reasoning or
-tool outputs, so it cannot be argued or prompt-injected past. Stage 1 is a
+its tool outputs, so the agent cannot argue with it directly. Stage 1 is a
 one-word ALLOW/BLOCK told to err on the side of blocking; stage 2 re-evaluates
 flagged actions with reasoning. A block is returned to the agent as a tool error
 with the reason and an instruction to find a safer path.
+
+Stage 2 may also read project files itself (read-only `read_file`, `glob` and
+`grep`, inside the project root; at most 6 calls, 16 KiB per result, 60 s) to
+judge what an action will really execute: the script a command runs, the
+Makefile or `package.json` behind a task runner. That is file content, and the
+agent can write project files without review, so it is a prompt-injection
+surface: a script could carry text addressed to the reviewer. Three things
+limit it. Every file result is framed as untrusted evidence that carries no
+weight as instructions; the classifier is told which files the agent created or
+modified this session (through its file tools; files a shell command changed
+are not tracked), so it treats their content as the agent's; and environment
+files (`.env`, `.env.*`, `.envrc`) are never read, listed or searched, so
+secrets in them are not sent to the classifier's provider. Note that stage 2
+only runs when stage 1 did not allow, so what it reads can only turn a block
+into an allow. Set `auto.classifier_tools = false` to make stage 2 decide from
+the attached context alone (more blocks and escalations, no file content).
 
 After **3 consecutive** or **20 total** classifier blocks, auto mode pauses and
 each tier-3 action opens a dialog: allow once, allow and add a narrow rule, deny,
@@ -60,6 +76,7 @@ trust_project_builds = true              # cargo build/test/check are tier 1
 compact = "warn"                         # or "auto"; see "Context and compaction"
 compact_warn_percent = 75
 compact_auto_percent = 85
+classifier_tools = true                  # stage 2 may read project files (see above)
 
 [[allow]]
 tool = "shell"
@@ -81,7 +98,8 @@ after the global and realm files and before the project file: tables merge,
 scalars replace, arrays **append** (`--set 'allow=[{tool="shell",arg="cargo nextest run*"}]'`
 adds a rule) and endpoints merge by name (`--set endpoints.litellm.base_url=http://host:4000`
 changes only the URL). The project file's deny rules still apply, and it may
-still lower `trust_project_builds`; its other `[auto]` keys apply only where the
+still lower `trust_project_builds` and turn `classifier_tools` off (it can never
+turn either on); its other `[auto]` keys apply only where the
 command line set nothing. A bad `--set` (unknown key, wrong type, invalid
 pattern or dialect) stops start-up and names the argument. Command-line rules
 show as `(cli)` in `/rules list` and are never written to a file.
@@ -94,6 +112,7 @@ show as `(cli)` in `/rules list` and are never written to a file.
 | `auto.compact` (`"warn"`/`"auto"`) | `--auto-compact` / `--no-auto-compact` | `"warn"` |
 | `auto.compact_warn_percent` | `--set auto.compact_warn_percent=N` | `75` |
 | `auto.compact_auto_percent` | `--set auto.compact_auto_percent=N` | `85` |
+| `auto.classifier_tools` | `--set auto.classifier_tools=false` | `true` |
 | `[[allow]]` `tool`, `arg` (glob) or `literal` | `--allow <tool>[=<glob>]` (repeatable) | none |
 | `[[deny]]` `tool`, `arg` (glob) or `literal` | `--deny <tool>[=<glob>]` (repeatable) | none |
 | `endpoints.<name>.dialect` (`anthropic`/`openai`/`gemini`) | `--endpoint-def <name>=<dialect>=<url>[,key_env=VAR]` | required |

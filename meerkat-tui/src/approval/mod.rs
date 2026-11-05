@@ -32,6 +32,7 @@ pub mod transcript;
 use classifier::{ActionClassifier, ClassifierInput, ClassifierVerdict, Environment};
 use counters::{AutoMode, AutoModeState, DenialCounters, PauseCause};
 use escalation::{EscalationBroker, EscalationPrompt, HumanDecision};
+use indexmap::IndexSet;
 use meerkat_core::{
     HookCapability, HookDecision, HookEngine, HookEntryConfig, HookExecutionMode,
     HookFailurePolicy, HookId, HookInvocation, HookPoint, HookReasonCode, HookRuntimeConfig,
@@ -318,6 +319,9 @@ pub struct ApprovalEngine {
     posix_shell: bool,
     events: mpsc::UnboundedSender<ApprovalEvent>,
     rules_path: Option<PathBuf>,
+    /// Project files (display paths) whose writes were allowed this run, in
+    /// first-write order: shown to the classifier as agent-authored.
+    agent_written: Mutex<IndexSet<String>>,
 }
 
 impl fmt::Debug for ApprovalEngine {
@@ -365,6 +369,7 @@ impl ApprovalEngine {
             posix_shell,
             events,
             rules_path,
+            agent_written: Mutex::new(IndexSet::new()),
         })
     }
 
@@ -567,6 +572,9 @@ impl ApprovalEngine {
         let tier = match &verdict {
             Verdict::Allow { tier, .. } | Verdict::Deny { tier, .. } => *tier,
         };
+        if verdict.is_allowed() {
+            self.record_agent_writes(&Action::parse(name, args));
+        }
         let summary = verdict.summary();
         self.transcripts
             .write()
@@ -582,6 +590,22 @@ impl ApprovalEngine {
             verdict: summary,
         });
         verdict
+    }
+
+    /// Remember the files an allowed write targets. Recorded at approval
+    /// time (before the tool runs): a write that then fails stays listed,
+    /// which only makes the classifier more careful.
+    fn record_agent_writes(&self, action: &Action<'_>) {
+        if matches!(action.kind, ActionKind::FileWrite { .. }) {
+            self.agent_written
+                .lock()
+                .extend(action.subjects(&self.root));
+        }
+    }
+
+    /// Project files the agent was allowed to write this run, oldest first.
+    pub fn agent_written(&self) -> Vec<String> {
+        self.agent_written.lock().iter().cloned().collect()
     }
 
     fn tier_of(&self, action: &Action<'_>) -> policy::TierDecision {
@@ -646,6 +670,7 @@ impl ApprovalEngine {
         }
 
         let script = self.script_payload(&action).await;
+        let agent_written = self.agent_written();
         let result = {
             let transcript = self
                 .transcripts
@@ -659,6 +684,7 @@ impl ApprovalEngine {
                 tool: name,
                 args,
                 script_payload: script.as_deref(),
+                agent_written: &agent_written,
             };
             self.classifier.classify(input).await
         };
