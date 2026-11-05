@@ -12,7 +12,8 @@ use ratatui::widgets::{Block as BorderBlock, Borders, Clear, Paragraph};
 
 use super::markdown::{truncate_to_width, wrap_text};
 use super::render::fmt_ctx_tokens;
-use crate::models::{ModelEntry, ModelSource};
+use crate::endpoints::describe_endpoint;
+use crate::models::{ModelEntry, ModelGroup, ModelSource};
 
 /// Maximum lines of the args preview shown in the escalation dialog.
 const MAX_ARGS_LINES: usize = 10;
@@ -73,41 +74,49 @@ impl ResumePicker {
     }
 }
 
-/// Model picker for `/model` without an id: the provider's models, the
-/// current one first, narrowed by a type-to-filter query.
+/// Model picker for `/model` without an id: one group per endpoint (the
+/// current endpoint and model first), narrowed by a type-to-filter query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelPicker {
-    /// Every model, in display order.
-    pub items: Vec<ModelEntry>,
-    /// Case-insensitive substring filter over id and display name.
+    /// Every endpoint's models, in display order.
+    pub groups: Vec<ModelGroup>,
+    /// Case-insensitive substring filter over `endpoint:id` and display name.
     pub filter: String,
-    /// Selected index into the filtered list.
+    /// Selected index into the filtered models (across groups).
     pub selected: usize,
-    /// Shown above the list (e.g. the provider endpoint failed).
-    pub warning: Option<String>,
 }
 
 impl ModelPicker {
-    /// A picker over `items` with nothing filtered and the first item selected.
-    pub fn new(items: Vec<ModelEntry>, warning: Option<String>) -> Self {
+    /// A picker over `groups` with nothing filtered and the first model selected.
+    pub fn new(groups: Vec<ModelGroup>) -> Self {
         Self {
-            items,
+            groups,
             filter: String::new(),
             selected: 0,
-            warning,
         }
     }
 
-    /// The items matching the filter, in display order.
-    pub fn filtered(&self) -> impl Iterator<Item = &ModelEntry> {
+    fn matches(needle: &str, group: &ModelGroup, entry: &ModelEntry) -> bool {
+        needle.is_empty()
+            || format!("{}:{}", group.endpoint, entry.id)
+                .to_lowercase()
+                .contains(needle)
+            || entry
+                .display_name
+                .as_deref()
+                .is_some_and(|name| name.to_lowercase().contains(needle))
+    }
+
+    /// The models matching the filter with their group, in display order.
+    pub fn filtered(&self) -> impl Iterator<Item = (&ModelGroup, &ModelEntry)> {
         let needle = self.filter.to_lowercase();
-        self.items.iter().filter(move |entry| {
-            needle.is_empty()
-                || entry.id.to_lowercase().contains(&needle)
-                || entry
-                    .display_name
-                    .as_deref()
-                    .is_some_and(|name| name.to_lowercase().contains(&needle))
+        self.groups.iter().flat_map(move |group| {
+            let needle = needle.clone();
+            group
+                .models
+                .iter()
+                .filter(move |entry| Self::matches(&needle, group, entry))
+                .map(move |entry| (group, entry))
         })
     }
 
@@ -135,11 +144,21 @@ impl ModelPicker {
         self.selected = 0;
     }
 
-    /// The selected model id, `None` when nothing matches the filter.
-    pub fn selected_id(&self) -> Option<&str> {
+    /// The selected model as `endpoint:id`, `None` when nothing matches.
+    pub fn selected_ref(&self) -> Option<String> {
         self.filtered()
             .nth(self.selected)
-            .map(|entry| entry.id.as_str())
+            .map(|(group, entry)| format!("{}:{}", group.endpoint, entry.id))
+    }
+
+    /// Warnings of every group (shown as notices when the picker cannot open).
+    pub fn warnings(groups: &[ModelGroup]) -> impl Iterator<Item = String> + '_ {
+        groups.iter().filter_map(|group| {
+            group
+                .warning
+                .as_ref()
+                .map(|warning| format!("{}: {warning}", group.endpoint))
+        })
     }
 }
 
@@ -275,11 +294,12 @@ fn picker_lines(picker: &ResumePicker, width: usize, max_rows: usize) -> Vec<Lin
         .collect()
 }
 
-/// Header (filter, warning), one row per visible model, and a key hint.
-/// At most `max_lines` lines; the list scrolls to keep the selection visible.
+/// Filter line, then per endpoint a header, its warning and its models,
+/// then a key hint. At most `max_lines` lines; the list scrolls to keep the
+/// selection visible.
 fn model_picker_lines(picker: &ModelPicker, width: usize, max_lines: usize) -> Vec<Line<'static>> {
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let mut lines = vec![if picker.filter.is_empty() {
+    let mut head = vec![if picker.filter.is_empty() {
         Line::styled("filter: (type to filter)", dim)
     } else {
         Line::from(vec![
@@ -287,40 +307,75 @@ fn model_picker_lines(picker: &ModelPicker, width: usize, max_lines: usize) -> V
             Span::raw(truncate_to_width(&picker.filter, width.saturating_sub(8))),
         ])
     }];
-    if let Some(warning) = &picker.warning {
-        lines.extend(
-            wrap_text(warning, width)
-                .into_iter()
-                .map(|l| Line::styled(l, Style::default().fg(Color::Yellow))),
-        );
-    }
     let footer = Line::styled("↑/↓ move · Enter select · Esc close", dim);
-    let matches: Vec<&ModelEntry> = picker.filtered().collect();
-    if matches.is_empty() {
-        lines.push(Line::styled("no models match", dim));
-        lines.push(footer);
-        return lines;
-    }
-    let rows = max_lines.saturating_sub(lines.len() + 1).max(1);
-    let start = picker.selected.saturating_sub(rows.saturating_sub(1));
-    let id_width = matches
-        .iter()
-        .map(|entry| entry.id.chars().count())
+    let needle = picker.filter.to_lowercase();
+    let id_width = picker
+        .filtered()
+        .map(|(_, entry)| entry.id.chars().count())
         .max()
         .unwrap_or(0)
         .min(width / 2);
-    for (i, entry) in matches.iter().enumerate().skip(start).take(rows) {
-        let text = truncate_to_width(&model_row(entry, id_width), width);
-        lines.push(if i == picker.selected {
-            Line::styled(text, Style::default().add_modifier(Modifier::REVERSED))
-        } else if entry.source == ModelSource::Current {
-            Line::styled(text, Style::default().add_modifier(Modifier::BOLD))
-        } else {
-            Line::from(text)
-        });
+    let mut body: Vec<Line<'static>> = Vec::new();
+    let mut selected_line = None;
+    let mut index = 0;
+    for group in &picker.groups {
+        let matching: Vec<&ModelEntry> = group
+            .models
+            .iter()
+            .filter(|entry| ModelPicker::matches(&needle, group, entry))
+            .collect();
+        if !needle.is_empty() && matching.is_empty() {
+            continue;
+        }
+        body.push(Line::styled(
+            truncate_to_width(&group_header(group), width),
+            Style::default().fg(Color::Cyan),
+        ));
+        if let Some(warning) = &group.warning {
+            body.extend(
+                wrap_text(warning, width)
+                    .into_iter()
+                    .map(|l| Line::styled(l, Style::default().fg(Color::Yellow))),
+            );
+        } else if matching.is_empty() {
+            body.push(Line::styled("no models", dim));
+        }
+        for entry in matching {
+            let text = truncate_to_width(&model_row(entry, id_width), width);
+            if index == picker.selected {
+                selected_line = Some(body.len());
+                body.push(Line::styled(
+                    text,
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ));
+            } else if entry.source == ModelSource::Current {
+                body.push(Line::styled(
+                    text,
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                body.push(Line::from(text));
+            }
+            index += 1;
+        }
     }
-    lines.push(footer);
-    lines
+    if index == 0 && !needle.is_empty() {
+        body.push(Line::styled("no models match", dim));
+    }
+    let rows = max_lines.saturating_sub(head.len() + 1).max(1);
+    let start = selected_line.map_or(0, |line| line.saturating_sub(rows.saturating_sub(1)));
+    head.extend(body.into_iter().skip(start).take(rows));
+    head.push(footer);
+    head
+}
+
+/// `── litellm (openai dialect, http://localhost:4000) ──`.
+fn group_header(group: &ModelGroup) -> String {
+    format!(
+        "── {} ({}) ──",
+        group.endpoint,
+        describe_endpoint(group.dialect, group.base_url.as_deref())
+    )
 }
 
 /// `id  Display Name  200k ctx  current`, with the id padded to `id_width`.
@@ -335,11 +390,10 @@ fn model_row(entry: &ModelEntry, id_width: usize) -> String {
         row.push_str(&fmt_ctx_tokens(window));
         row.push_str(" ctx");
     }
-    row.push_str(match entry.source {
-        ModelSource::Current => "  current",
-        ModelSource::Provider => "  provider",
-    });
-    row
+    if entry.source == ModelSource::Current {
+        row.push_str("  current");
+    }
+    row.trim_end().to_string()
 }
 
 #[cfg(test)]
@@ -370,62 +424,97 @@ mod tests {
         }
     }
 
+    fn group(endpoint: &str, models: Vec<ModelEntry>) -> ModelGroup {
+        ModelGroup {
+            endpoint: endpoint.into(),
+            dialect: crate::endpoints::Dialect::Anthropic,
+            base_url: None,
+            models,
+            warning: None,
+        }
+    }
+
     fn sample_models() -> ModelPicker {
-        ModelPicker::new(
-            vec![
-                model(
-                    "claude-sonnet-4-6",
-                    Some("Claude Sonnet 4.6"),
-                    ModelSource::Current,
-                ),
-                model(
-                    "claude-opus-4-6",
-                    Some("Claude Opus 4.6"),
-                    ModelSource::Provider,
-                ),
-                model("claude-haiku-4-5", None, ModelSource::Provider),
-            ],
-            None,
-        )
+        ModelPicker::new(vec![
+            group(
+                "anthropic",
+                vec![
+                    model(
+                        "claude-sonnet-4-6",
+                        Some("Claude Sonnet 4.6"),
+                        ModelSource::Current,
+                    ),
+                    model(
+                        "claude-opus-4-6",
+                        Some("Claude Opus 4.6"),
+                        ModelSource::Provider,
+                    ),
+                ],
+            ),
+            group(
+                "litellm",
+                vec![model("claude-haiku-4-5", None, ModelSource::Provider)],
+            ),
+        ])
     }
 
     #[test]
-    fn model_picker_filters_by_id_and_display_name() {
+    fn model_picker_filters_by_endpoint_id_and_display_name() {
         let mut p = sample_models();
         for c in "OPUS".chars() {
             p.push_filter(c);
         }
-        assert_eq!(p.selected_id(), Some("claude-opus-4-6"));
+        assert_eq!(
+            p.selected_ref().as_deref(),
+            Some("anthropic:claude-opus-4-6")
+        );
         assert_eq!(p.filtered().count(), 1);
         p.filter.clear();
         for c in "4.6".chars() {
             p.push_filter(c);
         }
-        let ids: Vec<&str> = p.filtered().map(|e| e.id.as_str()).collect();
+        let ids: Vec<&str> = p.filtered().map(|(_, e)| e.id.as_str()).collect();
         assert_eq!(ids, vec!["claude-sonnet-4-6", "claude-opus-4-6"]);
+        p.filter.clear();
+        for c in "litellm:".chars() {
+            p.push_filter(c);
+        }
+        assert_eq!(
+            p.selected_ref().as_deref(),
+            Some("litellm:claude-haiku-4-5")
+        );
     }
 
     #[test]
-    fn model_picker_navigation_resets_on_filter_and_clamps() {
+    fn model_picker_navigation_spans_groups_and_clamps() {
         let mut p = sample_models();
         p.down();
         p.down();
         p.down();
-        assert_eq!(p.selected_id(), Some("claude-haiku-4-5"));
+        assert_eq!(
+            p.selected_ref().as_deref(),
+            Some("litellm:claude-haiku-4-5")
+        );
         p.push_filter('o');
         assert_eq!(p.selected, 0);
         p.down();
-        assert_eq!(p.selected_id(), Some("claude-opus-4-6"));
+        assert_eq!(
+            p.selected_ref().as_deref(),
+            Some("anthropic:claude-opus-4-6")
+        );
         p.push_filter('x');
-        assert_eq!(p.selected_id(), None);
+        assert_eq!(p.selected_ref(), None);
         p.pop_filter();
-        assert_eq!(p.selected_id(), Some("claude-sonnet-4-6"));
+        assert_eq!(
+            p.selected_ref().as_deref(),
+            Some("anthropic:claude-sonnet-4-6")
+        );
         p.up();
         assert_eq!(p.selected, 0);
     }
 
     #[test]
-    fn model_row_shows_name_window_and_tag() {
+    fn model_row_shows_name_window_and_current() {
         let mut entry = model(
             "gemini-3.1-pro-preview",
             Some("Gemini 3.1 Pro"),
@@ -437,7 +526,18 @@ mod tests {
             "gemini-3.1-pro-preview    Gemini 3.1 Pro  1M ctx  current"
         );
         let bare = model("gpt-5.4", None, ModelSource::Provider);
-        assert_eq!(model_row(&bare, 7), "gpt-5.4  provider");
+        assert_eq!(model_row(&bare, 7), "gpt-5.4");
+    }
+
+    #[test]
+    fn group_header_names_endpoint_dialect_and_url() {
+        let mut g = group("litellm", Vec::new());
+        g.dialect = crate::endpoints::Dialect::OpenAi;
+        g.base_url = Some("http://localhost:4000".into());
+        assert_eq!(
+            group_header(&g),
+            "── litellm (openai dialect, http://localhost:4000) ──"
+        );
     }
 
     #[test]

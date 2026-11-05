@@ -15,6 +15,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use meerkat::LlmClient;
 use meerkat_core::error::AgentError;
 use meerkat_core::event::{AgentEvent, EventEnvelope, ScopedAgentEvent, StreamScopeFrame};
 use meerkat_core::service::{
@@ -47,8 +48,15 @@ pub struct SessionOptions {
     pub additional_instructions: Vec<String>,
     /// Model to run on, overriding the resumed session's stored model (or the
     /// runtime's default for a fresh session). Must belong to the runtime's
-    /// provider.
+    /// provider (or [`SessionOptions::provider`]).
     pub model: Option<String>,
+    /// Provider (client dialect) of the session; the runtime's when `None`.
+    pub provider: Option<Provider>,
+    /// LLM client of the session's endpoint; the runtime's shared client
+    /// when `None`.
+    pub llm: Option<Arc<dyn LlmClient>>,
+    /// Endpoint name, recorded as the `endpoint` label of the live session.
+    pub endpoint: Option<String>,
 }
 
 /// A live session plus the model it runs on.
@@ -89,8 +97,12 @@ impl SessionHandle {
             scoped_event_tx,
             additional_instructions,
             model: model_override,
+            provider,
+            llm,
+            endpoint,
         } = opts;
 
+        let provider = provider.unwrap_or(runtime.provider);
         let session = resume.unwrap_or_default();
         let model = match (model_override, session.session_metadata()) {
             (Some(model), _) => model,
@@ -103,7 +115,8 @@ impl SessionHandle {
         instructions.extend(additional_instructions);
 
         let build = SessionBuildOptions {
-            provider: Some(runtime.provider),
+            provider: Some(provider),
+            llm_client_override: llm.map(meerkat::encode_llm_client_override_for_service),
             resume_session: Some(session),
             external_tools,
             scoped_event_tx,
@@ -135,7 +148,11 @@ impl SessionHandle {
             skill_references: None,
             initial_turn: InitialTurnPolicy::Defer,
             build: Some(build),
-            labels: Some(BTreeMap::from([("surface".to_string(), "tui".to_string())])),
+            labels: Some(
+                std::iter::once(("surface".to_string(), "tui".to_string()))
+                    .chain(endpoint.map(|name| ("endpoint".to_string(), name)))
+                    .collect::<BTreeMap<_, _>>(),
+            ),
         };
         let created = runtime.service.create_session(req).await?;
         debug_assert_eq!(created.session_id, id);
@@ -144,7 +161,7 @@ impl SessionHandle {
             service: Arc::clone(&runtime.service),
             id: created.session_id,
             model,
-            provider: runtime.provider,
+            provider,
         })
     }
 

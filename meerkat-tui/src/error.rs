@@ -75,6 +75,12 @@ pub enum TuiError {
     /// An MCP config file (`.rkat/mcp.toml`) could not be read or parsed.
     #[error("MCP config error: {0}")]
     McpConfig(#[from] meerkat_core::mcp_config::McpConfigError),
+    /// No endpoint/model could be selected, or an endpoint is unusable.
+    #[error("{0}")]
+    Endpoint(String),
+    /// A command-line `tui.toml` setting is invalid.
+    #[error("invalid command-line setting: {0}")]
+    Overlay(#[from] crate::overlay::OverlayError),
     /// MCP servers could not be started.
     #[error("MCP: {0}")]
     Mcp(String),
@@ -102,6 +108,8 @@ impl TuiError {
             | Self::Provider(_)
             | Self::MissingApiKey { .. }
             | Self::SessionRef { .. }
+            | Self::Endpoint(_)
+            | Self::Overlay(_)
             | Self::McpConfig(_) => 2,
             Self::Io { .. }
             | Self::Persistence(_)

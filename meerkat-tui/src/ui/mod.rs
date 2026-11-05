@@ -18,7 +18,7 @@ pub mod search;
 pub mod transcript;
 
 use crate::delivery::{CONTINUATION_PROMPT, DeliveryReport, InjectFailure, PendingId};
-use crate::models::ModelEntry;
+use crate::models::ModelGroup;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -203,9 +203,10 @@ pub enum Msg {
     Status(StatusUpdate),
     /// Open the resume picker with `(ref, label)` items.
     ShowResumePicker(Vec<(String, String)>),
-    /// Open the model picker (answer to [`Effect::RequestModelPicker`]): the
-    /// models, current first, and a warning when the provider list failed.
-    ShowModelPicker(Vec<ModelEntry>, Option<String>),
+    /// Open the model picker (answer to [`Effect::RequestModelPicker`]): one
+    /// group per endpoint, the current endpoint and model first; a group's
+    /// warning says why its list is missing.
+    ShowModelPicker(Vec<ModelGroup>),
     /// Replace the transcript (e.g. after resuming a session).
     ResetTranscript(Vec<Block>),
     /// `/compact` finished (the integrator rebuilt the session).
@@ -761,11 +762,13 @@ impl App {
                     self.modal = Some(Modal::Resume(ResumePicker { items, selected: 0 }));
                 }
             }
-            Msg::ShowModelPicker(items, warning) => {
+            Msg::ShowModelPicker(groups) => {
                 if self.modal.is_none() {
-                    self.modal = Some(Modal::Model(ModelPicker::new(items, warning)));
-                } else if let Some(warning) = warning {
-                    self.transcript.push_notice(NoticeLevel::Warn, warning);
+                    self.modal = Some(Modal::Model(ModelPicker::new(groups)));
+                } else {
+                    for warning in ModelPicker::warnings(&groups) {
+                        self.transcript.push_notice(NoticeLevel::Warn, warning);
+                    }
                 }
             }
             Msg::ResetTranscript(blocks) => {
@@ -969,10 +972,10 @@ impl App {
                 KeyCode::Down => picker.down(),
                 KeyCode::Backspace => picker.pop_filter(),
                 KeyCode::Enter => {
-                    let selected = picker.selected_id().map(str::to_string);
-                    if let Some(model) = selected {
+                    if let Some(model) = picker.selected_ref() {
                         self.modal = None;
-                        if model != self.status.model {
+                        let current = format!("{}:{}", self.status.provider, self.status.model);
+                        if model != current {
                             self.switch_model(model, fx);
                         }
                     }
@@ -2693,8 +2696,12 @@ mod tests {
         assert!(app.modal.is_none());
     }
 
-    fn picker_models() -> Vec<ModelEntry> {
-        use crate::models::ModelSource;
+    fn picker_models() -> Vec<ModelGroup> {
+        picker_models_warning(None)
+    }
+
+    fn picker_models_warning(warning: Option<&str>) -> Vec<ModelGroup> {
+        use crate::models::{ModelEntry, ModelSource};
         let entry = |id: &str, source| ModelEntry {
             id: id.into(),
             display_name: None,
@@ -2702,11 +2709,17 @@ mod tests {
             context_window: None,
             max_output_tokens: None,
         };
-        vec![
-            entry("claude-sonnet-4-6", ModelSource::Current),
-            entry("claude-opus-4-6", ModelSource::Provider),
-            entry("claude-haiku-4-5", ModelSource::Provider),
-        ]
+        vec![ModelGroup {
+            endpoint: "anthropic".into(),
+            dialect: crate::endpoints::Dialect::Anthropic,
+            base_url: None,
+            models: vec![
+                entry("claude-sonnet-4-6", ModelSource::Current),
+                entry("claude-opus-4-6", ModelSource::Provider),
+                entry("claude-haiku-4-5", ModelSource::Provider),
+            ],
+            warning: warning.map(Into::into),
+        }]
     }
 
     fn app_on_sonnet() -> App {
@@ -2736,13 +2749,13 @@ mod tests {
     #[test]
     fn model_picker_filters_and_selects() {
         let mut app = app_on_sonnet();
-        app.update(Msg::ShowModelPicker(picker_models(), None));
+        app.update(Msg::ShowModelPicker(picker_models()));
         assert!(matches!(app.modal, Some(Modal::Model(_))));
         // `j`/`k`/`q` are filter characters here, not navigation.
         type_str(&mut app, "haiku");
         assert_eq!(
             app.update(key(KeyCode::Enter)),
-            vec![Effect::SetModel("claude-haiku-4-5".into())]
+            vec![Effect::SetModel("anthropic:claude-haiku-4-5".into())]
         );
         assert!(app.modal.is_none());
     }
@@ -2750,7 +2763,7 @@ mod tests {
     #[test]
     fn model_picker_navigation_backspace_and_esc() {
         let mut app = app_on_sonnet();
-        app.update(Msg::ShowModelPicker(picker_models(), None));
+        app.update(Msg::ShowModelPicker(picker_models()));
         type_str(&mut app, "zz");
         // Nothing matches: Enter keeps the picker open.
         assert!(app.update(key(KeyCode::Enter)).is_empty());
@@ -2760,13 +2773,13 @@ mod tests {
         app.update(key(KeyCode::Down));
         assert_eq!(
             app.update(key(KeyCode::Enter)),
-            vec![Effect::SetModel("claude-opus-4-6".into())]
+            vec![Effect::SetModel("anthropic:claude-opus-4-6".into())]
         );
         // Selecting the current model changes nothing.
-        app.update(Msg::ShowModelPicker(picker_models(), None));
+        app.update(Msg::ShowModelPicker(picker_models()));
         assert!(app.update(key(KeyCode::Enter)).is_empty());
         assert!(app.modal.is_none());
-        app.update(Msg::ShowModelPicker(picker_models(), None));
+        app.update(Msg::ShowModelPicker(picker_models()));
         assert!(app.update(key(KeyCode::Esc)).is_empty());
         assert!(app.modal.is_none());
     }
@@ -2775,10 +2788,9 @@ mod tests {
     fn model_picker_warning_becomes_notice_when_modal_busy() {
         let mut app = app_on_sonnet();
         app.update(Msg::ShowResumePicker(vec![("a".into(), "x".into())]));
-        app.update(Msg::ShowModelPicker(
-            picker_models(),
-            Some("could not list models".into()),
-        ));
+        app.update(Msg::ShowModelPicker(picker_models_warning(Some(
+            "could not list models",
+        ))));
         assert!(matches!(app.modal, Some(Modal::Resume(_))));
         assert!(app.transcript.blocks().iter().any(|b| matches!(
             b,
@@ -3318,8 +3330,14 @@ mod tests {
         let args =
             <crate::cli::Args as clap::Parser>::try_parse_from(["rkat-tui", "--auto-compact"])
                 .unwrap();
+        let overlay = crate::overlay::ConfigOverlay::from_args(&args)
+            .unwrap()
+            .rules_file()
+            .unwrap()
+            .unwrap();
+        let mode = overlay.auto.and_then(|auto| auto.compact);
         let app = App::new(StatusInfo::default())
-            .with_compaction_policy(settings.compaction_policy(args.compact_mode_override()));
+            .with_compaction_policy(settings.compaction_policy(mode));
         assert_eq!(app.compaction_policy().mode, CompactMode::Auto);
         assert_eq!(
             App::new(StatusInfo::default())

@@ -53,9 +53,12 @@ pub struct Runtime {
     pub config: Config,
     /// Model for new sessions.
     pub model: String,
-    /// Provider of [`Runtime::model`] and [`Runtime::llm`].
+    /// Provider (client dialect) of [`Runtime::model`] and [`Runtime::llm`].
     pub provider: Provider,
-    /// The one LLM client shared by sessions and the approval classifier.
+    /// Name of the start-up endpoint (see [`crate::endpoints`]).
+    pub endpoint: String,
+    /// The start-up endpoint's LLM client: shared by sessions on that
+    /// endpoint and the approval classifier.
     pub llm: Arc<dyn LlmClient>,
     /// The factory the session service builds agents with (cloned).
     pub factory: AgentFactory,
@@ -79,6 +82,7 @@ impl std::fmt::Debug for Runtime {
             .field("scope", &self.scope)
             .field("model", &self.model)
             .field("provider", &self.provider)
+            .field("endpoint", &self.endpoint)
             .field("backend", &self.backend)
             .field("hook_engine", &self.hook_engine.is_some())
             .field("memory_dir", &self.memory_dir)
@@ -143,10 +147,56 @@ pub async fn bootstrap_in(
     hook_engine: Option<Arc<dyn HookEngine>>,
     llm_override: Option<Arc<dyn LlmClient>>,
 ) -> Result<Runtime, TuiError> {
+    let (model, provider) = resolve_model_and_provider(args, &config)?;
+    let llm = match llm_override {
+        Some(client) => client,
+        None => {
+            let creds = resolve_provider_credentials(&config, provider)?;
+            build_llm_client(&AgentFactory::new(scope.realm_root()), creds).await?
+        }
+    };
+    let start = StartModel {
+        endpoint: meerkat::provider_key(provider).to_string(),
+        provider,
+        model,
+        llm,
+    };
+    bootstrap_with(scope, config, hook_engine, start).await
+}
+
+/// The start-up endpoint, model and client, resolved by the caller.
+pub struct StartModel {
+    /// Endpoint name.
+    pub endpoint: String,
+    /// Client dialect of the endpoint.
+    pub provider: Provider,
+    /// Model for new sessions.
+    pub model: String,
+    /// The endpoint's client.
+    pub llm: Arc<dyn LlmClient>,
+}
+
+/// Open realm persistence and build the session service around an already
+/// resolved start-up endpoint.
+///
+/// # Errors
+///
+/// Returns [`TuiError::Persistence`] when the realm cannot be opened.
+pub async fn bootstrap_with(
+    scope: RuntimeScope,
+    config: Config,
+    hook_engine: Option<Arc<dyn HookEngine>>,
+    start: StartModel,
+) -> Result<Runtime, TuiError> {
+    let StartModel {
+        endpoint,
+        provider,
+        model,
+        llm,
+    } = start;
     let mut config = config;
     force_inproc_comms(&mut config);
     disable_engine_auto_compaction(&mut config);
-    let (model, provider) = resolve_model_and_provider(args, &config)?;
 
     let (manifest, persistence) = meerkat::open_realm_persistence_in(
         &scope.state_root,
@@ -172,14 +222,6 @@ pub async fn bootstrap_in(
         factory = factory.user_config_root(user_root.clone());
     }
 
-    let llm = match llm_override {
-        Some(client) => client,
-        None => {
-            let creds = resolve_provider_credentials(&config, provider)?;
-            build_llm_client(&factory, creds).await?
-        }
-    };
-
     let builder = TuiAgentBuilder {
         factory: factory.clone(),
         config: config.clone(),
@@ -194,6 +236,7 @@ pub async fn bootstrap_in(
         config,
         model,
         provider,
+        endpoint,
         llm,
         factory,
         service,

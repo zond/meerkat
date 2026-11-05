@@ -111,9 +111,9 @@ Commands:
   /rules rm <n>                  remove rule n
   /auto                          show auto-mode state and denial counters
   /auto on|off|resume            enable, disable, or resume auto mode after a pause
-  /model                         pick a model from the provider's list (type to filter)
-  /model <id>                    switch to a model (idle only)
-  /model refresh                 refetch the provider's model list and pick
+  /model                         pick a model from every endpoint's list (type to filter)
+  /model [endpoint:]<id>         switch to a model (idle only); a bare id is looked up
+  /model refresh                 refetch every endpoint's model list and pick
   /remember <text>, #<text>      add a line to the workspace AGENTS.md (\\# sends a literal #)
   /compact                       summarise the conversation to free context (idle only)
                                  (tui.toml [auto] compact = \"warn\" (default) warns at 75%;
@@ -203,7 +203,7 @@ fn parse_command(name: &str, args: &[&str]) -> Result<Command, CommandError> {
             [] => Ok(Command::Model(ModelCommand::Pick)),
             ["refresh"] => Ok(Command::Model(ModelCommand::Refresh)),
             [m] => Ok(Command::Model(ModelCommand::Set((*m).to_string()))),
-            _ => Err(CommandError::Usage("/model [id | refresh]")),
+            _ => Err(CommandError::Usage("/model [[endpoint:]id | refresh]")),
         },
         "auto" => match args {
             [] => Ok(Command::Auto(AutoCommand::Status)),
@@ -386,6 +386,7 @@ mod tests {
             "delivers it at the next step",
             "press again",
             "switch to a model (idle only)",
+            "endpoint:",
             "/model refresh",
         ] {
             assert!(HELP_TEXT.contains(needle), "help is missing {needle}");

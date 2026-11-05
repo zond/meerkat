@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::bootstrap::credentials::ProviderCredentials;
+use crate::endpoints::{Dialect, Endpoint};
 
 /// Default Anthropic API base (mirrors `meerkat-client`).
 const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
@@ -120,6 +121,61 @@ pub async fn list_models(
     }
 }
 
+/// One endpoint's section of the `/model` picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelGroup {
+    /// Endpoint name.
+    pub endpoint: String,
+    /// Its dialect.
+    pub dialect: Dialect,
+    /// Its base URL override.
+    pub base_url: Option<String>,
+    /// Models, in display order (the current one first in its group).
+    pub models: Vec<ModelEntry>,
+    /// Why the list is missing or incomplete (the fetch failed).
+    pub warning: Option<String>,
+}
+
+/// List the models of `endpoint`. For OpenAI-dialect endpoints with a base
+/// URL, LiteLLM's `GET /model/info` is also tried to fill in context windows
+/// and output limits; any failure there is ignored.
+///
+/// # Errors
+///
+/// See [`list_models`].
+pub async fn list_endpoint_models(
+    endpoint: &Endpoint,
+    timeout: Duration,
+) -> Result<Vec<ModelEntry>, ListModelsError> {
+    let creds = endpoint.credentials();
+    let mut entries = list_models(&creds, timeout).await?;
+    if endpoint.dialect == Dialect::OpenAi
+        && let Some(base) = &endpoint.base_url
+    {
+        match litellm_model_info(base, &creds.api_key, timeout).await {
+            Ok(info) => apply_litellm_info(&mut entries, info),
+            Err(err) => {
+                tracing::debug!(endpoint = %endpoint.name, error = %err, "no LiteLLM /model/info");
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// [`list_endpoint_models`] for every endpoint in parallel; results in input order.
+pub async fn list_all_endpoints(
+    endpoints: &[Endpoint],
+    timeout: Duration,
+) -> Vec<(String, Result<Vec<ModelEntry>, ListModelsError>)> {
+    let fetches = endpoints.iter().map(|endpoint| async move {
+        (
+            endpoint.name.clone(),
+            list_endpoint_models(endpoint, timeout).await,
+        )
+    });
+    futures::future::join_all(fetches).await
+}
+
 /// Put `current` first (tagged [`ModelSource::Current`]) and otherwise keep
 /// the endpoint order of `live`, dropping duplicate ids.
 ///
@@ -150,6 +206,65 @@ pub fn with_current(current: &str, live: Vec<ModelEntry>) -> Vec<ModelEntry> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// LiteLLM
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct LiteLlmInfoPage {
+    #[serde(default)]
+    data: Vec<LiteLlmModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LiteLlmModel {
+    model_name: String,
+    #[serde(default)]
+    model_info: Option<LiteLlmModelInfo>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LiteLlmModelInfo {
+    #[serde(default)]
+    max_input_tokens: Option<u64>,
+    #[serde(default)]
+    max_output_tokens: Option<u64>,
+}
+
+async fn litellm_model_info(
+    base: &str,
+    api_key: &str,
+    timeout: Duration,
+) -> Result<LiteLlmInfoPage, ListModelsError> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(timeout);
+    if is_loopback_url(base) {
+        builder = builder.no_proxy();
+    }
+    let client = builder.build()?;
+    let url = format!("{}/model/info", base.trim_end_matches('/'));
+    fetch_json(client.get(url).bearer_auth(api_key)).await
+}
+
+/// Fill missing windows from LiteLLM's model info (first deployment with a
+/// value wins).
+fn apply_litellm_info(entries: &mut [ModelEntry], info: LiteLlmInfoPage) {
+    for model in info.data {
+        let Some(details) = model.model_info else {
+            continue;
+        };
+        for entry in entries.iter_mut().filter(|e| e.id == model.model_name) {
+            if entry.context_window.is_none() {
+                entry.context_window = details.max_input_tokens;
+            }
+            if entry.max_output_tokens.is_none() {
+                entry.max_output_tokens = details.max_output_tokens;
+            }
+        }
+    }
 }
 
 /// One-line, secret-free warning shown when [`list_models`] failed.
@@ -577,6 +692,27 @@ mod tests {
         let warning = fetch_warning(&err);
         assert!(warning.contains("HTTP 401"));
         assert!(!warning.contains('\n'));
+    }
+
+    #[test]
+    fn litellm_info_fills_missing_windows() {
+        let info: LiteLlmInfoPage = decode(
+            r#"{"data":[
+                {"model_name":"gpt-x","model_info":{"max_input_tokens":200000,"max_output_tokens":8192,"other":1}},
+                {"model_name":"gpt-x","model_info":{"max_input_tokens":1}},
+                {"model_name":"no-info"},
+                {"model_name":"null-info","model_info":{"max_input_tokens":null}}
+            ]}"#,
+        )
+        .unwrap();
+        let mut entries = vec![
+            entry("gpt-x", ModelSource::Provider),
+            entry("no-info", ModelSource::Provider),
+        ];
+        apply_litellm_info(&mut entries, info);
+        assert_eq!(entries[0].context_window, Some(200_000));
+        assert_eq!(entries[0].max_output_tokens, Some(8192));
+        assert_eq!(entries[1].context_window, None);
     }
 
     #[test]

@@ -339,6 +339,31 @@ pub async fn compact_session(
     last_input_tokens: u64,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
 ) -> Result<Compacted, CompactError> {
+    compact_session_with(
+        runtime,
+        handle,
+        Arc::clone(&runtime.llm),
+        model,
+        last_input_tokens,
+        event_tx,
+    )
+    .await
+}
+
+/// [`compact_session`] summarizing with `llm` (the session's endpoint client)
+/// instead of the runtime's shared client.
+///
+/// # Errors
+///
+/// See [`CompactError`].
+pub async fn compact_session_with(
+    runtime: &Runtime,
+    handle: &SessionHandle,
+    llm: Arc<dyn meerkat::LlmClient>,
+    model: &str,
+    last_input_tokens: u64,
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
+) -> Result<Compacted, CompactError> {
     let mut session = handle.export().await?;
     let original = session.clone();
     let messages_before = session.messages().len();
@@ -349,10 +374,7 @@ pub async fn compact_session(
     let mut config: CompactionConfig = runtime.config.compaction.clone().into();
     config.recent_turn_budget = config.recent_turn_budget.min(MANUAL_RECENT_TURNS);
     let compactor: Arc<dyn Compactor> = Arc::new(meerkat::DefaultCompactor::new(config));
-    let client = runtime
-        .factory
-        .build_llm_adapter(Arc::clone(&runtime.llm), model)
-        .await;
+    let client = runtime.factory.build_llm_adapter(llm, model).await;
     let outcome = run_compaction(
         &client,
         &compactor,

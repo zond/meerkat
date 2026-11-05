@@ -385,7 +385,8 @@ fn status_bar_shows_context_gauge_with_threshold_colours() {
 
 #[test]
 fn model_picker_snapshot() {
-    use meerkat_tui::models::{ModelEntry, ModelSource};
+    use meerkat_tui::endpoints::Dialect;
+    use meerkat_tui::models::{ModelEntry, ModelGroup, ModelSource};
     let entry = |id: &str, name: &str, window: Option<u64>, source| ModelEntry {
         id: id.into(),
         display_name: Some(name.into()),
@@ -396,24 +397,36 @@ fn model_picker_snapshot() {
     let mut status = StatusInfo::default();
     status.set_model("anthropic", "claude-sonnet-4-6");
     let mut app = App::new(status);
-    app.update(Msg::ShowModelPicker(
-        vec![
-            entry(
-                "claude-sonnet-4-6",
-                "Sonnet 4.6",
-                Some(1_000_000),
-                ModelSource::Current,
-            ),
-            entry(
-                "claude-opus-4-6",
-                "Opus 4.6",
-                Some(200_000),
-                ModelSource::Provider,
-            ),
-            entry("claude-haiku-4-5", "Haiku 4.5", None, ModelSource::Provider),
-        ],
-        Some("HTTP 500".into()),
-    ));
+    app.update(Msg::ShowModelPicker(vec![
+        ModelGroup {
+            endpoint: "anthropic".into(),
+            dialect: Dialect::Anthropic,
+            base_url: None,
+            models: vec![
+                entry(
+                    "claude-sonnet-4-6",
+                    "Sonnet 4.6",
+                    Some(1_000_000),
+                    ModelSource::Current,
+                ),
+                entry(
+                    "claude-opus-4-6",
+                    "Opus 4.6",
+                    Some(200_000),
+                    ModelSource::Provider,
+                ),
+                entry("claude-haiku-4-5", "Haiku 4.5", None, ModelSource::Provider),
+            ],
+            warning: None,
+        },
+        ModelGroup {
+            endpoint: "litellm".into(),
+            dialect: Dialect::OpenAi,
+            base_url: Some("http://localhost:4000".into()),
+            models: Vec::new(),
+            warning: Some("HTTP 500".into()),
+        },
+    ]));
     app.update(Msg::Key(ratatui::crossterm::event::KeyEvent::from(
         ratatui::crossterm::event::KeyCode::Down,
     )));
@@ -423,21 +436,25 @@ fn model_picker_snapshot() {
         .unwrap();
     let buffer = terminal.backend().buffer();
     let all = rows(buffer);
-    let modal: Vec<&str> = all[2..9].iter().map(String::as_str).collect();
+    let modal: Vec<&str> = all[1..9].iter().map(String::as_str).collect();
     assert_eq!(
         modal,
         vec![
             "  ┌ Select model ────────────────────────────────────────────────────┐",
             "  │filter: (type to filter)                                          │",
-            "  │HTTP 500                                                          │",
+            "  │── anthropic (anthropic dialect) ──                               │",
             "  │claude-sonnet-4-6  Sonnet 4.6  1M ctx  current                    │",
-            "  │claude-opus-4-6    Opus 4.6  200k ctx  provider                   │",
-            "  │claude-haiku-4-5   Haiku 4.5  provider                            │",
-            "  │↑/↓ move · Enter select · Esc close                               │",
+            "  │claude-opus-4-6    Opus 4.6  200k ctx                             │",
+            "  │claude-haiku-4-5   Haiku 4.5                                      │",
+            "  │── litellm (openai dialect, http://localhost:4000) ──             │",
+            "  │HTTP 500                                                          │",
         ]
     );
-    // The selection (moved down once) is highlighted; the warning is yellow.
-    assert!(buffer[(3, 6)].modifier.contains(Modifier::REVERSED));
-    assert!(!buffer[(3, 5)].modifier.contains(Modifier::REVERSED));
-    assert_eq!(buffer[(3, 4)].fg, Color::Yellow);
+    // The selection (moved down once) is highlighted, the current model is
+    // bold, headers are cyan and the failed endpoint's warning is yellow.
+    assert!(buffer[(3, 5)].modifier.contains(Modifier::REVERSED));
+    assert!(!buffer[(3, 4)].modifier.contains(Modifier::REVERSED));
+    assert!(buffer[(3, 4)].modifier.contains(Modifier::BOLD));
+    assert_eq!(buffer[(3, 3)].fg, Color::Cyan);
+    assert_eq!(buffer[(3, 8)].fg, Color::Yellow);
 }

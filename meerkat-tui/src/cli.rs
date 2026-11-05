@@ -3,26 +3,62 @@
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
-use crate::ui::compaction::CompactMode;
-
 /// Interactive coding harness for Meerkat.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "rkat-tui", version)]
 #[command(about = "Interactive terminal coding harness for Meerkat")]
 #[command(
-    after_help = "Examples:\n  rkat-tui\n  rkat-tui \"fix the failing test\"\n  rkat-tui --resume last\n  rkat-tui --model claude-sonnet-4-6 --classifier-model claude-haiku-4-5"
+    after_help = "Examples:\n  rkat-tui\n  rkat-tui \"fix the failing test\"\n  rkat-tui --resume last\n  rkat-tui --model claude-sonnet-4-6 --classifier-model claude-haiku-4-5\n  rkat-tui --endpoint-def litellm=openai=http://localhost:4000,key_env=LITELLM_KEY --model litellm:gpt-5.2\n  rkat-tui --allow 'shell=cargo nextest run*' --set auto.compact=auto\n\nEvery tui.toml setting can be given with --set <dotted.key>=<value> (TOML value; bare words are strings).\nCommand-line settings apply after the global and realm tui.toml, before the project file's deny rules."
 )]
 pub struct Args {
     /// Optional initial prompt to send as the first turn.
     pub prompt: Option<String>,
 
-    /// Model ID for the session (defaults to the configured or provider default model).
+    /// Model for the session: `<endpoint>:<id>`, or a bare id looked up in the
+    /// endpoints' model lists (then inferred from its prefix). Defaults to the
+    /// configured or provider default model.
     #[arg(long, short = 'm')]
     pub model: Option<String>,
 
-    /// Provider name (anthropic, openai, gemini). Inferred from the model when omitted.
+    /// Endpoint for a bare `--model` id and the default endpoint (a built-in
+    /// `anthropic`/`openai`/`gemini`, or a `[endpoints.<name>]` from tui.toml).
+    #[arg(long, conflicts_with = "provider")]
+    pub endpoint: Option<String>,
+
+    /// Built-in provider endpoint (anthropic, openai, gemini); same as `--endpoint`.
     #[arg(long)]
     pub provider: Option<String>,
+
+    /// Set any tui.toml key for this run: `--set auto.compact=auto`,
+    /// `--set endpoints.litellm.base_url=http://host:4000`,
+    /// `--set 'allow=[{tool="shell",arg="cargo nextest run*"}]'`. Tables merge,
+    /// scalars replace, arrays append. Repeatable.
+    #[arg(long = "set", value_name = "KEY=VALUE")]
+    pub set: Vec<String>,
+
+    /// Add an allow rule for this run: `<tool>[=<glob>]` (e.g.
+    /// `shell=cargo nextest run*`). Repeatable.
+    #[arg(long, value_name = "TOOL[=PATTERN]")]
+    pub allow: Vec<String>,
+
+    /// Add a deny rule for this run: `<tool>[=<glob>]`. Repeatable.
+    #[arg(long, value_name = "TOOL[=PATTERN]")]
+    pub deny: Vec<String>,
+
+    /// Define an endpoint for this run: `<name>=<dialect>=<url>[,key_env=VAR]`
+    /// (dialect: anthropic, openai, gemini). Repeatable.
+    #[arg(long = "endpoint-def", value_name = "NAME=DIALECT=URL[,key_env=VAR]")]
+    pub endpoint_def: Vec<String>,
+
+    /// Treat `cargo build|test|nextest|check|clippy` as tier 1 (`[auto]
+    /// trust_project_builds = true`).
+    #[arg(long, conflicts_with = "no_trust_project_builds")]
+    pub trust_project_builds: bool,
+
+    /// Review project builds like any other command (`[auto]
+    /// trust_project_builds = false`).
+    #[arg(long)]
+    pub no_trust_project_builds: bool,
 
     /// Resume an existing session: `last`, `~N`, a session ID, or an ID prefix.
     #[arg(long, conflicts_with = "continue_last")]
@@ -93,20 +129,6 @@ pub struct Args {
     /// (overrides `compact` in tui.toml).
     #[arg(long)]
     pub no_auto_compact: bool,
-}
-
-impl Args {
-    /// The compaction mode forced by `--auto-compact` / `--no-auto-compact`.
-    #[must_use]
-    pub fn compact_mode_override(&self) -> Option<CompactMode> {
-        if self.auto_compact {
-            Some(CompactMode::Auto)
-        } else if self.no_auto_compact {
-            Some(CompactMode::Warn)
-        } else {
-            None
-        }
-    }
 }
 
 /// Session store backend for a newly created realm.
@@ -183,14 +205,26 @@ mod tests {
     }
 
     #[test]
-    fn auto_compact_flags() {
-        let args = Args::try_parse_from(["rkat-tui"]).unwrap();
-        assert_eq!(args.compact_mode_override(), None);
-        let args = Args::try_parse_from(["rkat-tui", "--auto-compact"]).unwrap();
-        assert_eq!(args.compact_mode_override(), Some(CompactMode::Auto));
-        let args = Args::try_parse_from(["rkat-tui", "--no-auto-compact"]).unwrap();
-        assert_eq!(args.compact_mode_override(), Some(CompactMode::Warn));
+    fn exclusive_flag_pairs() {
         assert!(Args::try_parse_from(["rkat-tui", "--auto-compact", "--no-auto-compact"]).is_err());
+        assert!(
+            Args::try_parse_from([
+                "rkat-tui",
+                "--trust-project-builds",
+                "--no-trust-project-builds"
+            ])
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from(["rkat-tui", "--endpoint", "x", "--provider", "openai"]).is_err()
+        );
+        let args = Args::try_parse_from([
+            "rkat-tui", "--set", "a=1", "--set", "b=2", "--allow", "x", "--deny", "y",
+        ])
+        .unwrap();
+        assert_eq!(args.set, vec!["a=1", "b=2"]);
+        assert_eq!(args.allow, vec!["x"]);
+        assert_eq!(args.deny, vec!["y"]);
     }
 
     #[test]

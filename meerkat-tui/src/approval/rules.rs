@@ -8,11 +8,15 @@
 //! [`crate::bootstrap::GlobalDirs`]), `<realm>/tui.toml`
 //! (per-workspace, the default write target) and `<project>/.rkat/tui.toml`
 //! (committed with the repository, therefore untrusted: it may only add deny
-//! rules and `[auto]` settings, and may not loosen `trust_project_builds`).
+//! rules, `[auto]` settings and new endpoints, and may not loosen
+//! `trust_project_builds`). The command-line overlay ([`crate::overlay`]) is a
+//! fourth layer between the realm and project files. Besides rules and
+//! `[auto]`, the file holds `[endpoints.<name>]` (see [`crate::endpoints`]).
 
 use crate::ui::compaction::{CompactMode, CompactionPolicy};
 use globset::{Glob, GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -85,6 +89,22 @@ pub enum RuleOrigin {
     Project,
     /// Added during this process (not yet persisted).
     Session,
+    /// From the command line (`--set`, `--allow`, `--deny`, …); never persisted.
+    Cli,
+}
+
+impl RuleOrigin {
+    /// Lower-case label (`global`, `realm`, `project`, `session`, `cli`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Realm => "realm",
+            Self::Project => "project",
+            Self::Session => "session",
+            Self::Cli => "cli",
+        }
+    }
 }
 
 /// Tool-name matcher: an exact name or a glob such as `mcp__github__*`.
@@ -703,6 +723,78 @@ pub struct RuleEntry {
     pub literal: Option<String>,
 }
 
+/// One `[endpoints.<name>]` table: an extra LLM endpoint (see
+/// [`crate::endpoints`]). Unset fields inherit from lower layers.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointSection {
+    /// `anthropic`, `openai` or `gemini` (validated when endpoints are built).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<String>,
+    /// Base URL (e.g. `http://localhost:4000` for LiteLLM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Environment variable holding the API key (preferred over `api_key`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// The API key in plain text (allowed, with a notice).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Tie-break when several endpoints list the same bare model id
+    /// (higher wins; default 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+}
+
+impl fmt::Debug for EndpointSection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EndpointSection")
+            .field("dialect", &self.dialect)
+            .field("base_url", &self.base_url)
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("priority", &self.priority)
+            .finish()
+    }
+}
+
+impl EndpointSection {
+    /// Overwrite every field `other` sets.
+    pub fn merge_from(&mut self, other: &Self) {
+        let Self {
+            dialect,
+            base_url,
+            api_key_env,
+            api_key,
+            priority,
+        } = other;
+        if dialect.is_some() {
+            self.dialect.clone_from(dialect);
+        }
+        if base_url.is_some() {
+            self.base_url.clone_from(base_url);
+        }
+        if api_key_env.is_some() {
+            self.api_key_env.clone_from(api_key_env);
+        }
+        if api_key.is_some() {
+            self.api_key.clone_from(api_key);
+        }
+        if priority.is_some() {
+            self.priority = *priority;
+        }
+    }
+}
+
+/// An endpoint after layering, with the layer that first defined it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayeredEndpoint {
+    /// Merged settings.
+    pub section: EndpointSection,
+    /// Layer that defined the endpoint (later layers may only refine it).
+    pub origin: RuleOrigin,
+}
+
 /// On-disk rules file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -716,6 +808,9 @@ pub struct RulesFile {
     /// Deny rules.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<RuleEntry>,
+    /// Extra LLM endpoints by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub endpoints: BTreeMap<String, EndpointSection>,
 }
 
 impl RulesFile {
@@ -738,7 +833,12 @@ impl RulesFile {
         }
     }
 
-    fn rules(&self, origin: RuleOrigin) -> Result<Vec<Rule>, RulesError> {
+    /// The file's rules, tagged with `origin`.
+    ///
+    /// # Errors
+    ///
+    /// [`RulesError`] when a pattern is invalid.
+    pub fn rules(&self, origin: RuleOrigin) -> Result<Vec<Rule>, RulesError> {
         let allow = self
             .allow
             .iter()
@@ -796,6 +896,32 @@ pub enum Notice {
         /// Where the global rules file now lives.
         new_path: PathBuf,
     },
+    /// A configured endpoint is invalid and was skipped.
+    EndpointSkipped {
+        /// Endpoint name.
+        name: String,
+        /// Why.
+        reason: String,
+    },
+    /// A configured endpoint stores its API key in plain text.
+    EndpointPlainKey {
+        /// Endpoint name.
+        name: String,
+    },
+    /// The project file tried to change an endpoint a user layer defines.
+    ProjectEndpointIgnored {
+        /// Project rules file.
+        path: PathBuf,
+        /// Endpoint name.
+        name: String,
+    },
+    /// The realm rules file is tracked by git, so its endpoints are ignored.
+    TrackedRealmEndpointsIgnored {
+        /// Realm rules file.
+        path: PathBuf,
+        /// Number of ignored endpoints.
+        count: usize,
+    },
     /// The layered `compact_warn_percent`/`compact_auto_percent` were out of
     /// range (`1..=100`, auto ≥ warn) and were clamped.
     CompactPercentClamped {
@@ -840,6 +966,23 @@ impl fmt::Display for Notice {
                 path.display(),
                 new_path.display()
             ),
+            Self::EndpointSkipped { name, reason } => {
+                write!(f, "endpoint `{name}` skipped: {reason}")
+            }
+            Self::EndpointPlainKey { name } => write!(
+                f,
+                "endpoint `{name}` stores its API key in plain text in tui.toml; prefer `api_key_env`"
+            ),
+            Self::ProjectEndpointIgnored { path, name } => write!(
+                f,
+                "ignored [endpoints.{name}] in {}: a project file may add endpoints but not change yours",
+                path.display()
+            ),
+            Self::TrackedRealmEndpointsIgnored { path, count } => write!(
+                f,
+                "{} is tracked by git; ignored {count} endpoint(s) from it",
+                path.display()
+            ),
             Self::CompactPercentClamped {
                 configured: (warn, auto),
                 applied: (applied_warn, applied_auto),
@@ -879,16 +1022,23 @@ pub enum RealmTrust {
     Tracked,
 }
 
+/// Everything `tui.toml` configures, after layering.
+#[derive(Debug, Clone, Default)]
+pub struct Layered {
+    /// Merged allow/deny rules.
+    pub rules: RuleSet,
+    /// Merged `[auto]` settings.
+    pub settings: AutoSettings,
+    /// Merged `[endpoints.<name>]` (not yet validated).
+    pub endpoints: BTreeMap<String, LayeredEndpoint>,
+    /// Non-fatal observations to show once.
+    pub notices: Vec<Notice>,
+}
+
 /// Load and merge the three rule layers.
 ///
-/// `global_rules_file` is the user-global rules file itself (typically
-/// [`crate::bootstrap::GlobalDirs::rules_file`]); the realm and project layers
-/// are `tui.toml` inside `realm_dir` and `project_rkat_dir`.
-///
-/// Settings precedence (later wins): global, realm, project. A
-/// [`RealmTrust::Tracked`] realm file contributes only deny rules (no allow
-/// rules, no `[auto]` settings). The project layer contributes only deny rules
-/// and `[auto]` settings, and can never turn `trust_project_builds` on.
+/// Same as [`load_layered_with`] without a command-line layer, returning
+/// only rules, settings and notices.
 ///
 /// # Errors
 ///
@@ -899,18 +1049,62 @@ pub fn load_layered(
     project_rkat_dir: &Path,
     realm_trust: RealmTrust,
 ) -> Result<(RuleSet, AutoSettings, Vec<Notice>), RulesError> {
+    let layered = load_layered_with(
+        realm_dir,
+        global_rules_file,
+        project_rkat_dir,
+        realm_trust,
+        None,
+    )?;
+    Ok((layered.rules, layered.settings, layered.notices))
+}
+
+/// Load and merge the rule layers: global, realm, the command-line overlay
+/// `cli` (see [`crate::overlay`]), then the project file.
+///
+/// `global_rules_file` is the user-global rules file itself (typically
+/// [`crate::bootstrap::GlobalDirs::rules_file`]); the realm and project layers
+/// are `tui.toml` inside `realm_dir` and `project_rkat_dir`.
+///
+/// User layers (global → realm → cli): rules accumulate, `[auto]` fields and
+/// endpoint fields replace those of earlier layers, endpoints merge by name.
+/// A [`RealmTrust::Tracked`] realm file contributes only deny rules (no allow
+/// rules, `[auto]` settings or endpoints). The project layer contributes deny
+/// rules, `[auto]` settings the command line did not set, and new endpoints
+/// (which may not read keys from the environment); it can never turn
+/// `trust_project_builds` on, but may turn it off.
+///
+/// # Errors
+///
+/// Returns [`RulesError`] when a file cannot be read or parsed.
+pub fn load_layered_with(
+    realm_dir: &Path,
+    global_rules_file: Option<&Path>,
+    project_rkat_dir: &Path,
+    realm_trust: RealmTrust,
+    cli: Option<&RulesFile>,
+) -> Result<Layered, RulesError> {
     let mut rules = RuleSet::default();
     let mut settings = AutoSettings::default();
     let mut notices = Vec::new();
+    let mut endpoints: BTreeMap<String, LayeredEndpoint> = BTreeMap::new();
 
-    let mut user_layers = Vec::new();
+    let mut user_layers: Vec<(Option<PathBuf>, RuleOrigin, RulesFile)> = Vec::new();
     if let Some(global) = global_rules_file {
-        user_layers.push((global.to_path_buf(), RuleOrigin::Global));
+        user_layers.push((
+            Some(global.to_path_buf()),
+            RuleOrigin::Global,
+            RulesFile::load(global)?,
+        ));
     }
-    user_layers.push((realm_dir.join(RULES_FILE_NAME), RuleOrigin::Realm));
+    let realm_path = realm_dir.join(RULES_FILE_NAME);
+    let realm_file = RulesFile::load(&realm_path)?;
+    user_layers.push((Some(realm_path), RuleOrigin::Realm, realm_file));
+    if let Some(cli) = cli {
+        user_layers.push((None, RuleOrigin::Cli, cli.clone()));
+    }
 
-    for (path, origin) in user_layers {
-        let file = RulesFile::load(&path)?;
+    for (path, origin, file) in user_layers {
         let untrusted = origin == RuleOrigin::Realm && realm_trust == RealmTrust::Tracked;
         let mut ignored_allow = 0;
         for rule in file.rules(origin)? {
@@ -920,11 +1114,30 @@ pub fn load_layered(
                 rules.push(rule);
             }
         }
+        let path = path.unwrap_or_default();
         if ignored_allow > 0 {
             notices.push(Notice::TrackedRealmAllowIgnored {
                 path: path.clone(),
                 count: ignored_allow,
             });
+        }
+        if untrusted {
+            if !file.endpoints.is_empty() {
+                notices.push(Notice::TrackedRealmEndpointsIgnored {
+                    path: path.clone(),
+                    count: file.endpoints.len(),
+                });
+            }
+        } else {
+            for (name, section) in &file.endpoints {
+                endpoints
+                    .entry(name.clone())
+                    .and_modify(|layered| layered.section.merge_from(section))
+                    .or_insert_with(|| LayeredEndpoint {
+                        section: section.clone(),
+                        origin,
+                    });
+            }
         }
         match &file.auto {
             Some(auto) if untrusted => {
@@ -952,10 +1165,35 @@ pub fn load_layered(
             RuleOrigin::Project,
         )?);
     }
+    for (name, section) in &project.endpoints {
+        if endpoints.contains_key(name) {
+            notices.push(Notice::ProjectEndpointIgnored {
+                path: project_path.clone(),
+                name: name.clone(),
+            });
+        } else {
+            endpoints.insert(
+                name.clone(),
+                LayeredEndpoint {
+                    section: section.clone(),
+                    origin: RuleOrigin::Project,
+                },
+            );
+        }
+    }
     if let Some(mut auto) = project.auto {
         if auto.trust_project_builds == Some(true) {
             auto.trust_project_builds = None;
             notices.push(Notice::ProjectTrustIgnored { path: project_path });
+        }
+        // The command line wins over the project file, except that the
+        // project may always lower `trust_project_builds`.
+        if let Some(cli_auto) = cli.and_then(|c| c.auto.as_ref()) {
+            let lower_trust = auto.trust_project_builds;
+            auto = project_auto_without(auto, cli_auto);
+            if lower_trust == Some(false) {
+                auto.trust_project_builds = Some(false);
+            }
         }
         apply_auto(&mut settings, &auto);
     }
@@ -973,7 +1211,36 @@ pub fn load_layered(
         settings.compact_warn_percent = policy.warn_percent;
         settings.compact_auto_percent = policy.auto_percent;
     }
-    Ok((rules, settings, notices))
+    Ok(Layered {
+        rules,
+        settings,
+        endpoints,
+        notices,
+    })
+}
+
+/// `project` with every field `cli` sets cleared.
+fn project_auto_without(project: AutoSection, cli: &AutoSection) -> AutoSection {
+    fn keep<T>(value: Option<T>, overridden: bool) -> Option<T> {
+        if overridden { None } else { value }
+    }
+    AutoSection {
+        enabled: keep(project.enabled, cli.enabled.is_some()),
+        classifier_model: keep(project.classifier_model, cli.classifier_model.is_some()),
+        trust_project_builds: keep(
+            project.trust_project_builds,
+            cli.trust_project_builds.is_some(),
+        ),
+        compact: keep(project.compact, cli.compact.is_some()),
+        compact_warn_percent: keep(
+            project.compact_warn_percent,
+            cli.compact_warn_percent.is_some(),
+        ),
+        compact_auto_percent: keep(
+            project.compact_auto_percent,
+            cli.compact_auto_percent.is_some(),
+        ),
+    }
 }
 
 fn apply_auto(settings: &mut AutoSettings, auto: &AutoSection) {
@@ -1181,6 +1448,16 @@ mod tests {
                 arg: None,
                 literal: None,
             }],
+            endpoints: BTreeMap::from([(
+                "litellm".to_string(),
+                EndpointSection {
+                    dialect: Some("openai".into()),
+                    base_url: Some("http://localhost:4000".into()),
+                    api_key_env: Some("LITELLM_KEY".into()),
+                    api_key: None,
+                    priority: Some(2),
+                },
+            )]),
         };
         let text = toml::to_string_pretty(&file).unwrap();
         let back: RulesFile = toml::from_str(&text).unwrap();
@@ -1604,6 +1881,142 @@ mod tests {
             notices
                 .iter()
                 .any(|n| matches!(n, Notice::TrackedRealmAutoIgnored { .. }))
+        );
+    }
+
+    fn write(dir: &Path, text: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(RULES_FILE_NAME), text).unwrap();
+    }
+
+    fn cli(text: &str) -> RulesFile {
+        toml::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn cli_layer_beats_realm_but_project_deny_and_lowering_still_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (realm, project) = (tmp.path().join("realm"), tmp.path().join("p"));
+        write(
+            &realm,
+            "[auto]\nenabled = true\ncompact = \"warn\"\nclassifier_model = \"realm-model\"\n[[allow]]\ntool = \"read_file\"\n",
+        );
+        write(
+            &project,
+            "[auto]\ncompact = \"warn\"\ncompact_warn_percent = 50\ntrust_project_builds = false\n[[deny]]\ntool = \"shell\"\narg = \"git push*\"\n",
+        );
+        let overlay = cli(
+            "[auto]\nenabled = false\ncompact = \"auto\"\ntrust_project_builds = true\n[[allow]]\ntool = \"shell\"\narg = \"cargo nextest run*\"\n[[deny]]\ntool = \"shell\"\narg = \"git push*\"\n",
+        );
+        let layered =
+            load_layered_with(&realm, None, &project, RealmTrust::Owned, Some(&overlay)).unwrap();
+        let s = &layered.settings;
+        assert!(!s.enabled, "cli beats realm");
+        assert_eq!(s.compact, CompactMode::Auto, "cli beats project");
+        assert_eq!(s.classifier_model.as_deref(), Some("realm-model"));
+        assert_eq!(
+            s.compact_warn_percent, 50,
+            "project fills what cli left unset"
+        );
+        assert!(!s.trust_project_builds, "project may lower trust");
+        let allow: Vec<(RuleOrigin, &str)> = layered
+            .rules
+            .allow
+            .iter()
+            .map(|r| (r.origin, r.tool.as_str()))
+            .collect();
+        assert_eq!(
+            allow,
+            vec![(RuleOrigin::Realm, "read_file"), (RuleOrigin::Cli, "shell")]
+        );
+        // The project's deny duplicates the cli's: one rule, the cli's.
+        assert_eq!(layered.rules.deny.len(), 1);
+        assert!(
+            layered
+                .rules
+                .matches_deny("shell", &["git push origin".to_string()])
+                .is_some()
+        );
+        // Without the cli deny, the project's still applies.
+        let layered = load_layered_with(
+            &realm,
+            None,
+            &project,
+            RealmTrust::Owned,
+            Some(&cli("[[allow]]\ntool = \"shell\"\narg = \"git push*\"\n")),
+        )
+        .unwrap();
+        assert_eq!(layered.rules.deny[0].origin, RuleOrigin::Project);
+        assert!(
+            layered
+                .rules
+                .matches_deny("shell", &["git push".to_string()])
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn cli_rules_are_never_persisted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(RULES_FILE_NAME);
+        let mut set = RuleSet::default();
+        set.push(Rule::new(RuleKind::Allow, "shell", Some("ls*"), RuleOrigin::Cli).unwrap());
+        set.push(Rule::new(RuleKind::Allow, "read_file", None, RuleOrigin::Realm).unwrap());
+        persist_realm_rules(&path, &set).unwrap();
+        let file = RulesFile::load(&path).unwrap();
+        assert_eq!(file.allow.len(), 1);
+        assert_eq!(file.allow[0].tool, "read_file");
+    }
+
+    #[test]
+    fn endpoints_layer_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (realm, project) = (tmp.path().join("realm"), tmp.path().join("p"));
+        let global = tmp.path().join("global").join(RULES_FILE_NAME);
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(
+            &global,
+            "[endpoints.litellm]\ndialect = \"openai\"\nbase_url = \"http://global\"\napi_key_env = \"LITELLM_KEY\"\n",
+        )
+        .unwrap();
+        write(
+            &realm,
+            "[endpoints.litellm]\nbase_url = \"http://realm\"\npriority = 2\n",
+        );
+        write(
+            &project,
+            "[endpoints.litellm]\nbase_url = \"http://evil\"\n[endpoints.team]\ndialect = \"anthropic\"\napi_key = \"k\"\n",
+        );
+        let overlay = cli("[endpoints.litellm]\nbase_url = \"http://cli\"\n");
+        let layered = load_layered_with(
+            &realm,
+            Some(&global),
+            &project,
+            RealmTrust::Owned,
+            Some(&overlay),
+        )
+        .unwrap();
+        let litellm = &layered.endpoints["litellm"];
+        assert_eq!(litellm.origin, RuleOrigin::Global);
+        assert_eq!(litellm.section.dialect.as_deref(), Some("openai"));
+        assert_eq!(litellm.section.base_url.as_deref(), Some("http://cli"));
+        assert_eq!(litellm.section.api_key_env.as_deref(), Some("LITELLM_KEY"));
+        assert_eq!(litellm.section.priority, Some(2));
+        assert_eq!(layered.endpoints["team"].origin, RuleOrigin::Project);
+        assert!(layered.notices.iter().any(
+            |n| matches!(n, Notice::ProjectEndpointIgnored { name, .. } if name == "litellm")
+        ));
+        assert!(!format!("{:?}", layered.endpoints["team"]).contains("\"k\""));
+
+        // A tracked realm contributes no endpoints.
+        let layered = load_layered_with(&realm, None, &project, RealmTrust::Tracked, None).unwrap();
+        // Only the project's (dialect-less, later skipped) entry remains.
+        assert_eq!(layered.endpoints["litellm"].origin, RuleOrigin::Project);
+        assert!(
+            layered
+                .notices
+                .iter()
+                .any(|n| matches!(n, Notice::TrackedRealmEndpointsIgnored { count: 1, .. }))
         );
     }
 }

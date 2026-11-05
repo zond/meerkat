@@ -12,6 +12,9 @@ rkat-tui -c                   # continue the latest session of this workspace
 rkat-tui --resume ~2
 rkat-tui --model gpt-5.2 --classifier-model gpt-5.2
 rkat-tui --no-auto            # tier-3 actions are denied instead of classified
+rkat-tui --model gpt-x        # bare ids are looked up in every endpoint's model list
+rkat-tui --endpoint-def litellm=openai=http://localhost:4000,key_env=LITELLM_KEY --model litellm:gpt-5.2
+rkat-tui --allow 'shell=cargo nextest run*' --set auto.compact=auto
 ```
 
 ## How approval works
@@ -42,7 +45,8 @@ Sub-agents spawned by the agent inherit the same hooks, so they are gated too.
 
 Rules live in TOML, layered (later settings win): the user-global
 `~/.config/rkat-tui/tui.toml` (see below), then `<realm>/tui.toml` (written by
-the UI), then `<project>/.rkat/tui.toml`. The old global location
+the UI), then the command line (see the configuration reference), then
+`<project>/.rkat/tui.toml`. The old global location
 `~/.rkat/tui.toml` is no longer read; rkat-tui shows a notice if it still exists.
 The project file may only
 add deny rules and `[auto]` settings; broad allow rules (blanket shell,
@@ -65,6 +69,111 @@ arg = "cargo nextest run*"
 tool = "shell"
 arg = "git push*"
 ```
+
+## Configuration reference (`tui.toml`)
+
+Every key can be set in any user layer (`<config-dir>/tui.toml`,
+`<realm>/tui.toml`) or for one run on the command line with
+`--set <dotted.key>=<value>`. The value is TOML (`true`, `85`, `"x"`,
+`[{tool = "shell"}]`); anything that does not parse as TOML is a string, so
+`--set auto.compact=auto` needs no quotes. Command-line settings form a layer
+after the global and realm files and before the project file: tables merge,
+scalars replace, arrays **append** (`--set 'allow=[{tool="shell",arg="cargo nextest run*"}]'`
+adds a rule) and endpoints merge by name (`--set endpoints.litellm.base_url=http://host:4000`
+changes only the URL). The project file's deny rules still apply, and it may
+still lower `trust_project_builds`; its other `[auto]` keys apply only where the
+command line set nothing. A bad `--set` (unknown key, wrong type, invalid
+pattern or dialect) stops start-up and names the argument. Command-line rules
+show as `(cli)` in `/rules list` and are never written to a file.
+
+| Key | Flag | Default |
+|---|---|---|
+| `auto.enabled` | `--no-auto` (= `false`) | `true` |
+| `auto.classifier_model` | `--classifier-model <id>` | per-dialect default of the start-up endpoint |
+| `auto.trust_project_builds` | `--trust-project-builds` / `--no-trust-project-builds` | `false` |
+| `auto.compact` (`"warn"`/`"auto"`) | `--auto-compact` / `--no-auto-compact` | `"warn"` |
+| `auto.compact_warn_percent` | `--set auto.compact_warn_percent=N` | `75` |
+| `auto.compact_auto_percent` | `--set auto.compact_auto_percent=N` | `85` |
+| `[[allow]]` `tool`, `arg` (glob) or `literal` | `--allow <tool>[=<glob>]` (repeatable) | none |
+| `[[deny]]` `tool`, `arg` (glob) or `literal` | `--deny <tool>[=<glob>]` (repeatable) | none |
+| `endpoints.<name>.dialect` (`anthropic`/`openai`/`gemini`) | `--endpoint-def <name>=<dialect>=<url>[,key_env=VAR]` | required |
+| `endpoints.<name>.base_url` | (same) | the dialect's public API |
+| `endpoints.<name>.api_key_env` | (same, `key_env=`) | — (preferred) |
+| `endpoints.<name>.api_key` | `--set endpoints.<name>.api_key=…` | — (plain text; warned about) |
+| `endpoints.<name>.priority` | `--set endpoints.<name>.priority=N` | `0` |
+| anything | `--set <dotted.key>=<value>` (repeatable) | |
+
+Other flags: `--model`/`-m <[endpoint:]id>`, `--endpoint <name>` (endpoint
+for a bare `--model` and the default; `--provider <name>` is the same for the
+built-in ones), `--resume <ref>`, `-c`/`--continue`, `-w`/`--workspace`,
+`--config-dir`, `--user-config-root`, `--realm`, `--isolated`,
+`--realm-backend`, `--state-root`, `--mouse`, `--wait-for-mcp`. `--auto-compact`
+conflicts with `--no-auto-compact`, `--trust-project-builds` with
+`--no-trust-project-builds`, `--endpoint` with `--provider`.
+
+## Models and endpoints
+
+An **endpoint** is a named place to send requests in one of Meerkat's client
+dialects: `anthropic` (Messages API), `openai` (the Responses API,
+`/v1/responses`; also LiteLLM and other OpenAI-compatible proxies that speak
+it) or `gemini`. The built-in endpoints `anthropic`, `openai` and `gemini`
+exist when the realm config (`providers.api_keys`, `providers.base_urls`) or
+the provider's environment variable has a key. More come from `tui.toml`:
+
+```toml
+[endpoints.litellm]
+dialect = "openai"
+base_url = "http://localhost:4000"
+api_key_env = "LITELLM_KEY"   # or api_key = "…" (plain text, warned about)
+priority = 1                  # optional tie-break, default 0
+```
+
+Names use letters, digits, `_` and `-` and may not be a built-in name.
+Endpoints with an unknown or missing dialect or no key are skipped with a
+notice. The project file may add endpoints but not change yours, and may not
+read keys from the environment (`api_key_env`), so a cloned repository cannot
+point your key at its own server; a git-tracked realm file contributes none.
+
+**Model references** are `endpoint:id` (explicit; `:` separates, ids may
+contain dots and further colons) or a bare id, resolved by lookup in the
+fetched model lists:
+
+1. exactly one endpoint lists the id → that endpoint;
+2. several list it → the current endpoint, else the built-in endpoint of the
+   id's dialect, else the highest `priority`, else the first configured
+   (built-ins first, then by name);
+3. none lists it (new id, or the fetch failed) → the id's prefix decides:
+   `claude-*` → anthropic, `gpt-*`/`chatgpt-*`/`o<digit>*` → openai,
+   `gemini-*` → gemini — the built-in endpoint of that dialect, else the only
+   endpoint of that dialect; else the only configured endpoint; else an error
+   listing the endpoints.
+
+At start-up `--model <bare id>` with several endpoints fetches every list first
+(in parallel, 10 s each) and reuses the result for the picker; `--endpoint`
+skips the lookup. Without `--model`: the realm config's `agent.model` when its
+prefix picks an endpoint, else with a single endpoint its catalog default (or
+the first model it lists, with a notice), else start-up fails listing the
+endpoints.
+
+`/model` opens a picker with one group per endpoint
+(`── litellm (openai dialect, http://localhost:4000) ──`), the current
+endpoint and model first (bold), each row `id  display name  200k ctx`; type to
+filter on `endpoint:id` and display name, Enter switches. Every endpoint's
+list is fetched in parallel in the background at start-up (10 s each) and
+cached; `/model refresh` refetches. A failed endpoint shows its error under
+its header. For OpenAI-dialect endpoints with a base URL, LiteLLM's
+`/model/info` fills in context windows. `/model <ref>` switches directly
+(fetching the lists first if a bare id needs them).
+
+Switching swaps the live session's client between turns, also across
+endpoints and dialects; `/clear`, `/compact` and `/resume` keep the endpoint.
+Each session's endpoint and model are recorded in
+`<realm>/tui_endpoints/<session-id>.toml` and restored by `-c`/`/resume`
+(unless `--model`/`--endpoint` is given); when the endpoint no longer exists
+it is inferred from the model id's prefix, with a notice. The approval
+classifier always uses the start-up endpoint. Sub-agents spawned with
+`agent_spawn` do not follow the endpoint: Meerkat builds their clients from
+its own provider defaults and checks models against its curated allowlist.
 
 ## Keys and commands
 
@@ -89,18 +198,12 @@ model never received to `<workspace>/.rkat/tui/tui_unsent.txt` (the next start
 says so).
 
 `/help`, `/quit`, `/clear`, `/resume [ref]`, `/rules [list|add allow|deny <tool> [pattern]|rm <n>]`,
-`/auto [on|off|resume]`, `/model [id|refresh]`, `/remember <text>`, `/compact`.
+`/auto [on|off|resume]`, `/model [[endpoint:]id|refresh]`, `/remember <text>`, `/compact`.
 `/clear`, `/resume`, `/model` and `/compact` work only while idle (no turn
 running, nothing queued); the transcript is replaced only once the new session
 is live.
 
-`/model` without an id opens a picker over the models the provider's
-list-models endpoint reports for your key (current model first; ↑/↓, type to
-filter, Enter switches, Esc closes), with display name and context window where
-the endpoint gives them. The list is fetched once in the background at start-up
-(10 s timeout) and cached; `/model refresh` refetches it. When the endpoint
-fails the picker shows only the current model and the error; `/model <id>`
-still switches directly. Only the session's provider is listed.
+`/model` is described under [Models and endpoints](#models-and-endpoints).
 
 A single-line prompt starting with `#` (`# use cargo nextest`) is the same as
 `/remember`; `##…`, multi-line input and `\#…` are sent as prompts.
@@ -109,8 +212,8 @@ The status bar shows a context gauge, `ctx 42% (84k/200k)`, yellow from 70%
 and red from 90% (`~` marks an estimate, e.g. right after `/resume` or
 `/compact`, or a window borrowed from a related model or the provider default
 for a model the catalog does not know). The window comes from the provider's
-list-models endpoint when it reports one (Anthropic, Gemini); otherwise (OpenAI,
-or the fetch failed) from the curated catalog.
+list-models endpoint when it reports one (Anthropic, Gemini, LiteLLM's
+`/model/info`); otherwise (OpenAI, or the fetch failed) from the curated catalog.
 
 ## Instructions and memory
 

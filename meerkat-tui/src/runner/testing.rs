@@ -5,6 +5,7 @@
 //! permissive approval engine without a classifier or human broker) and
 //! hands back the channels the UI would own. Not a stable API.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use meerkat::ToolGatewayBuilder;
@@ -15,8 +16,8 @@ use tokio::task::JoinHandle;
 pub use super::quit::SavedUnsent;
 use super::quit::UNSENT_FILE;
 use super::{
-    AGENT_EVENT_CAPACITY, ESCALATION_CAPACITY, Integrator, IntegratorParts, SessionTemplate,
-    workspace_notes_dir,
+    AGENT_EVENT_CAPACITY, ESCALATION_CAPACITY, Integrator, IntegratorParts, SessionTarget,
+    SessionTemplate, workspace_notes_dir,
 };
 use crate::approval::classifier::{Environment, UnavailableClassifier};
 use crate::approval::escalation::EscalationBroker;
@@ -24,6 +25,7 @@ use crate::approval::rules::{AutoSettings, RuleSet};
 use crate::approval::{ApprovalConfig, ApprovalEngine};
 use crate::bootstrap::Runtime;
 use crate::bootstrap::credentials::ProviderCredentials;
+use crate::endpoints::{Dialect, Endpoint, EndpointRef, EndpointRegistry, SecretString};
 use crate::error::TuiError;
 use crate::memory::{MemoryToolDispatcher, NoteStore, Scope};
 use crate::session::SessionHandle;
@@ -60,7 +62,8 @@ pub async fn spawn_integrator_for_tests(runtime: Runtime) -> Result<IntegratorHa
 }
 
 /// Like [`spawn_integrator_for_tests`], fetching the model list with `creds`
-/// (point `base_url` at a stub server).
+/// (point `base_url` at a stub server) as the built-in endpoint of its
+/// provider.
 ///
 /// # Errors
 ///
@@ -68,6 +71,33 @@ pub async fn spawn_integrator_for_tests(runtime: Runtime) -> Result<IntegratorHa
 pub async fn spawn_integrator_with_model_list(
     runtime: Runtime,
     creds: Option<ProviderCredentials>,
+) -> Result<IntegratorHarness, TuiError> {
+    let endpoints = creds
+        .and_then(|creds| {
+            let dialect = Dialect::from_provider(creds.provider)?;
+            Some(vec![Endpoint {
+                name: dialect.as_str().to_string(),
+                dialect,
+                base_url: creds.base_url,
+                api_key: SecretString::new(creds.api_key),
+                builtin: true,
+                priority: 0,
+            }])
+        })
+        .unwrap_or_default();
+    spawn_integrator_with_endpoints(runtime, EndpointRegistry::from_endpoints(endpoints)).await
+}
+
+/// Like [`spawn_integrator_for_tests`] with `endpoints` configured. The
+/// runtime's client serves the runtime's endpoint (`runtime.endpoint`);
+/// other endpoints get real clients built from their settings.
+///
+/// # Errors
+///
+/// When the approval engine or the first session cannot be built.
+pub async fn spawn_integrator_with_endpoints(
+    runtime: Runtime,
+    endpoints: EndpointRegistry,
 ) -> Result<IntegratorHarness, TuiError> {
     let (approval_tx, approval_rx) = mpsc::unbounded_channel();
     let (broker, escalation_rx) = EscalationBroker::new(ESCALATION_CAPACITY);
@@ -109,7 +139,14 @@ pub async fn spawn_integrator_with_model_list(
         external_tools: Arc::new(gateway),
         scoped_tx,
     };
-    let session = SessionHandle::create(&runtime, template.options(None, None)).await?;
+    let current_endpoint = runtime.endpoint.clone();
+    let clients = HashMap::from([(current_endpoint.clone(), Arc::clone(&runtime.llm))]);
+    let target = SessionTarget {
+        choice: EndpointRef::new(current_endpoint.clone(), runtime.model.clone()),
+        provider: runtime.provider,
+        llm: Arc::clone(&runtime.llm),
+    };
+    let session = SessionHandle::create(&runtime, template.options(None, Some(target))).await?;
     let first_session = session.id().clone();
     let unsent_path = runtime.scope.realm_root().join(UNSENT_FILE);
 
@@ -128,7 +165,10 @@ pub async fn spawn_integrator_with_model_list(
         approval_rx,
         diff_rx,
         last_context: None,
-        creds,
+        endpoints,
+        current_endpoint,
+        clients,
+        models: None,
     });
     Ok(IntegratorHarness {
         effects,

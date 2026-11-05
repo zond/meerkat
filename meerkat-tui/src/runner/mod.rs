@@ -19,15 +19,17 @@ use crate::approval::escalation::{EscalationBroker, EscalationRequest, HumanDeci
 use crate::approval::policy::VerdictSummary;
 use crate::approval::rules::{self, AutoSettings, Rule, RuleId, RuleKind, RuleOrigin, RuleSet};
 use crate::approval::{ApprovalConfig, ApprovalEngine, ApprovalEvent};
-use crate::bootstrap::credentials::{
-    ProviderCredentials, build_llm_client, resolve_model_and_provider, resolve_provider_credentials,
-};
-use crate::bootstrap::{self, Runtime};
+use crate::bootstrap::{self, Runtime, StartModel};
 use crate::cli::Args;
 use crate::delivery::{InjectFailure, PendingId, frame};
+use crate::endpoints::{
+    EndpointRef, EndpointRegistry, StartupPlan, StartupRequest, load_choice, needs_lookup,
+    plan_startup, restore_choice,
+};
 use crate::error::TuiError;
 use crate::memory::{MemoryToolDispatcher, NoteStore, Scope};
-use crate::models::ModelEntry;
+use crate::models::list_endpoint_models;
+use crate::overlay::ConfigOverlay;
 use crate::session::delivery::{recall, reconcile, user_texts};
 use crate::session::lifecycle::{
     context_window, estimate_tokens, probe_memory, session_instructions,
@@ -41,7 +43,7 @@ use crate::ui::{
     Msg, NoticeLevel, StatusInfo, StatusUpdate, ToolState, TurnOutcome, TurnSummary, UiChannels,
     run_ui,
 };
-use meerkat::{AgentFactory, SessionService, ToolGatewayBuilder};
+use meerkat::{AgentFactory, ToolGatewayBuilder};
 use meerkat_client::LlmClient;
 use meerkat_core::AgentToolDispatcher;
 use meerkat_core::service::SessionError;
@@ -68,17 +70,15 @@ const RULES_FILE: &str = "tui.toml";
 /// Returns a [`TuiError`] when bootstrap fails, the session cannot be created,
 /// or the terminal cannot be driven.
 pub async fn run(args: Args) -> Result<(), TuiError> {
+    // Command-line settings are validated before anything else happens.
+    let overlay = ConfigOverlay::from_args(&args)?;
+    let cli_layer = overlay.rules_file()?;
     let (scope, mut config) = bootstrap::prepare(&args).await?;
     init_logging(&scope.realm_root())?;
-    // Before `bootstrap_in`, which hands copies of the config to the factory.
+    // Before `bootstrap_with`, which hands copies of the config to the factory.
     bootstrap::instructions::apply_system_md(&mut config, scope.global.as_ref());
 
-    // Shared LLM client: the session and the classifier use the same credentials.
-    let (model, provider) = resolve_model_and_provider(&args, &config)?;
-    let creds = resolve_provider_credentials(&config, provider)?;
-    let llm = build_llm_client(&AgentFactory::new(scope.realm_root()), creds.clone()).await?;
-
-    // Approval engine, built before the agent so its hooks are in the engine.
+    // tui.toml layers (global → realm → command line → project).
     let realm_dir = scope.realm_root();
     let global_rules = scope.global.as_ref().map(bootstrap::GlobalDirs::rules_file);
     // The realm rules file lives inside the workspace. If it is (or may be)
@@ -96,11 +96,17 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
             rules::RealmTrust::Tracked
         }
     };
-    let (rule_set, mut settings, mut notices) = rules::load_layered(
+    let rules::Layered {
+        rules: rule_set,
+        settings,
+        endpoints: endpoint_sections,
+        mut notices,
+    } = rules::load_layered_with(
         &realm_dir,
         global_rules.as_deref(),
         &scope.context_root.join(".rkat"),
         realm_trust,
+        cli_layer.as_ref(),
     )?;
     notices.extend(tracking_notice);
     if let Some(notice) = rules::legacy_global_rules_notice(
@@ -109,17 +115,25 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
     ) {
         notices.push(notice);
     }
-    if args.no_auto {
-        settings.enabled = false;
-    }
-    if let Some(m) = &args.classifier_model {
-        settings.classifier_model = Some(m.clone());
-    }
+
+    // Endpoints and the start-up model. The start-up endpoint's client is
+    // shared by its sessions and the approval classifier.
+    let (registry, endpoint_notices) = EndpointRegistry::discover(&config, &endpoint_sections);
+    notices.extend(endpoint_notices);
+    let startup = resolve_startup(&args, &config, &registry).await?;
+    let start_endpoint = registry.get(&startup.choice.endpoint).ok_or_else(|| {
+        TuiError::Endpoint(format!("unknown endpoint `{}`", startup.choice.endpoint))
+    })?;
+    let provider: Provider = start_endpoint.dialect.into();
+    let llm = start_endpoint
+        .build_client(&AgentFactory::new(scope.realm_root()))
+        .await?;
+
     let (approval_tx, approval_rx) = mpsc::unbounded_channel();
     let (broker, escalation_rx) = EscalationBroker::new(ESCALATION_CAPACITY);
     let cwd = std::env::current_dir().map_err(|e| TuiError::io("read current directory", e))?;
     let environment = Environment::detect(scope.project_root.as_path(), &cwd).await;
-    let compaction_policy = settings.compaction_policy(args.compact_mode_override());
+    let compaction_policy = settings.compaction_policy(None);
     let classifier = make_classifier(&settings, Arc::clone(&llm), provider);
     let engine = ApprovalEngine::new(ApprovalConfig {
         root: scope.project_root.clone(),
@@ -135,8 +149,18 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
     let base_hooks = bootstrap::layered_hooks_config(&scope, &config).await;
     let hook_engine = engine.build_hook_engine(base_hooks)?;
 
-    let runtime =
-        bootstrap::bootstrap_in(scope, config, &args, Some(hook_engine), Some(llm)).await?;
+    let runtime = bootstrap::bootstrap_with(
+        scope,
+        config,
+        Some(hook_engine),
+        StartModel {
+            endpoint: startup.choice.endpoint.clone(),
+            provider,
+            model: startup.choice.model.clone(),
+            llm: Arc::clone(&llm),
+        },
+    )
+    .await?;
 
     // File tools and the first session.
     let (diff_tx, diff_rx) = mpsc::unbounded_channel();
@@ -188,13 +212,58 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         external_tools,
         scoped_tx: scoped_tx.clone(),
     };
-    let session = SessionHandle::create(&runtime, template.options(resumed, None)).await?;
+
+    // A resumed session continues on its own endpoint and model unless the
+    // command line picked one.
+    let mut clients: HashMap<String, Arc<dyn LlmClient>> =
+        HashMap::from([(startup.choice.endpoint.clone(), Arc::clone(&llm))]);
+    let explicit = args.model.is_some() || args.endpoint.is_some() || args.provider.is_some();
+    let (choice, mut choice_notice) = match &resumed {
+        Some(session) if !explicit => restore_choice(
+            load_choice(&runtime.scope.realm_root(), &session.id().to_string()),
+            session
+                .session_metadata()
+                .map(|meta| (meta.provider, meta.model)),
+            registry.as_slice(),
+            |name| registry.get(name).is_some(),
+            &startup.choice,
+        ),
+        _ => (startup.choice.clone(), None),
+    };
+    let (choice, choice_llm) = match clients.get(&choice.endpoint) {
+        Some(client) => (choice, Arc::clone(client)),
+        None => match registry.get(&choice.endpoint) {
+            Some(endpoint) => match endpoint.build_client(&runtime.factory).await {
+                Ok(client) => {
+                    clients.insert(choice.endpoint.clone(), Arc::clone(&client));
+                    (choice, client)
+                }
+                Err(err) => {
+                    choice_notice = Some(format!(
+                        "could not use {choice} ({err}); continuing on {}",
+                        startup.choice
+                    ));
+                    (startup.choice.clone(), Arc::clone(&llm))
+                }
+            },
+            None => (startup.choice.clone(), Arc::clone(&llm)),
+        },
+    };
+    let target = SessionTarget {
+        provider: registry
+            .get(&choice.endpoint)
+            .map_or(provider, |e| e.dialect.into()),
+        llm: choice_llm,
+        choice,
+    };
+    let session_endpoint = target.choice.endpoint.clone();
+    let session = SessionHandle::create(&runtime, template.options(resumed, Some(target))).await?;
     engine.set_primary_session(session.id());
     let current_model = session.model().to_string();
 
     // UI state and channels.
     let mut status = StatusInfo::default();
-    status.set_model(provider_name(provider), &model);
+    status.set_model(&session_endpoint, &current_model);
     status.set_session(&session.id().to_string());
     let (auto_state, denials) = auto_status(&engine);
     status.set_auto(auto_state, denials);
@@ -235,7 +304,16 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
             text,
         });
     }
-    let _ = ui_tx.send(Msg::Status(window_status(provider, &current_model)));
+    for text in startup.notice.into_iter().chain(choice_notice) {
+        let _ = ui_tx.send(Msg::Notice {
+            level: NoticeLevel::Info,
+            text,
+        });
+    }
+    let _ = ui_tx.send(Msg::Status(window_status(
+        session.provider(),
+        &current_model,
+    )));
     if let Some(text) = quit::unsent_notice(&runtime.scope.realm_root()) {
         let _ = ui_tx.send(Msg::Notice {
             level: NoticeLevel::Warn,
@@ -267,7 +345,10 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         approval_rx,
         diff_rx,
         last_context: resumed_context,
-        creds: Some(creds),
+        endpoints: registry,
+        current_endpoint: session_endpoint,
+        clients,
+        models: startup.models,
     });
     let integrator_task = tokio::spawn(integrator.run());
 
@@ -296,6 +377,69 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         Err(_) => tracing::warn!("integrator did not shut down in time"),
     }
     ui_result.map_err(TuiError::from)
+}
+
+/// The start-up endpoint and model, the model lists when they had to be
+/// fetched to decide, and a notice when the model was picked automatically.
+struct Startup {
+    choice: EndpointRef,
+    models: Option<models::ModelCache>,
+    notice: Option<String>,
+}
+
+/// Decide the start-up endpoint and model (see [`plan_startup`]). A bare
+/// `--model` id with several endpoints is looked up in their lists, fetched
+/// now (10 s cap, in parallel) and kept as the picker cache.
+async fn resolve_startup(
+    args: &Args,
+    config: &meerkat_core::Config,
+    registry: &EndpointRegistry,
+) -> Result<Startup, TuiError> {
+    let endpoint = args.endpoint.as_deref().or(args.provider.as_deref());
+    let request = StartupRequest {
+        model: args.model.as_deref(),
+        endpoint,
+        config_model: &config.agent.model,
+    };
+    let models = match request.model {
+        Some(model) if endpoint.is_none() && needs_lookup(model, registry.as_slice()) => {
+            Some(models::fetch_cache(registry).await)
+        }
+        _ => None,
+    };
+    let index = models::index_of(models.as_ref());
+    match plan_startup(request, registry.as_slice(), &index)? {
+        StartupPlan::Resolved(choice) => Ok(Startup {
+            choice,
+            models,
+            notice: None,
+        }),
+        StartupPlan::FirstListed(name) => {
+            let endpoint = registry
+                .get(&name)
+                .ok_or_else(|| TuiError::Endpoint(format!("unknown endpoint `{name}`")))?;
+            let listed = list_endpoint_models(endpoint, models::LIST_MODELS_TIMEOUT)
+                .await
+                .map_err(|err| {
+                    TuiError::Endpoint(format!(
+                        "no model selected and listing the models of `{name}` failed ({err}); pass --model"
+                    ))
+                })?;
+            let first = listed.first().ok_or_else(|| {
+                TuiError::Endpoint(format!(
+                    "no model selected and `{name}` lists no models; pass --model"
+                ))
+            })?;
+            let choice = EndpointRef::new(name, first.id.clone());
+            Ok(Startup {
+                notice: Some(format!(
+                    "no model configured; using {choice}, the first model it lists"
+                )),
+                choice,
+                models,
+            })
+        }
+    }
 }
 
 /// Status update for the context window of `model`.
@@ -434,15 +578,6 @@ fn make_classifier(
     }
 }
 
-fn provider_name(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Anthropic => "anthropic",
-        Provider::OpenAI => "openai",
-        Provider::Gemini => "gemini",
-        Provider::Other => "other",
-    }
-}
-
 /// Status-bar form of the auto-mode state.
 fn auto_status(engine: &ApprovalEngine) -> (String, (u32, u32, u32, u32)) {
     use crate::approval::counters::{MAX_CONSECUTIVE_DENIALS, MAX_TOTAL_DENIALS};
@@ -541,10 +676,31 @@ struct SessionTemplate {
     scoped_tx: mpsc::Sender<ScopedAgentEvent>,
 }
 
+/// Where a session runs: endpoint and model, the endpoint's dialect and client.
+struct SessionTarget {
+    choice: EndpointRef,
+    provider: Provider,
+    llm: Arc<dyn LlmClient>,
+}
+
 impl SessionTemplate {
     /// Options for a session build. Instruction files and the notes index are
     /// re-read every time, so `/clear`, `/resume` and `/compact` reload them.
-    fn options(&self, resume: Option<Session>, model: Option<String>) -> SessionOptions {
+    /// Without a `target` the runtime's endpoint and model apply.
+    fn options(&self, resume: Option<Session>, target: Option<SessionTarget>) -> SessionOptions {
+        let (model, provider, llm, endpoint) = match target {
+            Some(SessionTarget {
+                choice,
+                provider,
+                llm,
+            }) => (
+                Some(choice.model),
+                Some(provider),
+                Some(llm),
+                Some(choice.endpoint),
+            ),
+            None => (None, None, None, None),
+        };
         SessionOptions {
             resume,
             external_tools: Some(Arc::clone(&self.external_tools)),
@@ -555,6 +711,9 @@ impl SessionTemplate {
                 Some(&self.notes),
             ),
             model,
+            provider,
+            llm,
+            endpoint,
         }
     }
 }
@@ -572,9 +731,14 @@ struct IntegratorParts {
     approval_rx: mpsc::UnboundedReceiver<ApprovalEvent>,
     diff_rx: mpsc::UnboundedReceiver<FileDiff>,
     last_context: Option<u64>,
-    /// Credentials for the provider's list-models endpoint; `None` disables
-    /// the fetch (tests).
-    creds: Option<ProviderCredentials>,
+    /// Configured endpoints (empty disables listing: tests).
+    endpoints: EndpointRegistry,
+    /// Endpoint of `session`.
+    current_endpoint: String,
+    /// Clients already built, by endpoint name (at least `current_endpoint`).
+    clients: HashMap<String, Arc<dyn LlmClient>>,
+    /// Model lists fetched before start-up, if any (else fetched in the background).
+    models: Option<models::ModelCache>,
 }
 
 struct Integrator {
@@ -594,6 +758,12 @@ struct Integrator {
     /// Messages injected into the running turn, `(id, framed body)` in
     /// injection order; reconciled when the turn ends.
     inflight: Vec<(PendingId, String)>,
+    /// The endpoint sessions run on (start-up endpoint, then `/model`); kept
+    /// across `/clear` and `/compact` rebuilds. The approval classifier
+    /// keeps the start-up endpoint's client.
+    current_endpoint: String,
+    /// Dialect of `current_endpoint`.
+    current_provider: Provider,
     /// The model sessions run on (start-up model, then `/model`); kept across
     /// `/clear` and `/compact` rebuilds.
     current_model: String,
@@ -605,14 +775,18 @@ struct Integrator {
     dead: bool,
     /// Messages the UI still held when the user quit ([`Effect::SaveUnsent`]).
     held_unsent: Vec<(Option<PendingId>, String)>,
-    /// Credentials for the provider's list-models endpoint.
-    creds: Option<ProviderCredentials>,
-    /// The provider's model list, cached after the first successful fetch.
-    models: Option<Vec<ModelEntry>>,
-    /// A list-models request in flight.
+    /// Configured endpoints.
+    endpoints: EndpointRegistry,
+    /// Clients by endpoint name, built on first use.
+    clients: HashMap<String, Arc<dyn LlmClient>>,
+    /// Every endpoint's model list, cached after the first fetch.
+    models: Option<models::ModelCache>,
+    /// A fetch of the lists in flight.
     model_fetch: Option<models::ModelFetch>,
     /// `/model` is waiting for [`Integrator::model_fetch`] to open the picker.
     picker_waiting: bool,
+    /// `/model <bare id>` waiting for the lists to resolve it.
+    pending_set: Option<String>,
 }
 
 /// A turn in flight and the session it runs on (which stays the one to
@@ -636,13 +810,18 @@ impl Integrator {
             approval_rx,
             diff_rx,
             last_context,
-            creds,
+            endpoints,
+            current_endpoint,
+            clients,
+            models,
         } = parts;
         let current_model = session.model().to_string();
-        // Fetch the model list right away so the context gauge uses the
+        let current_provider = session.provider();
+        // Fetch the model lists right away so the context gauge uses the
         // endpoint's window from the first turn.
-        let model_fetch = creds.as_ref().map(models::spawn_model_fetch);
-        Self {
+        let model_fetch = (models.is_none() && !endpoints.is_empty())
+            .then(|| models::spawn_model_fetch(&endpoints));
+        let integrator = Self {
             runtime,
             engine,
             session,
@@ -657,15 +836,24 @@ impl Integrator {
             next_escalation: 0,
             turn: None,
             inflight: Vec::new(),
+            current_endpoint,
+            current_provider,
             current_model,
             last_context,
             dead: false,
             held_unsent: Vec::new(),
-            creds,
-            models: None,
+            endpoints,
+            clients,
+            models,
             model_fetch,
             picker_waiting: false,
+            pending_set: None,
+        };
+        integrator.save_current_choice();
+        if integrator.models.is_some() {
+            integrator.push_context_window();
         }
+        integrator
     }
 
     /// Serve effects until the UI quits (or drops the effect channel), then
@@ -693,7 +881,7 @@ impl Integrator {
                     self.turn_finished(result).await;
                 }
                 joined = async { match self.model_fetch.as_mut() { Some(fetch) => fetch.await, None => std::future::pending().await } } => {
-                    self.model_fetch_finished(joined);
+                    self.model_fetch_finished(joined).await;
                 }
             }
         }
@@ -1019,51 +1207,12 @@ impl Integrator {
     fn list_rules(&self) {
         let rules = self.engine.rules();
         let lines: Vec<String> = numbered_rules(&rules)
-            .map(|(n, rule)| format!("{n}. {}", describe_rule(rule)))
+            .map(|(n, rule)| rule_list_line(n, rule))
             .collect();
         if lines.is_empty() {
             self.notice(NoticeLevel::Info, "no rules");
         } else {
             self.notice(NoticeLevel::Info, lines.join("\n"));
-        }
-    }
-
-    async fn set_model(&mut self, model: String) {
-        // Ids the provider lists are accepted even without a known prefix
-        // (e.g. OpenAI's `o3`).
-        let provider = self.session.provider();
-        let listed = self.model_is_listed(&model);
-        let inferred = Provider::infer_from_model(&model);
-        if inferred.is_some_and(|p| p != provider) || (inferred.is_none() && !listed) {
-            self.notice(
-                NoticeLevel::Warn,
-                format!(
-                    "{model} is not a {} model; restart with --model to switch providers",
-                    provider_name(self.session.provider())
-                ),
-            );
-            return;
-        }
-        let adapter = self
-            .runtime
-            .factory
-            .build_llm_adapter(Arc::clone(&self.runtime.llm), model.clone())
-            .await;
-        match self
-            .runtime
-            .service
-            .set_session_client(self.session.id(), Arc::new(adapter))
-            .await
-        {
-            Ok(()) => {
-                self.send(Msg::Status(StatusUpdate::Model {
-                    provider: provider_name(self.session.provider()).to_string(),
-                    model: model.clone(),
-                }));
-                self.current_model = model;
-                self.push_context_window();
-            }
-            Err(err) => self.notice(NoticeLevel::Error, format!("model not changed: {err}")),
         }
     }
 }
@@ -1146,6 +1295,11 @@ fn nth_rule_id(rules: &RuleSet, n: usize) -> Option<RuleId> {
     }
 }
 
+/// One `/rules list` line: number, rule and the layer it came from.
+fn rule_list_line(n: usize, rule: &Rule) -> String {
+    format!("{n}. {} ({})", describe_rule(rule), rule.origin.as_str())
+}
+
 fn describe_rule(rule: &Rule) -> String {
     let kind = match rule.kind {
         RuleKind::Allow => "allow",
@@ -1181,6 +1335,14 @@ mod tests {
             Some((RuleKind::Deny, 0))
         );
         assert_eq!(nth_rule_id(&rules, 3), None);
+    }
+
+    #[test]
+    fn rules_list_shows_the_origin() {
+        let rule = Rule::new(RuleKind::Allow, "shell", Some("ls*"), RuleOrigin::Cli).unwrap();
+        assert_eq!(rule_list_line(3, &rule), "3. allow shell ls* (cli)");
+        let rule = Rule::new(RuleKind::Deny, "shell", None, RuleOrigin::Project).unwrap();
+        assert_eq!(rule_list_line(1, &rule), "1. deny shell (project)");
     }
 
     #[test]

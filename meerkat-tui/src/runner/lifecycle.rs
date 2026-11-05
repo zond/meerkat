@@ -11,11 +11,12 @@ use meerkat_core::service::SessionError;
 use meerkat_core::{AgentEvent, EventEnvelope, Message, Session};
 use tokio::sync::mpsc;
 
-use super::{Integrator, blocks_from_session, provider_name};
+use super::{Integrator, SessionTarget, blocks_from_session};
 use crate::bootstrap::instructions::{append_remember_line, remember_target, remembered_context};
+use crate::endpoints::{EndpointRef, load_choice, restore_choice};
 use crate::error::TuiError;
 use crate::session::lifecycle::{
-    CompactError, compact_session, estimate_tokens, index_discarded, retire_session,
+    CompactError, compact_session_with, estimate_tokens, index_discarded, retire_session,
 };
 use crate::session::{SessionHandle, load_session, resolve_session_ref};
 use crate::ui::{CompactFailure, Msg, NoticeLevel, StatusUpdate};
@@ -53,8 +54,8 @@ impl Integrator {
         if self.busy("/clear") {
             return;
         }
-        let model = Some(self.current_model.clone());
-        match self.replace_session(None, model).await {
+        let choice = self.current_choice();
+        match self.replace_session(None, choice, None).await {
             Ok(()) => {
                 self.send(Msg::ResetTranscript(Vec::new()));
                 self.send(Msg::Status(StatusUpdate::Tokens {
@@ -90,7 +91,17 @@ impl Integrator {
         let blocks = blocks_from_session(&session);
         let id = session.id().clone();
         let seed = session.clone();
-        match self.replace_session(Some(session), None).await {
+        let known = self.known_endpoint_list();
+        let (choice, notice) = restore_choice(
+            load_choice(&self.runtime.scope.realm_root(), &id.to_string()),
+            session
+                .session_metadata()
+                .map(|meta| (meta.provider, meta.model)),
+            &known,
+            |name| self.endpoint_exists(name),
+            &self.current_choice(),
+        );
+        match self.replace_session(Some(session), choice, notice).await {
             Ok(()) => {
                 self.engine.seed_transcript(&id, &seed);
                 self.send(Msg::ResetTranscript(blocks));
@@ -109,8 +120,10 @@ impl Integrator {
     async fn replace_session(
         &mut self,
         resume: Option<Session>,
-        model: Option<String>,
+        choice: EndpointRef,
+        notice: Option<String>,
     ) -> Result<(), TuiError> {
+        let previous_choice = self.current_choice();
         let previous = match self.session.export().await {
             Ok(session) => Some(session),
             Err(err) => {
@@ -124,13 +137,17 @@ impl Integrator {
             tracing::warn!(error = %err, "could not persist the session before replacing it");
         }
         self.retire_current().await;
-        match self.open_session(resume, model).await {
-            Ok(()) => Ok(()),
+        match self.open_session(resume, choice).await {
+            Ok(()) => {
+                if let Some(text) = notice {
+                    self.notice(NoticeLevel::Warn, text);
+                }
+                Ok(())
+            }
             Err(err) => {
                 let restored = match previous {
                     Some(previous) => {
-                        let model = Some(self.current_model.clone());
-                        match self.open_session(Some(previous), model).await {
+                        match self.open_session(Some(previous), previous_choice).await {
                             Ok(()) => true,
                             Err(restore) => {
                                 tracing::warn!(error = %restore, "could not restore the previous session");
@@ -162,26 +179,40 @@ impl Integrator {
         }
     }
 
-    /// Build a session (fresh or `resume`) and make it current; pushes the
-    /// session, model and context status.
+    /// Build a session (fresh or `resume`) on `choice` and make it current;
+    /// pushes the session, model and context status.
     async fn open_session(
         &mut self,
         resume: Option<Session>,
-        model: Option<String>,
+        choice: EndpointRef,
     ) -> Result<(), TuiError> {
         let context = resume.as_ref().map(|s| estimate_tokens(s.messages()));
+        let llm = self
+            .client_for(&choice.endpoint)
+            .await
+            .map_err(TuiError::Endpoint)?;
+        let target = SessionTarget {
+            provider: self.provider_of(&choice.endpoint),
+            llm,
+            choice,
+        };
+        let endpoint = target.choice.endpoint.clone();
         let handle =
-            SessionHandle::create(&self.runtime, self.template.options(resume, model)).await?;
+            SessionHandle::create(&self.runtime, self.template.options(resume, Some(target)))
+                .await?;
         self.engine.set_primary_session(handle.id());
+        self.current_endpoint = endpoint;
+        self.current_provider = handle.provider();
         self.current_model = handle.model().to_string();
         self.last_context = context;
         self.dead = false;
         self.send(Msg::Status(StatusUpdate::Session(handle.id().to_string())));
         self.send(Msg::Status(StatusUpdate::Model {
-            provider: provider_name(handle.provider()).to_string(),
+            provider: self.current_endpoint.clone(),
             model: handle.model().to_string(),
         }));
         self.session = handle;
+        self.save_current_choice();
         self.push_context_window();
         self.send(Msg::Status(StatusUpdate::Context {
             used: context,
@@ -206,6 +237,14 @@ impl Integrator {
             ))));
             return;
         }
+        let choice = self.current_choice();
+        let llm = match self.client_for(&choice.endpoint).await {
+            Ok(llm) => llm,
+            Err(err) => {
+                self.send(Msg::CompactFinished(Err(CompactFailure::Other(err))));
+                return;
+            }
+        };
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(COMPACTION_EVENT_CAPACITY);
         let ui_tx = self.ui_tx.clone();
         let source = self.session.id().to_string();
@@ -219,9 +258,10 @@ impl Integrator {
                 )));
             }
         });
-        let result = compact_session(
+        let result = compact_session_with(
             &self.runtime,
             &self.session,
+            llm,
             &self.current_model,
             self.last_context.unwrap_or(0),
             Some(event_tx),
@@ -248,13 +288,12 @@ impl Integrator {
                 format!("compacted history was not indexed for memory_search: {err}"),
             ),
         }
-        let model = Some(self.current_model.clone());
         let mut opened = self
-            .open_session(Some(compacted.session.clone()), model.clone())
+            .open_session(Some(compacted.session.clone()), choice.clone())
             .await;
         if opened.is_err() {
             opened = self
-                .open_session(Some(compacted.session.clone()), model)
+                .open_session(Some(compacted.session.clone()), choice)
                 .await;
         }
         match opened {
@@ -284,8 +323,8 @@ impl Integrator {
         tracing::warn!(error = %err, "could not open the compacted session; restoring");
         let id = original.id().clone();
         let seed = original.clone();
-        let model = Some(self.current_model.clone());
-        match self.open_session(Some(original), model).await {
+        let choice = self.current_choice();
+        match self.open_session(Some(original), choice).await {
             Ok(()) => {
                 self.engine.seed_transcript(&id, &seed);
                 // The store holds the compacted version; the restored
