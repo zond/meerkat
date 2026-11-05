@@ -23,6 +23,8 @@ use crate::approval::rules::{EndpointSection, LayeredEndpoint, Notice, RuleOrigi
 use crate::bootstrap::credentials::{ProviderCredentials, resolve_provider_credentials};
 use crate::error::TuiError;
 use crate::models::ModelEntry;
+use crate::ui::cost::{SessionCost, UsageTotals};
+use indexmap::IndexMap;
 
 /// Names of the built-in endpoints, in display order.
 pub const BUILTIN_NAMES: [&str; 3] = ["anthropic", "openai", "gemini"];
@@ -791,12 +793,63 @@ pub fn restore_choice(
     }
 }
 
-/// On-disk form of a session's endpoint choice.
+/// On-disk form of a session's endpoint choice and cost totals.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChoiceFile {
     endpoint: String,
     model: String,
+    /// The totals in `cost` were partly derived from the session's
+    /// cumulative usage (see [`SessionCost::known`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    cost_estimated: bool,
+    /// `[cost."<model>"]`: token totals per model.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    cost: IndexMap<String, UsageTotals>,
+}
+
+impl ChoiceFile {
+    fn new(choice: &EndpointRef, cost: Option<&SessionCost>) -> Self {
+        Self {
+            endpoint: choice.endpoint.clone(),
+            model: choice.model.clone(),
+            cost_estimated: cost.is_some_and(|c| !c.known),
+            cost: cost.map(|c| c.per_model.clone()).unwrap_or_default(),
+        }
+    }
+
+    fn session_cost(self) -> Option<SessionCost> {
+        (!self.cost.is_empty()).then_some(SessionCost {
+            per_model: self.cost,
+            known: !self.cost_estimated,
+        })
+    }
+}
+
+fn read_choice_file(realm_root: &Path, session_id: &str) -> Option<ChoiceFile> {
+    let text = std::fs::read_to_string(choice_path(realm_root, session_id)).ok()?;
+    match toml::from_str::<ChoiceFile>(&text) {
+        Ok(file) => Some(file),
+        Err(err) => {
+            tracing::warn!(error = %err, session_id, "ignoring unreadable endpoint choice");
+            None
+        }
+    }
+}
+
+fn write_choice_file(
+    realm_root: &Path,
+    session_id: &str,
+    file: &ChoiceFile,
+) -> Result<(), TuiError> {
+    let path = choice_path(realm_root, session_id);
+    let text = toml::to_string(file)
+        .map_err(|e| TuiError::Endpoint(format!("serialize endpoint choice: {e}")))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| TuiError::io("create endpoint choice directory", e))?;
+    }
+    std::fs::write(&path, text).map_err(|e| TuiError::io("write endpoint choice", e))
 }
 
 fn choice_path(realm_root: &Path, session_id: &str) -> PathBuf {
@@ -811,36 +864,50 @@ fn choice_path(realm_root: &Path, session_id: &str) -> PathBuf {
 /// # Errors
 ///
 /// I/O or serialization failures.
+/// The session's cost totals already in the sidecar are kept.
+///
+/// # Errors
+///
+/// I/O or serialization failures.
 pub fn save_choice(
     realm_root: &Path,
     session_id: &str,
     choice: &EndpointRef,
 ) -> Result<(), TuiError> {
-    let path = choice_path(realm_root, session_id);
-    let text = toml::to_string(&ChoiceFile {
-        endpoint: choice.endpoint.clone(),
-        model: choice.model.clone(),
-    })
-    .map_err(|e| TuiError::Endpoint(format!("serialize endpoint choice: {e}")))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| TuiError::io("create endpoint choice directory", e))?;
-    }
-    std::fs::write(&path, text).map_err(|e| TuiError::io("write endpoint choice", e))
+    let cost = read_choice_file(realm_root, session_id).and_then(ChoiceFile::session_cost);
+    write_choice_file(
+        realm_root,
+        session_id,
+        &ChoiceFile::new(choice, cost.as_ref()),
+    )
+}
+
+/// Record the choice of session `session_id` together with its cost totals
+/// (`[cost."<model>"]` tables in the same sidecar).
+///
+/// # Errors
+///
+/// I/O or serialization failures.
+pub fn save_cost(
+    realm_root: &Path,
+    session_id: &str,
+    choice: &EndpointRef,
+    cost: &SessionCost,
+) -> Result<(), TuiError> {
+    write_choice_file(realm_root, session_id, &ChoiceFile::new(choice, Some(cost)))
 }
 
 /// The recorded choice of session `session_id`, if any (unreadable files
 /// count as missing).
 #[must_use]
 pub fn load_choice(realm_root: &Path, session_id: &str) -> Option<EndpointRef> {
-    let text = std::fs::read_to_string(choice_path(realm_root, session_id)).ok()?;
-    match toml::from_str::<ChoiceFile>(&text) {
-        Ok(file) => Some(EndpointRef::new(file.endpoint, file.model)),
-        Err(err) => {
-            tracing::warn!(error = %err, session_id, "ignoring unreadable endpoint choice");
-            None
-        }
-    }
+    read_choice_file(realm_root, session_id).map(|file| EndpointRef::new(file.endpoint, file.model))
+}
+
+/// The recorded cost totals of session `session_id`, if any.
+#[must_use]
+pub fn load_cost(realm_root: &Path, session_id: &str) -> Option<SessionCost> {
+    read_choice_file(realm_root, session_id).and_then(ChoiceFile::session_cost)
 }
 
 #[cfg(test)]
@@ -1285,5 +1352,53 @@ mod tests {
             load_choice(tmp.path(), "abc"),
             Some(r("litellm", "llama3:8b"))
         );
+        assert!(load_cost(tmp.path(), "abc").is_none());
+    }
+
+    #[test]
+    fn cost_sidecar_round_trip_survives_choice_updates() {
+        use crate::ui::cost::{SessionCost, UsageTotals};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cost = SessionCost::default();
+        cost.add(
+            "gpt-5.4",
+            &UsageTotals {
+                input: 10,
+                output: 20,
+                cache_read: 30,
+                cache_write: 0,
+            },
+        );
+        cost.add(
+            "claude-opus-4-6",
+            &UsageTotals {
+                input: 1,
+                ..UsageTotals::default()
+            },
+        );
+        save_cost(tmp.path(), "abc", &r("litellm", "gpt-5.4"), &cost).unwrap();
+        let text = std::fs::read_to_string(tmp.path().join(CHOICE_DIR).join("abc.toml")).unwrap();
+        assert!(text.contains("[cost.\"gpt-5.4\"]"), "{text}");
+        assert!(!text.contains("cost_estimated"), "{text}");
+        assert_eq!(load_cost(tmp.path(), "abc"), Some(cost.clone()));
+        // Switching the model keeps the totals.
+        save_choice(tmp.path(), "abc", &r("anthropic", "claude-opus-4-6")).unwrap();
+        assert_eq!(load_cost(tmp.path(), "abc"), Some(cost.clone()));
+        assert_eq!(
+            load_choice(tmp.path(), "abc"),
+            Some(r("anthropic", "claude-opus-4-6"))
+        );
+        // Estimated totals stay estimated.
+        cost.known = false;
+        save_cost(tmp.path(), "abc", &r("anthropic", "claude-opus-4-6"), &cost).unwrap();
+        assert_eq!(load_cost(tmp.path(), "abc").map(|c| c.known), Some(false));
+        // Old sidecars without cost still load.
+        std::fs::write(
+            tmp.path().join(CHOICE_DIR).join("old.toml"),
+            "endpoint = \"openai\"\nmodel = \"gpt-5.2\"\n",
+        )
+        .unwrap();
+        assert_eq!(load_choice(tmp.path(), "old"), Some(r("openai", "gpt-5.2")));
+        assert!(load_cost(tmp.path(), "old").is_none());
     }
 }

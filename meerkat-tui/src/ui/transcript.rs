@@ -143,6 +143,9 @@ pub enum Block {
         diff: Option<DiffView>,
         /// Nesting depth (0 for the primary agent, >0 for sub-agents).
         depth: usize,
+        /// Whether the result preview and diff are hidden behind the header.
+        /// Tool output starts collapsed; a click (or Ctrl-T) toggles it.
+        collapsed: bool,
     },
     /// An approval decision.
     Approval {
@@ -305,6 +308,26 @@ impl Transcript {
         true
     }
 
+    /// Expand or collapse the output of the tool block `id`. Returns the new
+    /// `collapsed` state, or `None` when `id` is not a tool block with output.
+    pub fn toggle_tool(&mut self, id: BlockId) -> Option<bool> {
+        if !self.block(id).is_some_and(tool_has_output) {
+            return None;
+        }
+        match self.block_mut(id) {
+            Some(Block::Tool { collapsed, .. }) => {
+                *collapsed = !*collapsed;
+                Some(*collapsed)
+            }
+            _ => None,
+        }
+    }
+
+    /// The most recent tool block with output to show or hide.
+    pub fn last_tool_with_output(&self) -> Option<BlockId> {
+        self.blocks.iter().rposition(tool_has_output).map(BlockId)
+    }
+
     /// Attach a diff to the tool block for `tool_use_id`. Returns whether the block was found.
     pub fn attach_diff(&mut self, tool_use_id: &str, view: DiffView) -> bool {
         let Some(id) = self.tool_block(tool_use_id) else {
@@ -342,6 +365,21 @@ impl Transcript {
             .skip(start)
             .take(len)
             .cloned()
+            .collect()
+    }
+
+    /// The block drawn on each of the lines `[start, start + len)`, matching
+    /// [`Self::visible_lines`]. Call [`Self::ensure_layout`] first.
+    pub fn visible_blocks(&self, start: usize, len: usize) -> Vec<BlockId> {
+        self.layout
+            .iter()
+            .enumerate()
+            .flat_map(|(i, slot)| {
+                let n = slot.as_ref().map_or(0, |c| c.lines.len());
+                std::iter::repeat_n(BlockId(i), n)
+            })
+            .skip(start)
+            .take(len)
             .collect()
     }
 
@@ -579,6 +617,7 @@ impl Transcript {
             result_preview: None,
             diff: None,
             depth,
+            collapsed: true,
         });
         self.by_tool_id.insert(key, id);
     }
@@ -668,6 +707,29 @@ impl Transcript {
 pub fn args_preview(args: &Value) -> String {
     let raw = serde_json::to_string(args).unwrap_or_default();
     truncate_chars(&raw, MAX_TOOL_ARGS_PREVIEW)
+}
+
+/// Whether `block` is a tool block with a result preview or a diff.
+fn tool_has_output(block: &Block) -> bool {
+    matches!(block, Block::Tool { result_preview, diff, .. }
+        if result_preview.is_some() || diff.is_some())
+}
+
+/// Number of lines in the tool result a preview was made from (the preview
+/// itself is capped at [`MAX_TOOL_RESULT_LINES`] plus a `... (N more lines)`
+/// trailer, see [`preview_result`]).
+pub fn result_line_count(preview: &str) -> usize {
+    let shown = preview.lines().count();
+    let more = preview
+        .lines()
+        .last()
+        .and_then(|l| l.strip_prefix("... ("))
+        .and_then(|l| l.strip_suffix(" more lines)"))
+        .and_then(|n| n.parse::<usize>().ok());
+    match more {
+        Some(more) if shown == MAX_TOOL_RESULT_LINES + 1 => MAX_TOOL_RESULT_LINES + more,
+        _ => shown,
+    }
 }
 
 fn preview_result(result: &str) -> String {
@@ -925,5 +987,74 @@ mod tests {
         assert_eq!(t.tool_block("t1"), Some(BlockId(1)));
         assert!(t.remove_block(BlockId(5)).is_none());
         assert_eq!(t.ensure_layout(40), t.visible_lines(0, 100).len());
+    }
+
+    #[test]
+    fn visible_blocks_match_visible_lines() {
+        let mut t = Transcript::new();
+        t.push(Block::User { text: "a".into() });
+        t.push(Block::User {
+            text: "b\nc".into(),
+        });
+        let total = t.ensure_layout(40);
+        assert_eq!(total, 5);
+        assert_eq!(
+            t.visible_blocks(0, 10),
+            [0, 0, 1, 1, 1].map(BlockId).to_vec()
+        );
+        assert_eq!(t.visible_blocks(1, 2), [BlockId(0), BlockId(1)]);
+        assert_eq!(t.visible_blocks(0, 10).len(), t.visible_lines(0, 10).len());
+    }
+
+    #[test]
+    fn tool_output_starts_collapsed_and_toggles() {
+        let mut t = Transcript::new();
+        t.apply_agent_event(&AgentEvent::ToolCallRequested {
+            id: "t1".into(),
+            name: "glob".into(),
+            args: json!({}),
+        });
+        let id = t.tool_block("t1").unwrap();
+        // Nothing to show yet: not toggleable.
+        assert_eq!(t.toggle_tool(id), None);
+        assert_eq!(t.last_tool_with_output(), None);
+        t.apply_agent_event(&AgentEvent::ToolExecutionCompleted {
+            id: "t1".into(),
+            name: "glob".into(),
+            result: "a\nb".into(),
+            is_error: false,
+            duration_ms: 1,
+            has_images: false,
+        });
+        assert!(matches!(
+            t.block(id),
+            Some(Block::Tool {
+                collapsed: true,
+                ..
+            })
+        ));
+        assert_eq!(t.ensure_layout(40), 2);
+        assert_eq!(t.last_tool_with_output(), Some(id));
+        assert_eq!(t.toggle_tool(id), Some(false));
+        assert_eq!(t.ensure_layout(40), 4);
+        assert_eq!(t.toggle_tool(id), Some(true));
+        t.push(Block::User { text: "x".into() });
+        assert_eq!(t.toggle_tool(BlockId(1)), None);
+    }
+
+    #[test]
+    fn result_line_count_reads_the_preview_trailer() {
+        assert_eq!(result_line_count("one"), 1);
+        assert_eq!(result_line_count("a\nb"), 2);
+        let long = (0..57)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(result_line_count(&preview_result(&long)), 57);
+        let exact = (0..20)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(result_line_count(&preview_result(&exact)), 20);
     }
 }

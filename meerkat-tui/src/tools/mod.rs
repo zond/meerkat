@@ -18,10 +18,12 @@ mod edit;
 mod glob;
 mod grep;
 mod read;
+mod read_only;
 mod write;
 
 pub use diff::FileDiff;
 pub use grep::OutputMode;
+pub use read_only::{READ_ONLY_TOOL_NAMES, ReadOnlyProjectTools};
 
 use crate::paths::{PathError, ProjectRoot, ResolvedPath};
 use async_trait::async_trait;

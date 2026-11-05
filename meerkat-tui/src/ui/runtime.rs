@@ -79,7 +79,8 @@ pub struct TerminalGuard {
 }
 
 impl TerminalGuard {
-    /// Enter TUI mode. `mouse` enables mouse capture (wheel scrolling, but no native selection).
+    /// Enter TUI mode. `mouse` enables mouse capture (on by default: wheel
+    /// scrolling and click-to-expand; native selection then needs Shift).
     pub fn enter(mouse: bool) -> io::Result<Self> {
         enable_raw_mode()?;
         TERMINAL_ACTIVE.store(true, Ordering::SeqCst);

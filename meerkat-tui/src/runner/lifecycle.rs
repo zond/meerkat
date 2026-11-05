@@ -19,7 +19,7 @@ use crate::session::lifecycle::{
     CompactError, compact_session_with, estimate_tokens, index_discarded, retire_session,
 };
 use crate::session::{SessionHandle, load_session, resolve_session_ref};
-use crate::ui::{CompactFailure, Msg, NoticeLevel, StatusUpdate};
+use crate::ui::{CompactFailure, Msg, NoticeLevel, SessionCost, StatusUpdate};
 
 /// Capacity of the compaction event channel.
 const COMPACTION_EVENT_CAPACITY: usize = 16;
@@ -62,6 +62,9 @@ impl Integrator {
                     input: 0,
                     output: 0,
                 }));
+                self.send(Msg::Status(
+                    StatusUpdate::CostTotals(SessionCost::default()),
+                ));
             }
             Err(err) => self.notice(
                 NoticeLevel::Error,
@@ -109,6 +112,7 @@ impl Integrator {
                     input: usage.input_tokens,
                     output: usage.output_tokens,
                 }));
+                self.push_session_cost(&seed);
             }
             Err(err) => self.notice(NoticeLevel::Error, format!("session: {err}")),
         }

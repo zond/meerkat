@@ -10,7 +10,7 @@ use ratatui::widgets::{Block as BorderBlock, Borders, Paragraph};
 
 use super::markdown::{display_width, render_markdown, sanitize, truncate_to_width, wrap_text};
 use super::modal::draw_modal;
-use super::transcript::{Block, NoticeLevel, ToolState, args_preview};
+use super::transcript::{Block, DiffView, NoticeLevel, ToolState, args_preview, result_line_count};
 use super::{App, HistorySearch, StatusInfo};
 
 /// Maximum visible input lines.
@@ -63,6 +63,8 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let total = app.transcript.ensure_layout(area.width);
     let start = app.scroll.window(total, height);
     let lines = app.transcript.visible_lines(start, height);
+    let rows = app.transcript.visible_blocks(start, height);
+    app.set_transcript_rows(area.y, rows);
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -311,6 +313,7 @@ pub fn status_bar(status: &StatusInfo, now: Instant) -> Line<'static> {
         fmt_tokens(status.input_tokens),
         fmt_tokens(status.output_tokens)
     )));
+    segs.extend(super::cost::cost_segment_text(&status.cost, &status.prices).map(Span::raw));
     segs.extend(context_segment(status));
     if !status.auto_state.is_empty() {
         let (c, cm, t, tm) = status.denials;
@@ -440,9 +443,10 @@ pub fn block_lines(block: &Block, width: u16) -> Vec<Line<'static>> {
             result_preview,
             diff,
             depth,
+            collapsed,
         } => {
             let indent = "  ".repeat(*depth);
-            let (marker, status, color) = match state {
+            let (marker, mut status, color) = match state {
                 ToolState::Requested => ("○", String::new(), Color::DarkGray),
                 ToolState::Running { .. } => ("◐", " running…".to_string(), Color::Yellow),
                 ToolState::Done {
@@ -455,6 +459,14 @@ pub fn block_lines(block: &Block, width: u16) -> Vec<Line<'static>> {
                 } => ("✗", format!(" ({duration_ms}ms)"), Color::Red),
                 ToolState::Denied { reason } => ("⊘", format!(" denied: {reason}"), Color::Red),
             };
+            let has_body = result_preview.is_some() || diff.is_some();
+            if has_body {
+                status.push_str(&tool_toggle_hint(
+                    *collapsed,
+                    result_preview.as_deref(),
+                    diff.as_ref(),
+                ));
+            }
             let header = format!("{indent}{marker} {name}({})", args_preview(args));
             let header_w = w.saturating_sub(display_width(&status));
             out.push(Line::from(vec![
@@ -464,31 +476,14 @@ pub fn block_lines(block: &Block, width: u16) -> Vec<Line<'static>> {
                 ),
                 Span::styled(truncate_to_width(&sanitize(&status), w), dim),
             ]));
-            let body_prefix = format!("{indent}  │ ");
-            if let Some(preview) = result_preview {
-                prefixed(preview, w, &body_prefix, &body_prefix, dim, &mut out);
-            }
-            if let Some(d) = diff {
-                out.push(Line::styled(
-                    truncate_to_width(
-                        &format!("{indent}  {} (+{} -{})", d.path, d.added, d.removed),
-                        w,
-                    ),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
-                let total = d.unified.lines().count();
-                for l in d.unified.lines().take(MAX_DIFF_LINES) {
-                    out.push(Line::styled(
-                        truncate_to_width(&sanitize(&format!("{indent}  {l}")), w),
-                        diff_line_style(l),
-                    ));
-                }
-                if total > MAX_DIFF_LINES {
-                    out.push(Line::styled(
-                        format!("{indent}  … {} more lines", total - MAX_DIFF_LINES),
-                        dim,
-                    ));
-                }
+            if !*collapsed {
+                tool_body(
+                    &indent,
+                    result_preview.as_deref(),
+                    diff.as_ref(),
+                    w,
+                    &mut out,
+                );
             }
         }
         Block::Approval {
@@ -520,6 +515,60 @@ pub fn block_lines(block: &Block, width: u16) -> Vec<Line<'static>> {
     }
     out.push(Line::default());
     out
+}
+
+/// The hint after a tool header with output: `▸ 12 lines` / `▸ +3 -1` when
+/// collapsed (click or Ctrl-T to expand), `▾` when expanded.
+fn tool_toggle_hint(collapsed: bool, preview: Option<&str>, diff: Option<&DiffView>) -> String {
+    if !collapsed {
+        return " ▾".to_string();
+    }
+    let mut parts = Vec::new();
+    if let Some(preview) = preview {
+        let n = result_line_count(preview);
+        parts.push(format!("{n} line{}", if n == 1 { "" } else { "s" }));
+    }
+    if let Some(d) = diff {
+        parts.push(format!("+{} -{}", d.added, d.removed));
+    }
+    format!(" ▸ {}", parts.join(", "))
+}
+
+/// The expanded body of a tool block: the result preview, then the diff.
+fn tool_body(
+    indent: &str,
+    preview: Option<&str>,
+    diff: Option<&DiffView>,
+    w: usize,
+    out: &mut Vec<Line<'static>>,
+) {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let body_prefix = format!("{indent}  │ ");
+    if let Some(preview) = preview {
+        prefixed(preview, w, &body_prefix, &body_prefix, dim, out);
+    }
+    if let Some(d) = diff {
+        out.push(Line::styled(
+            truncate_to_width(
+                &format!("{indent}  {} (+{} -{})", d.path, d.added, d.removed),
+                w,
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        let total = d.unified.lines().count();
+        for l in d.unified.lines().take(MAX_DIFF_LINES) {
+            out.push(Line::styled(
+                truncate_to_width(&sanitize(&format!("{indent}  {l}")), w),
+                diff_line_style(l),
+            ));
+        }
+        if total > MAX_DIFF_LINES {
+            out.push(Line::styled(
+                format!("{indent}  … {} more lines", total - MAX_DIFF_LINES),
+                dim,
+            ));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -557,7 +606,7 @@ mod tests {
 
     #[test]
     fn tool_block_layout() {
-        let block = Block::Tool {
+        let mut block = Block::Tool {
             name: "read_file".into(),
             args: serde_json::json!({"path": "a.rs"}),
             state: ToolState::Done {
@@ -567,16 +616,84 @@ mod tests {
             result_preview: Some("fn main() {}".into()),
             diff: None,
             depth: 0,
+            collapsed: true,
         };
+        let lines: Vec<String> = block_lines(&block, 60).iter().map(line_text).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "✓ read_file({\"path\":\"a.rs\"}) (3ms) ▸ 1 line".to_string(),
+                String::new(),
+            ]
+        );
+        if let Block::Tool { collapsed, .. } = &mut block {
+            *collapsed = false;
+        }
         let lines: Vec<String> = block_lines(&block, 40).iter().map(line_text).collect();
         assert_eq!(
             lines,
             vec![
-                "✓ read_file({\"path\":\"a.rs\"}) (3ms)".to_string(),
+                "✓ read_file({\"path\":\"a.rs\"}) (3ms) ▾".to_string(),
                 "  │ fn main() {}".to_string(),
                 String::new(),
             ]
         );
+    }
+
+    #[test]
+    fn collapsed_tool_hint_counts_lines_and_diff() {
+        let preview = (0..30)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut t = super::super::transcript::Transcript::new();
+        t.apply_agent_event(&meerkat_core::AgentEvent::ToolCallRequested {
+            id: "g".into(),
+            name: "grep".into(),
+            args: serde_json::json!({}),
+        });
+        t.apply_agent_event(&meerkat_core::AgentEvent::ToolExecutionCompleted {
+            id: "g".into(),
+            name: "grep".into(),
+            result: preview,
+            is_error: false,
+            duration_ms: 2,
+            has_images: false,
+        });
+        let lines = t.ensure_layout(80);
+        assert_eq!(lines, 2, "collapsed: header + spacer");
+        let header = line_text(&t.visible_lines(0, 1)[0]);
+        assert!(header.ends_with("(2ms) ▸ 30 lines"), "{header}");
+
+        let diff = DiffView {
+            path: "x".into(),
+            unified: "+a".into(),
+            added: 3,
+            removed: 1,
+        };
+        assert_eq!(
+            tool_toggle_hint(true, Some("ok"), Some(&diff)),
+            " ▸ 1 line, +3 -1"
+        );
+        assert_eq!(tool_toggle_hint(true, None, Some(&diff)), " ▸ +3 -1");
+        assert_eq!(tool_toggle_hint(false, None, Some(&diff)), " ▾");
+    }
+
+    #[test]
+    fn tool_without_output_has_no_hint() {
+        let block = Block::Tool {
+            name: "shell".into(),
+            args: serde_json::json!({}),
+            state: ToolState::Running {
+                since: Instant::now(),
+            },
+            result_preview: None,
+            diff: None,
+            depth: 0,
+            collapsed: true,
+        };
+        let header = line_text(&block_lines(&block, 60)[0]);
+        assert_eq!(header, "◐ shell({}) running…");
     }
 
     #[test]
@@ -659,6 +776,35 @@ mod tests {
     }
 
     #[test]
+    fn cost_segment_follows_the_tokens() {
+        use crate::approval::rules::PricingSection;
+        use crate::pricing::PriceTable;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        let now = Instant::now();
+        let mut s = StatusInfo::default();
+        s.set_tokens(1500, 20);
+        s.context_used = Some(84_000);
+        let usage = |input| meerkat_core::Usage {
+            input_tokens: input,
+            ..meerkat_core::Usage::default()
+        };
+        s.cost.record("m", &usage(1_000));
+        assert_eq!(status_line(&s, now), " ↑1.5k ↓20 │ $? │ ctx 84k");
+        s.prices = Arc::new(PriceTable::new(BTreeMap::from([(
+            "m".to_string(),
+            PricingSection {
+                input: Some(420.0),
+                output: Some(1.0),
+                ..PricingSection::default()
+            },
+        )])));
+        assert_eq!(status_line(&s, now), " ↑1.5k ↓20 │ $0.42 │ ctx 84k");
+        s.cost.record("unpriced", &usage(1));
+        assert_eq!(status_line(&s, now), " ↑1.5k ↓20 │ ~$0.42 │ ctx 84k");
+    }
+
+    #[test]
     fn diff_lines_are_colored_and_capped() {
         use super::super::transcript::DiffView;
         let mut unified =
@@ -681,6 +827,7 @@ mod tests {
                 removed: 1,
             }),
             depth: 0,
+            collapsed: false,
         };
         let lines = block_lines(&block, 60);
         let find = |t: &str| {

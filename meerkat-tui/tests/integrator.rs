@@ -668,3 +668,62 @@ async fn bare_id_inference_and_ambiguity() {
     rig.expect("model status", |m| is_model(m, "proxy", "gpt-5.2"))
         .await;
 }
+
+#[tokio::test]
+async fn cost_totals_round_trip_through_the_sidecar() {
+    use meerkat_tui::ui::{SessionCost, UsageTotals};
+    let mut rig = Rig::new(Vec::new()).await;
+    // The integrator publishes its price table at start-up (no fetch in tests).
+    rig.expect("prices", |m| {
+        matches!(m, Msg::Status(StatusUpdate::Prices(_)))
+    })
+    .await;
+    rig.turn("hello").await;
+    let mut cost = SessionCost::default();
+    cost.add(
+        "claude-sonnet-4-6",
+        &UsageTotals {
+            input: 1_200,
+            output: 300,
+            cache_read: 40_000,
+            cache_write: 500,
+        },
+    );
+    rig.send(Effect::CostSnapshot(cost.clone()));
+
+    // `/clear` starts the next session from zero.
+    rig.send(Effect::NewSession);
+    let second = match rig
+        .expect("second session", |m| {
+            matches!(m, Msg::Status(StatusUpdate::Session(_)))
+        })
+        .await
+    {
+        Msg::Status(StatusUpdate::Session(id)) => id,
+        _ => unreachable!(),
+    };
+    rig.expect(
+        "zero cost",
+        |m| matches!(m, Msg::Status(StatusUpdate::CostTotals(c)) if c.per_model.is_empty()),
+    )
+    .await;
+    rig.turn("second").await;
+
+    // Resuming the first session restores its recorded totals.
+    rig.send(Effect::ResumeSession(rig.first_session.to_string()));
+    let expected = cost.clone();
+    rig.expect(
+        "recorded cost",
+        move |m| matches!(m, Msg::Status(StatusUpdate::CostTotals(c)) if *c == expected),
+    )
+    .await;
+
+    // A session without recorded totals derives them from its usage (none
+    // here: the scripted client reports no usage), so it starts empty.
+    rig.send(Effect::ResumeSession(second));
+    rig.expect(
+        "derived cost",
+        |m| matches!(m, Msg::Status(StatusUpdate::CostTotals(c)) if c.per_model.is_empty()),
+    )
+    .await;
+}

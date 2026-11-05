@@ -24,8 +24,10 @@ use crate::endpoints::{
     SecretString, needs_lookup, parse_model_ref, save_choice,
 };
 use crate::models::{
-    ListModelsError, ModelEntry, ModelGroup, fetch_warning, list_all_endpoints, with_current,
+    EndpointListing, ListModelsError, ModelEntry, ModelGroup, fetch_warning, list_all_endpoints,
+    with_current,
 };
+use crate::pricing::ModelPrice;
 use crate::ui::{Msg, NoticeLevel, StatusUpdate};
 
 /// Timeout for each list-models request.
@@ -38,7 +40,10 @@ pub(crate) type ModelCache = HashMap<String, Result<Vec<ModelEntry>, String>>;
 pub(super) type ModelFetch = JoinHandle<FetchResults>;
 
 /// Per-endpoint results of one fetch, in endpoint order.
-pub(super) type FetchResults = Vec<(String, Result<Vec<ModelEntry>, ListModelsError>)>;
+pub(super) type FetchResults = Vec<(String, Result<EndpointListing, ListModelsError>)>;
+
+/// Prices the endpoints reported (LiteLLM `/model/info`), by model id.
+pub(super) type EndpointPrices = Vec<(String, ModelPrice)>;
 
 /// Start fetching every endpoint's model list.
 pub(super) fn spawn_model_fetch(endpoints: &EndpointRegistry) -> ModelFetch {
@@ -47,25 +52,31 @@ pub(super) fn spawn_model_fetch(endpoints: &EndpointRegistry) -> ModelFetch {
 }
 
 /// Fetch every endpoint's list now (start-up lookups).
-pub(super) async fn fetch_cache(endpoints: &EndpointRegistry) -> ModelCache {
+pub(super) async fn fetch_cache(endpoints: &EndpointRegistry) -> (ModelCache, EndpointPrices) {
     let endpoints: Vec<Endpoint> = endpoints.iter().cloned().collect();
     cache_from(list_all_endpoints(&endpoints, LIST_MODELS_TIMEOUT).await)
 }
 
-/// Turn fetch results into a cache, logging failures.
-pub(super) fn cache_from(
-    results: Vec<(String, Result<Vec<ModelEntry>, ListModelsError>)>,
-) -> ModelCache {
-    results
+/// Turn fetch results into a cache and the reported prices, logging failures.
+pub(super) fn cache_from(results: FetchResults) -> (ModelCache, EndpointPrices) {
+    let mut prices = Vec::new();
+    let cache = results
         .into_iter()
         .map(|(name, result)| {
-            let result = result.map_err(|err| {
-                tracing::warn!(endpoint = %name, error = %err, "could not list models");
-                fetch_warning(&err)
-            });
+            let result = match result {
+                Ok(listing) => {
+                    prices.extend(listing.prices);
+                    Ok(listing.models)
+                }
+                Err(err) => {
+                    tracing::warn!(endpoint = %name, error = %err, "could not list models");
+                    Err(fetch_warning(&err))
+                }
+            };
             (name, result)
         })
-        .collect()
+        .collect();
+    (cache, prices)
 }
 
 /// Which endpoints list which ids, from the successful entries of `cache`.
@@ -226,7 +237,11 @@ impl Integrator {
     ) {
         self.model_fetch = None;
         let cache = match joined {
-            Ok(results) => cache_from(results),
+            Ok(results) => {
+                let (cache, prices) = cache_from(results);
+                self.set_endpoint_prices(prices);
+                cache
+            }
             Err(err) => {
                 tracing::warn!(error = %err, "list-models task failed");
                 self.endpoints

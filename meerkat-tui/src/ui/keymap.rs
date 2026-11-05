@@ -51,6 +51,8 @@ pub enum Action {
     Escape,
     /// Toggle collapse of the last reasoning block (Ctrl-O).
     ToggleReasoning,
+    /// Expand or collapse the output of the most recent tool call (Ctrl-T).
+    ToggleToolOutput,
     /// Start a reverse history search (Ctrl-R).
     HistorySearch,
     /// Ctrl-X: the first key of a chord, resolved by the app with the next key.
@@ -87,6 +89,7 @@ pub fn map_key(key: &KeyEvent, input_empty: bool) -> Action {
         KeyCode::Char('c') if ctrl => Action::CtrlC,
         KeyCode::Char('d') if ctrl => Action::CtrlD,
         KeyCode::Char('o') if ctrl => Action::ToggleReasoning,
+        KeyCode::Char('t') if ctrl => Action::ToggleToolOutput,
         KeyCode::Char('r') if ctrl => Action::HistorySearch,
         KeyCode::Char('x') if ctrl => Action::ChordPrefix,
         KeyCode::Char('a') if ctrl => Action::Edit(EditAction::Home),
@@ -173,6 +176,10 @@ mod tests {
         assert_eq!(
             map_key(&k(KeyCode::Char('o'), KeyModifiers::CONTROL), false),
             Action::ToggleReasoning
+        );
+        assert_eq!(
+            map_key(&k(KeyCode::Char('t'), KeyModifiers::CONTROL), false),
+            Action::ToggleToolOutput
         );
         assert_eq!(
             map_key(&k(KeyCode::Char('r'), KeyModifiers::CONTROL), false),

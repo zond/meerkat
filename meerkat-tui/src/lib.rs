@@ -10,6 +10,7 @@
 //! - [`paths`] — project-root path resolution and protected-path policy (shared)
 //! - [`bootstrap`] — realm/config/factory/service construction
 //! - [`endpoints`] — LLM endpoints (built-in providers, `[endpoints.<name>]`) and `endpoint:model` references
+//! - [`pricing`] — token prices for the cost readout (overrides, LiteLLM, community list)
 //! - [`overlay`] — the `--set`/`--allow`/… command-line layer over `tui.toml`
 //! - [`session`] — session handle: create, resume, turns, interrupt, prompt queue
 //! - [`tools`] — in-crate file tools (`read_file`, `write_file`, `edit_file`, `glob`, `grep`)
@@ -26,6 +27,7 @@ pub mod memory;
 pub mod models;
 pub mod overlay;
 pub mod paths;
+pub mod pricing;
 pub mod runner;
 pub mod session;
 pub mod tools;

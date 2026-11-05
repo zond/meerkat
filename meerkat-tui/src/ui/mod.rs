@@ -6,6 +6,7 @@
 
 pub mod commands;
 pub mod compaction;
+pub mod cost;
 pub mod delivery;
 pub mod history;
 pub mod input;
@@ -20,13 +21,15 @@ pub mod transcript;
 use crate::delivery::{CONTINUATION_PROMPT, DeliveryReport, InjectFailure, PendingId};
 use crate::models::ModelGroup;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use meerkat_core::{AgentEvent, EventEnvelope, ScopedAgentEvent};
-use ratatui::crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 
 pub use commands::{AutoCommand, Command, CommandError, ModelCommand, RuleEffect, RulesCommand};
 pub use compaction::{CompactFailure, CompactMode, CompactionGauge, CompactionPolicy, GaugeAction};
+pub use cost::{CostReadout, SessionCost, SessionCostSnapshot, UsageTotals};
 pub use delivery::{Pending, PendingQueue, PendingState};
 pub use history::History;
 pub use input::InputEditor;
@@ -103,7 +106,7 @@ pub struct ApprovalNotice {
 }
 
 /// Status-bar update pushed by the integrator.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StatusUpdate {
     /// Provider and model changed.
     Model {
@@ -143,6 +146,11 @@ pub enum StatusUpdate {
     /// An estimated context window (the model is not in the catalog; the
     /// window is a family or provider default). The gauge shows `~`.
     ApproxContextWindow(u64),
+    /// Replace the session's cost totals (new or resumed session).
+    CostTotals(SessionCostSnapshot),
+    /// The price table changed (start-up, fetched lists); the cost readout
+    /// is recomputed.
+    Prices(Arc<crate::pricing::PriceTable>),
 }
 
 /// Input to [`App::update`].
@@ -280,10 +288,13 @@ pub enum Effect {
     /// Compact the session's context (idle only); answered with
     /// [`Msg::CompactFinished`].
     Compact,
+    /// The session's cost totals after a model call; the integrator
+    /// persists them next to the session.
+    CostSnapshot(SessionCostSnapshot),
 }
 
 /// Everything the status bar shows.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StatusInfo {
     /// Provider name.
     pub provider: String,
@@ -313,6 +324,10 @@ pub struct StatusInfo {
     pub context_approx: bool,
     /// Whether `context_window` is an estimate (model not in the catalog).
     pub window_approx: bool,
+    /// Token totals per model, for the cost readout.
+    pub cost: SessionCost,
+    /// Prices for the cost readout.
+    pub prices: Arc<crate::pricing::PriceTable>,
 }
 
 /// Number of session-id characters shown in the status bar.
@@ -373,6 +388,8 @@ impl StatusInfo {
                 self.context_window = Some(window);
                 self.window_approx = true;
             }
+            StatusUpdate::CostTotals(cost) => self.cost = cost,
+            StatusUpdate::Prices(prices) => self.prices = prices,
         }
     }
 }
@@ -531,6 +548,10 @@ pub struct App {
     run_first_block: usize,
     last_ctrl_c: Option<Instant>,
     viewport_height: usize,
+    /// Screen row of the transcript's first line and the block drawn on each
+    /// transcript row, as of the last draw (for mouse hit-testing).
+    transcript_top: u16,
+    transcript_rows: Vec<BlockId>,
     dirty: bool,
 }
 
@@ -565,6 +586,8 @@ impl App {
             run_first_block: 0,
             last_ctrl_c: None,
             viewport_height: 20,
+            transcript_top: 0,
+            transcript_rows: Vec::new(),
             dirty: true,
         }
     }
@@ -648,6 +671,40 @@ impl App {
         self.viewport_height = height.max(1);
     }
 
+    /// Record where the transcript was drawn: the screen row of its first
+    /// line and the block shown on each row (set by the renderer).
+    pub fn set_transcript_rows(&mut self, top: u16, rows: Vec<BlockId>) {
+        self.transcript_top = top;
+        self.transcript_rows = rows;
+    }
+
+    /// The transcript block drawn at screen row `row` in the last frame.
+    pub fn block_at_row(&self, row: u16) -> Option<BlockId> {
+        let offset = row.checked_sub(self.transcript_top)?;
+        self.transcript_rows.get(usize::from(offset)).copied()
+    }
+
+    /// A left click: expand or collapse the tool block under it. Expanding
+    /// stops following new output so the clicked block stays where it is.
+    /// Returns whether anything changed.
+    fn click(&mut self, row: u16) -> bool {
+        if self.modal.is_some() {
+            return false;
+        }
+        let Some(id) = self.block_at_row(row) else {
+            return false;
+        };
+        match self.transcript.toggle_tool(id) {
+            Some(collapsed) => {
+                if !collapsed {
+                    self.scroll.follow = false;
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Return and reset the redraw flag.
     pub fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
@@ -686,6 +743,7 @@ impl App {
             Msg::Mouse(m) => match m.kind {
                 MouseEventKind::ScrollUp => self.scroll.up(keymap::LINE_SCROLL),
                 MouseEventKind::ScrollDown => self.scroll.down(keymap::LINE_SCROLL),
+                MouseEventKind::Down(MouseButton::Left) => dirty = self.click(m.row),
                 _ => dirty = false,
             },
             Msg::Agent(env) => {
@@ -701,10 +759,17 @@ impl App {
                     AgentEvent::TurnCompleted { usage, .. } => {
                         self.status.context_used = Some(context_tokens(usage));
                         self.status.context_approx = false;
+                        self.status.cost.record(&self.status.model, usage);
+                        fx.push(Effect::CostSnapshot(self.status.cost.clone()));
                     }
                     AgentEvent::CompactionCompleted { summary_tokens, .. } => {
                         self.status.context_used = Some(*summary_tokens);
                         self.status.context_approx = true;
+                        // Only the summary size is reported: count it as output.
+                        self.status
+                            .cost
+                            .record_output(&self.status.model, *summary_tokens);
+                        fx.push(Effect::CostSnapshot(self.status.cost.clone()));
                     }
                     _ => {}
                 }
@@ -866,6 +931,11 @@ impl App {
             }
             Action::ToggleReasoning => {
                 self.transcript.toggle_last_reasoning();
+            }
+            Action::ToggleToolOutput => {
+                if let Some(id) = self.transcript.last_tool_with_output() {
+                    self.transcript.toggle_tool(id);
+                }
             }
             Action::HistorySearch => self.start_search(),
             Action::ChordPrefix => self.chord = Some(now),
@@ -1630,6 +1700,10 @@ impl App {
                 self.transcript
                     .push_notice(NoticeLevel::Info, commands::HELP_TEXT);
             }
+            Command::Cost => {
+                let text = self.status.cost.breakdown(&self.status.prices);
+                self.transcript.push_notice(NoticeLevel::Info, text);
+            }
             Command::Clear => {
                 if self.running {
                     busy(self);
@@ -1903,6 +1977,109 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// What the renderer does: lay out at `width` and record the rows of a
+    /// transcript drawn from screen row `top` with `height` rows.
+    fn draw_rows(app: &mut App, top: u16, width: u16, height: usize) {
+        let total = app.transcript.ensure_layout(width);
+        let start = app.scroll.window(total, height);
+        let rows = app.transcript.visible_blocks(start, height);
+        app.set_transcript_rows(top, rows);
+    }
+
+    fn click_at(row: u16) -> Msg {
+        Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    fn tool_collapsed(app: &App, id: BlockId) -> bool {
+        match app.transcript.block(id) {
+            Some(Block::Tool { collapsed, .. }) => *collapsed,
+            other => panic!("not a tool block: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn click_toggles_tool_output_and_ctrl_t_toggles_the_last() {
+        let mut app = App::new(StatusInfo::default());
+        app.transcript.push(user("look"));
+        for id in ["t1", "t2"] {
+            app.update(agent(AgentEvent::ToolCallRequested {
+                id: id.into(),
+                name: "read_file".into(),
+                args: json!({"path": "a.rs"}),
+            }));
+            app.update(agent(AgentEvent::ToolExecutionCompleted {
+                id: id.into(),
+                name: "read_file".into(),
+                result: "a\nb\nc".into(),
+                is_error: false,
+                duration_ms: 1,
+                has_images: false,
+            }));
+        }
+        let (t1, t2) = (
+            app.transcript.tool_block("t1").unwrap(),
+            app.transcript.tool_block("t2").unwrap(),
+        );
+        assert!(tool_collapsed(&app, t1) && tool_collapsed(&app, t2));
+        // Transcript drawn from screen row 2: user (2 rows), t1 (2), t2 (2).
+        draw_rows(&mut app, 2, 60, 20);
+        assert_eq!(app.block_at_row(1), None);
+        assert_eq!(app.block_at_row(4), Some(t1));
+        assert_eq!(app.block_at_row(30), None);
+
+        app.take_dirty();
+        app.update(click_at(4));
+        assert!(!tool_collapsed(&app, t1));
+        assert!(tool_collapsed(&app, t2));
+        assert!(app.take_dirty());
+        // Expanded t1 is 5 rows (header, 3 lines, spacer); a click on its
+        // output collapses it again.
+        draw_rows(&mut app, 2, 60, 20);
+        assert_eq!(app.block_at_row(6), Some(t1));
+        app.update(click_at(6));
+        assert!(tool_collapsed(&app, t1));
+
+        // A click on a non-tool block changes nothing and needs no redraw.
+        draw_rows(&mut app, 2, 60, 20);
+        app.take_dirty();
+        app.update(click_at(2));
+        assert!(!app.take_dirty());
+
+        app.update(ctrl('t'));
+        assert!(!tool_collapsed(&app, t2));
+        assert!(tool_collapsed(&app, t1));
+        app.update(ctrl('t'));
+        assert!(tool_collapsed(&app, t2));
+    }
+
+    #[test]
+    fn clicks_are_ignored_under_a_modal() {
+        let mut app = App::new(StatusInfo::default());
+        app.update(agent(AgentEvent::ToolCallRequested {
+            id: "t1".into(),
+            name: "glob".into(),
+            args: json!({}),
+        }));
+        app.update(agent(AgentEvent::ToolExecutionCompleted {
+            id: "t1".into(),
+            name: "glob".into(),
+            result: "x".into(),
+            is_error: false,
+            duration_ms: 1,
+            has_images: false,
+        }));
+        let t1 = app.transcript.tool_block("t1").unwrap();
+        draw_rows(&mut app, 0, 60, 10);
+        app.update(Msg::ShowResumePicker(vec![("a".into(), "a".into())]));
+        app.update(click_at(0));
+        assert!(tool_collapsed(&app, t1));
     }
 
     fn agent_at(ev: AgentEvent, seq: u64) -> Msg {
@@ -3275,7 +3452,10 @@ mod tests {
                 ..Usage::default()
             },
         }));
-        assert!(fx.is_empty());
+        assert!(
+            fx.iter().all(|e| matches!(e, Effect::CostSnapshot(_))),
+            "{fx:?}"
+        );
         assert!(!app.compacting);
         // A manual /compact is running: no second one.
         let mut app = gauge_app(CompactMode::Auto);
@@ -3346,5 +3526,151 @@ mod tests {
                 .mode,
             CompactMode::Warn
         );
+    }
+
+    fn priced(entries: &[(&str, f64, f64)]) -> Arc<crate::pricing::PriceTable> {
+        use crate::approval::rules::PricingSection;
+        Arc::new(crate::pricing::PriceTable::new(
+            entries
+                .iter()
+                .map(|(id, input, output)| {
+                    (
+                        (*id).to_string(),
+                        PricingSection {
+                            input: Some(*input),
+                            output: Some(*output),
+                            ..PricingSection::default()
+                        },
+                    )
+                })
+                .collect(),
+        ))
+    }
+
+    fn completed(input: u64, output: u64) -> Msg {
+        agent(AgentEvent::TurnCompleted {
+            stop_reason: StopReason::EndTurn,
+            usage: Usage {
+                input_tokens: input,
+                output_tokens: output,
+                ..Usage::default()
+            },
+        })
+    }
+
+    fn footer(app: &App) -> String {
+        render::status_line(&app.status, Instant::now())
+    }
+
+    #[test]
+    fn turn_completed_attributes_cost_to_the_current_model_and_snapshots() {
+        let mut app = App::new(StatusInfo::default());
+        app.update(Msg::Status(StatusUpdate::Model {
+            provider: "anthropic".into(),
+            model: "a".into(),
+        }));
+        let fx = app.update(completed(1_000_000, 0));
+        let mut expected = SessionCost::default();
+        expected.add(
+            "a",
+            &UsageTotals {
+                input: 1_000_000,
+                ..UsageTotals::default()
+            },
+        );
+        assert_eq!(fx, vec![Effect::CostSnapshot(expected.clone())]);
+        // A model switch: later usage goes to the new model.
+        app.update(Msg::Status(StatusUpdate::Model {
+            provider: "openai".into(),
+            model: "b".into(),
+        }));
+        let fx = app.update(completed(0, 1_000_000));
+        expected.add(
+            "b",
+            &UsageTotals {
+                output: 1_000_000,
+                ..UsageTotals::default()
+            },
+        );
+        assert_eq!(fx, vec![Effect::CostSnapshot(expected)]);
+        // Compaction summaries count as output of the current model.
+        let fx = app.update(agent(AgentEvent::CompactionCompleted {
+            summary_tokens: 500,
+            messages_before: 10,
+            messages_after: 3,
+        }));
+        assert_eq!(app.status.cost.per_model["b"].output, 1_000_500);
+        assert!(matches!(fx.as_slice(), [Effect::CostSnapshot(_)]));
+        // Nothing priced yet.
+        assert!(footer(&app).contains(" │ $? │ "), "{}", footer(&app));
+        // Prices arrive: the footer recomputes.
+        app.update(Msg::Status(StatusUpdate::Prices(priced(&[
+            ("a", 1.0, 1.0),
+            ("b", 2.0, 2.0),
+        ]))));
+        assert!(footer(&app).contains(" │ $3.00 │ "), "{}", footer(&app));
+        app.update(Msg::Status(StatusUpdate::Prices(priced(&[(
+            "a", 0.42, 1.0,
+        )]))));
+        assert!(footer(&app).contains(" │ ~$0.42 │ "), "{}", footer(&app));
+    }
+
+    #[test]
+    fn cost_command_prints_the_breakdown() {
+        let mut app = App::new(StatusInfo::default());
+        assert!(submit(&mut app, "/cost").is_empty());
+        let (_, text) = last_notice(&app).unwrap();
+        assert!(text.contains("no tokens used"), "{text}");
+        app.status.set_model("anthropic", "a");
+        app.update(Msg::Status(StatusUpdate::Prices(priced(&[(
+            "a", 3.0, 15.0,
+        )]))));
+        app.update(completed(2_000_000, 100_000));
+        assert!(submit(&mut app, "/cost").is_empty());
+        let (level, text) = last_notice(&app).unwrap();
+        assert_eq!(level, NoticeLevel::Info);
+        assert!(text.contains("a: in 2000000 · out 100000"), "{text}");
+        assert!(text.contains("$7.50 (price: tui.toml)"), "{text}");
+        assert!(text.contains("total: $7.50"), "{text}");
+    }
+
+    #[test]
+    fn resume_replaces_the_cost_totals() {
+        let mut app = App::new(StatusInfo::default());
+        app.update(Msg::Status(StatusUpdate::Prices(priced(&[(
+            "a", 1.0, 1.0,
+        )]))));
+        app.status.set_model("anthropic", "a");
+        app.update(completed(5_000_000, 0));
+        assert!(footer(&app).contains("$5.00"), "{}", footer(&app));
+        // Resuming a session with recorded totals.
+        let mut recorded = SessionCost::default();
+        recorded.add(
+            "a",
+            &UsageTotals {
+                output: 420_000,
+                ..UsageTotals::default()
+            },
+        );
+        app.update(Msg::Status(StatusUpdate::CostTotals(recorded)));
+        assert!(footer(&app).contains(" │ $0.42"), "{}", footer(&app));
+        // The next call adds to the resumed total.
+        app.update(completed(580_000, 0));
+        assert!(footer(&app).contains(" │ $1.00"), "{}", footer(&app));
+        // Totals derived from the session's usage are marked approximate.
+        let derived = SessionCost::derived(
+            "a",
+            &Usage {
+                input_tokens: 1_000_000,
+                ..Usage::default()
+            },
+        );
+        app.update(Msg::Status(StatusUpdate::CostTotals(derived)));
+        assert!(footer(&app).contains(" │ ~$1.00"), "{}", footer(&app));
+        // A new session starts from zero: no segment.
+        app.update(Msg::Status(
+            StatusUpdate::CostTotals(SessionCost::default()),
+        ));
+        assert!(!footer(&app).contains('$'), "{}", footer(&app));
     }
 }

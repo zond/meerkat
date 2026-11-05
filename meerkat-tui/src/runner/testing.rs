@@ -169,6 +169,8 @@ pub async fn spawn_integrator_with_endpoints(
         current_endpoint,
         clients,
         models: None,
+        // Never touch the network or the user's price cache in tests.
+        pricing: crate::pricing::PricingSetup::default(),
     });
     Ok(IntegratorHarness {
         effects,

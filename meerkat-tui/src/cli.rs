@@ -110,9 +110,14 @@ pub struct Args {
     #[arg(long)]
     pub classifier_model: Option<String>,
 
-    /// Capture mouse events for wheel scrolling and click-to-toggle. Off by
-    /// default so the terminal's native text selection keeps working.
-    #[arg(long)]
+    /// Do not capture mouse events. The mouse is captured by default for wheel
+    /// scrolling and click-to-expand tool output; most terminals still allow
+    /// native text selection with Shift held. This flag restores plain selection.
+    #[arg(long, conflicts_with = "mouse")]
+    pub no_mouse: bool,
+
+    /// Accepted for compatibility: mouse capture is now the default.
+    #[arg(long, hide = true)]
     pub mouse: bool,
 
     /// Block until every configured MCP server has finished connecting before
@@ -129,6 +134,19 @@ pub struct Args {
     /// (overrides `compact` in tui.toml).
     #[arg(long)]
     pub no_auto_compact: bool,
+
+    /// Do not download the community price list for the cost readout; use
+    /// the cached copy and `[pricing]` from tui.toml only.
+    #[arg(long)]
+    pub no_pricing_fetch: bool,
+}
+
+impl Args {
+    /// Whether the UI captures mouse events (on unless `--no-mouse`).
+    #[must_use]
+    pub fn mouse_capture(&self) -> bool {
+        !self.no_mouse
+    }
 }
 
 /// Session store backend for a newly created realm.
@@ -151,6 +169,12 @@ mod tests {
     fn parses_bare_invocation() {
         let args = Args::try_parse_from(["rkat-tui"]).unwrap();
         assert!(args.prompt.is_none());
+        assert!(!args.no_pricing_fetch);
+        assert!(
+            Args::try_parse_from(["rkat-tui", "--no-pricing-fetch"])
+                .unwrap()
+                .no_pricing_fetch
+        );
         assert!(!args.no_auto);
         assert!(!args.isolated);
     }

@@ -5,6 +5,7 @@
 //! agent events, approval decisions, escalations and diffs back as
 //! [`Msg`]s. Nothing here touches the terminal directly.
 
+mod cost;
 mod lifecycle;
 mod models;
 mod quit;
@@ -30,6 +31,7 @@ use crate::error::TuiError;
 use crate::memory::{MemoryToolDispatcher, NoteStore, Scope};
 use crate::models::list_endpoint_models;
 use crate::overlay::ConfigOverlay;
+use crate::pricing::{PriceTable, PricingSetup};
 use crate::session::delivery::{recall, reconcile, user_texts};
 use crate::session::lifecycle::{
     context_window, estimate_tokens, probe_memory, session_instructions,
@@ -100,6 +102,7 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         rules: rule_set,
         settings,
         endpoints: endpoint_sections,
+        pricing: price_overrides,
         mut notices,
     } = rules::load_layered_with(
         &realm_dir,
@@ -121,6 +124,15 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
     let (registry, endpoint_notices) = EndpointRegistry::discover(&config, &endpoint_sections);
     notices.extend(endpoint_notices);
     let startup = resolve_startup(&args, &config, &registry).await?;
+    let mut pricing = PricingSetup::load(
+        price_overrides,
+        scope
+            .global
+            .as_ref()
+            .map(bootstrap::GlobalDirs::pricing_cache),
+        !args.no_pricing_fetch,
+    );
+    pricing.table.set_endpoint_prices(startup.prices.clone());
     let start_endpoint = registry.get(&startup.choice.endpoint).ok_or_else(|| {
         TuiError::Endpoint(format!("unknown endpoint `{}`", startup.choice.endpoint))
     })?;
@@ -134,7 +146,12 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
     let cwd = std::env::current_dir().map_err(|e| TuiError::io("read current directory", e))?;
     let environment = Environment::detect(scope.project_root.as_path(), &cwd).await;
     let compaction_policy = settings.compaction_policy(None);
-    let classifier = make_classifier(&settings, Arc::clone(&llm), provider);
+    let classifier = make_classifier(
+        &settings,
+        Arc::clone(&llm),
+        provider,
+        scope.project_root.clone(),
+    );
     let engine = ApprovalEngine::new(ApprovalConfig {
         root: scope.project_root.clone(),
         rules: rule_set,
@@ -202,6 +219,7 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
     };
     let resumed_blocks = resumed.as_ref().map(blocks_from_session);
     let resumed_context = resumed.as_ref().map(|s| estimate_tokens(s.messages()));
+
     if let Some(session) = &resumed {
         engine.seed_transcript(session.id(), session);
     }
@@ -256,6 +274,9 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         llm: choice_llm,
         choice,
     };
+    let resumed_cost = resumed
+        .as_ref()
+        .map(|s| cost::session_cost(&runtime.scope.realm_root(), s, &target.choice.model));
     let session_endpoint = target.choice.endpoint.clone();
     let session = SessionHandle::create(&runtime, template.options(resumed, Some(target))).await?;
     engine.set_primary_session(session.id());
@@ -329,6 +350,9 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
     if let Some(blocks) = resumed_blocks {
         let _ = ui_tx.send(Msg::ResetTranscript(blocks));
     }
+    if let Some(cost) = resumed_cost {
+        let _ = ui_tx.send(Msg::Status(StatusUpdate::CostTotals(cost)));
+    }
     if let Some(prompt) = args.prompt.clone() {
         let _ = effect_tx.send(Effect::StartTurn(prompt));
     }
@@ -349,6 +373,7 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         current_endpoint: session_endpoint,
         clients,
         models: startup.models,
+        pricing,
     });
     let integrator_task = tokio::spawn(integrator.run());
 
@@ -360,7 +385,7 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
             ui_rx,
         },
         effect_tx,
-        args.mouse,
+        args.mouse_capture(),
         histories,
     )
     .await;
@@ -384,6 +409,8 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
 struct Startup {
     choice: EndpointRef,
     models: Option<models::ModelCache>,
+    /// Prices the fetched lists reported (LiteLLM `/model/info`).
+    prices: models::EndpointPrices,
     notice: Option<String>,
 }
 
@@ -401,17 +428,19 @@ async fn resolve_startup(
         endpoint,
         config_model: &config.agent.model,
     };
-    let models = match request.model {
+    let (models, prices) = match request.model {
         Some(model) if endpoint.is_none() && needs_lookup(model, registry.as_slice()) => {
-            Some(models::fetch_cache(registry).await)
+            let (cache, prices) = models::fetch_cache(registry).await;
+            (Some(cache), prices)
         }
-        _ => None,
+        _ => (None, Vec::new()),
     };
     let index = models::index_of(models.as_ref());
     match plan_startup(request, registry.as_slice(), &index)? {
         StartupPlan::Resolved(choice) => Ok(Startup {
             choice,
             models,
+            prices,
             notice: None,
         }),
         StartupPlan::FirstListed(name) => {
@@ -437,6 +466,7 @@ async fn resolve_startup(
                 )),
                 choice,
                 models,
+                prices,
             })
         }
     }
@@ -567,13 +597,18 @@ fn make_classifier(
     settings: &AutoSettings,
     llm: Arc<dyn LlmClient>,
     provider: Provider,
+    project_root: crate::paths::ProjectRoot,
 ) -> Arc<dyn ActionClassifier> {
     let model = settings
         .classifier_model
         .clone()
         .or_else(|| classifier_default_model(provider).map(str::to_string));
     match model {
-        Some(model) => Arc::new(LlmClassifier::new(llm, provider, model)),
+        // Stage 2 may read project files (read-only, bounded) to judge what a
+        // command will actually execute.
+        Some(model) => Arc::new(LlmClassifier::new(llm, provider, model).with_project_tools(
+            Arc::new(crate::tools::ReadOnlyProjectTools::new(project_root)),
+        )),
         None => Arc::new(UnavailableClassifier),
     }
 }
@@ -655,6 +690,7 @@ fn restored_tool_block(name: &str, args: serde_json::Value) -> Block {
         result_preview: None,
         diff: None,
         depth: 0,
+        collapsed: true,
     }
 }
 
@@ -739,6 +775,8 @@ struct IntegratorParts {
     clients: HashMap<String, Arc<dyn LlmClient>>,
     /// Model lists fetched before start-up, if any (else fetched in the background).
     models: Option<models::ModelCache>,
+    /// Start-up prices and how to refresh the community list.
+    pricing: PricingSetup,
 }
 
 struct Integrator {
@@ -787,6 +825,10 @@ struct Integrator {
     picker_waiting: bool,
     /// `/model <bare id>` waiting for the lists to resolve it.
     pending_set: Option<String>,
+    /// Prices for the cost readout (shared with the UI).
+    prices: Arc<PriceTable>,
+    /// A community price-list refresh in flight.
+    price_fetch: Option<cost::PriceFetch>,
 }
 
 /// A turn in flight and the session it runs on (which stays the one to
@@ -814,6 +856,7 @@ impl Integrator {
             current_endpoint,
             clients,
             models,
+            pricing,
         } = parts;
         let current_model = session.model().to_string();
         let current_provider = session.provider();
@@ -821,6 +864,9 @@ impl Integrator {
         // endpoint's window from the first turn.
         let model_fetch = (models.is_none() && !endpoints.is_empty())
             .then(|| models::spawn_model_fetch(&endpoints));
+        let price_fetch = pricing
+            .refresh_url()
+            .map(|url| cost::spawn_price_fetch(url.to_string(), pricing.cache_path.clone()));
         let integrator = Self {
             runtime,
             engine,
@@ -848,8 +894,11 @@ impl Integrator {
             model_fetch,
             picker_waiting: false,
             pending_set: None,
+            prices: Arc::new(pricing.table),
+            price_fetch,
         };
         integrator.save_current_choice();
+        integrator.push_prices();
         if integrator.models.is_some() {
             integrator.push_context_window();
         }
@@ -882,6 +931,9 @@ impl Integrator {
                 }
                 joined = async { match self.model_fetch.as_mut() { Some(fetch) => fetch.await, None => std::future::pending().await } } => {
                     self.model_fetch_finished(joined).await;
+                }
+                joined = async { match self.price_fetch.as_mut() { Some(fetch) => fetch.await, None => std::future::pending().await } } => {
+                    self.price_fetch_finished(joined);
                 }
             }
         }
@@ -1053,6 +1105,7 @@ impl Integrator {
             Effect::RequestModelPicker { refresh } => self.request_model_picker(refresh),
             Effect::Remember(text) => self.remember(&text),
             Effect::Compact => self.compact().await,
+            Effect::CostSnapshot(snapshot) => self.save_cost_snapshot(&snapshot),
         }
     }
 

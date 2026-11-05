@@ -101,13 +101,15 @@ show as `(cli)` in `/rules list` and are never written to a file.
 | `endpoints.<name>.api_key_env` | (same, `key_env=`) | — (preferred) |
 | `endpoints.<name>.api_key` | `--set endpoints.<name>.api_key=…` | — (plain text; warned about) |
 | `endpoints.<name>.priority` | `--set endpoints.<name>.priority=N` | `0` |
+| `pricing."<model id>".input`, `.output`, `.cached_input`, `.cache_write` (USD per 1M tokens) | `--set 'pricing."<id>".input=15'` | fetched prices (see [Cost](#cost)) |
 | anything | `--set <dotted.key>=<value>` (repeatable) | |
 
 Other flags: `--model`/`-m <[endpoint:]id>`, `--endpoint <name>` (endpoint
 for a bare `--model` and the default; `--provider <name>` is the same for the
 built-in ones), `--resume <ref>`, `-c`/`--continue`, `-w`/`--workspace`,
 `--config-dir`, `--user-config-root`, `--realm`, `--isolated`,
-`--realm-backend`, `--state-root`, `--mouse`, `--wait-for-mcp`. `--auto-compact`
+`--realm-backend`, `--state-root`, `--mouse`, `--wait-for-mcp`,
+`--no-pricing-fetch`. `--auto-compact`
 conflicts with `--no-auto-compact`, `--trust-project-builds` with
 `--no-trust-project-builds`, `--endpoint` with `--provider`.
 
@@ -183,6 +185,12 @@ searches prompt history (workspace, then global; Ctrl-R again for older
 matches, Enter/arrows accept into the editor, Esc cancels); Ctrl-X Ctrl-S
 interrupts the running turn and sends the input; PgUp/PgDn and Shift+↑/↓ scroll.
 
+The mouse is captured by default: the wheel scrolls the transcript and a click
+on a tool call expands or collapses its output (tool output starts collapsed,
+with a `▸` marker; `▾` when expanded); Ctrl-T does the same for the latest tool
+call. Hold Shift to select text natively, or start with `--no-mouse` to turn
+capture off.
+
 While the agent is working, Enter queues the message and delivers it at the
 agent's next step (between tool calls). Esc recalls every queued message into
 the editor (and interrupts the turn when nothing is queued); ↑ on an empty
@@ -198,7 +206,7 @@ model never received to `<workspace>/.rkat/tui/tui_unsent.txt` (the next start
 says so).
 
 `/help`, `/quit`, `/clear`, `/resume [ref]`, `/rules [list|add allow|deny <tool> [pattern]|rm <n>]`,
-`/auto [on|off|resume]`, `/model [[endpoint:]id|refresh]`, `/remember <text>`, `/compact`.
+`/auto [on|off|resume]`, `/model [[endpoint:]id|refresh]`, `/remember <text>`, `/compact`, `/cost`.
 `/clear`, `/resume`, `/model` and `/compact` work only while idle (no turn
 running, nothing queued); the transcript is replaced only once the new session
 is live.
@@ -214,6 +222,40 @@ and red from 90% (`~` marks an estimate, e.g. right after `/resume` or
 for a model the catalog does not know). The window comes from the provider's
 list-models endpoint when it reports one (Anthropic, Gemini, LiteLLM's
 `/model/info`); otherwise (OpenAI, or the fetch failed) from the curated catalog.
+
+### Cost
+
+After the token counters the status bar shows what the session has cost so
+far, `$0.42`: every model call's tokens are added to the model in use at the
+time, and each model's totals are priced as uncached input + cache reads
+(`cached_input`, else the input price) + cache writes (`cache_write`, else the
+input price) + output, per million tokens. `~$0.42` marks an estimate: some
+model used has no price (it is left out), the totals of a resumed session had
+to be derived from its overall usage (sessions from before cost tracking), or
+a price comes from a community list older than its 7-day cache lifetime. `$?`
+means no model used has a price. `/cost` prints the breakdown: tokens in, out,
+cache read and cache write, and USD per model with the source of its price.
+
+Prices come from, in order: `[pricing."<model id>"]` in your `tui.toml`
+(`input`, `output`, `cached_input`, `cache_write` in USD per million tokens;
+unset fields fall back to the sources below; for one run
+`--set 'pricing."claude-opus-4-6".input=15'`; the project file and a
+git-tracked realm file may not set prices); a LiteLLM endpoint's
+`/model/info` prices for its models; and LiteLLM's community list
+(`model_prices_and_context_window.json` on GitHub), downloaded in the
+background at start-up (10 s timeout) and cached in
+`<config-dir>/pricing-cache.json` for 7 days — the cache is used right away
+and refreshed when stale; start-up never waits for it. `--no-pricing-fetch`
+skips the download (cache and `tui.toml` only). Ids are matched exactly, then
+without a provider prefix (`anthropic/`, `openai/`, `gemini/`, `vertex_ai/`),
+then without a trailing date (`-20250929`).
+
+The totals are kept next to the session (`<realm>/tui_endpoints/<id>.toml`,
+`[cost."<model>"]`) and restored by `-c`/`/resume`; `/clear` starts from zero.
+Caveats: the readout is an estimate, not a bill. Compaction summaries count
+only their summary tokens (as output), the classifier's and sub-agents' calls
+are not counted, OpenAI reports cached input inside `input` (priced at the full
+input price), and batch, tiered or long-context pricing is ignored.
 
 ## Instructions and memory
 

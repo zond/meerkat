@@ -75,6 +75,8 @@ pub enum Command {
     Remember(String),
     /// `/compact`: summarise the session's context.
     Compact,
+    /// `/cost`: the session's token cost by model.
+    Cost,
 }
 
 /// Slash-command parse failure.
@@ -118,6 +120,7 @@ Commands:
   /compact                       summarise the conversation to free context (idle only)
                                  (tui.toml [auto] compact = \"warn\" (default) warns at 75%;
                                  \"auto\" or --auto-compact runs it at 85%)
+  /cost                          token usage and cost per model (footer: $0.42, ~ estimate, $? unpriced)
 Keys:
   Enter                          send; while the agent is working, queues the message
                                  and delivers it at the next step
@@ -190,6 +193,10 @@ fn parse_command(name: &str, args: &[&str]) -> Result<Command, CommandError> {
         "quit" | "exit" | "q" => Ok(Command::Quit),
         "clear" | "new" => Ok(Command::Clear),
         "help" | "?" => Ok(Command::Help),
+        "cost" => match args {
+            [] => Ok(Command::Cost),
+            _ => Err(CommandError::Usage("/cost")),
+        },
         "compact" => match args {
             [] => Ok(Command::Compact),
             _ => Err(CommandError::Usage("/compact")),
@@ -287,6 +294,8 @@ mod tests {
             Some(Err(CommandError::Usage("/remember <text>")))
         );
         assert_eq!(ok("/compact"), Command::Compact);
+        assert_eq!(ok("/cost"), Command::Cost);
+        assert_eq!(parse("/cost now"), Some(Err(CommandError::Usage("/cost"))));
         assert!(matches!(
             parse("/compact now"),
             Some(Err(CommandError::Usage(_)))
@@ -364,6 +373,7 @@ mod tests {
             "/remember",
             "#<text>",
             "/compact",
+            "/cost",
             "Enter",
             "Alt+Enter",
             "Ctrl+J",

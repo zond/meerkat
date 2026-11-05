@@ -11,7 +11,8 @@
 //! rules, `[auto]` settings and new endpoints, and may not loosen
 //! `trust_project_builds`). The command-line overlay ([`crate::overlay`]) is a
 //! fourth layer between the realm and project files. Besides rules and
-//! `[auto]`, the file holds `[endpoints.<name>]` (see [`crate::endpoints`]).
+//! `[auto]`, the file holds `[endpoints.<name>]` (see [`crate::endpoints`])
+//! and `[pricing."<model id>"]` price overrides (see [`crate::pricing`]).
 
 use crate::ui::compaction::{CompactMode, CompactionPolicy};
 use globset::{Glob, GlobBuilder, GlobMatcher};
@@ -786,6 +787,56 @@ impl EndpointSection {
     }
 }
 
+/// One `[pricing."<model id>"]` table: USD per million tokens for the cost
+/// readout (see [`crate::pricing`]). Unset fields inherit from lower layers,
+/// then from the fetched price lists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PricingSection {
+    /// Uncached input tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<f64>,
+    /// Output tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<f64>,
+    /// Input tokens read from the prompt cache (default: `input`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input: Option<f64>,
+    /// Input tokens written to the prompt cache (default: `input`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<f64>,
+}
+
+impl PricingSection {
+    /// Overwrite every field `other` sets.
+    pub fn merge_from(&mut self, other: &Self) {
+        let Self {
+            input,
+            output,
+            cached_input,
+            cache_write,
+        } = *other;
+        self.input = input.or(self.input);
+        self.output = output.or(self.output);
+        self.cached_input = cached_input.or(self.cached_input);
+        self.cache_write = cache_write.or(self.cache_write);
+    }
+
+    /// The first field that is not a finite, non-negative number, if any.
+    #[must_use]
+    pub fn invalid_field(&self) -> Option<&'static str> {
+        [
+            ("input", self.input),
+            ("output", self.output),
+            ("cached_input", self.cached_input),
+            ("cache_write", self.cache_write),
+        ]
+        .into_iter()
+        .find(|(_, value)| value.is_some_and(|v| !v.is_finite() || v < 0.0))
+        .map(|(name, _)| name)
+    }
+}
+
 /// An endpoint after layering, with the layer that first defined it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayeredEndpoint {
@@ -796,7 +847,7 @@ pub struct LayeredEndpoint {
 }
 
 /// On-disk rules file.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RulesFile {
     /// Auto-mode settings.
@@ -811,6 +862,9 @@ pub struct RulesFile {
     /// Extra LLM endpoints by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub endpoints: BTreeMap<String, EndpointSection>,
+    /// Price overrides by model id (USD per million tokens).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pricing: BTreeMap<String, PricingSection>,
 }
 
 impl RulesFile {
@@ -922,6 +976,21 @@ pub enum Notice {
         /// Number of ignored endpoints.
         count: usize,
     },
+    /// A file the user does not own (the project file, or a realm file
+    /// tracked by git) set `[pricing]`; only user layers may.
+    PricingIgnored {
+        /// The rules file.
+        path: PathBuf,
+        /// Number of ignored model entries.
+        count: usize,
+    },
+    /// A `[pricing."<model>"]` entry has a negative or non-finite price.
+    PricingInvalid {
+        /// Model id.
+        model: String,
+        /// The offending field.
+        field: &'static str,
+    },
     /// The layered `compact_warn_percent`/`compact_auto_percent` were out of
     /// range (`1..=100`, auto ≥ warn) and were clamped.
     CompactPercentClamped {
@@ -983,6 +1052,16 @@ impl fmt::Display for Notice {
                 "{} is tracked by git; ignored {count} endpoint(s) from it",
                 path.display()
             ),
+            Self::PricingIgnored { path, count } => write!(
+                f,
+                "ignored {count} [pricing] entr{} in {}: only your own tui.toml files set prices",
+                if *count == 1 { "y" } else { "ies" },
+                path.display()
+            ),
+            Self::PricingInvalid { model, field } => write!(
+                f,
+                "ignored [pricing.\"{model}\"]: `{field}` must be a non-negative number"
+            ),
             Self::CompactPercentClamped {
                 configured: (warn, auto),
                 applied: (applied_warn, applied_auto),
@@ -1031,6 +1110,8 @@ pub struct Layered {
     pub settings: AutoSettings,
     /// Merged `[endpoints.<name>]` (not yet validated).
     pub endpoints: BTreeMap<String, LayeredEndpoint>,
+    /// Merged `[pricing."<model>"]` overrides (invalid entries dropped).
+    pub pricing: BTreeMap<String, PricingSection>,
     /// Non-fatal observations to show once.
     pub notices: Vec<Notice>,
 }
@@ -1088,6 +1169,7 @@ pub fn load_layered_with(
     let mut settings = AutoSettings::default();
     let mut notices = Vec::new();
     let mut endpoints: BTreeMap<String, LayeredEndpoint> = BTreeMap::new();
+    let mut pricing: BTreeMap<String, PricingSection> = BTreeMap::new();
 
     let mut user_layers: Vec<(Option<PathBuf>, RuleOrigin, RulesFile)> = Vec::new();
     if let Some(global) = global_rules_file {
@@ -1120,6 +1202,21 @@ pub fn load_layered_with(
                 path: path.clone(),
                 count: ignored_allow,
             });
+        }
+        if untrusted {
+            if !file.pricing.is_empty() {
+                notices.push(Notice::PricingIgnored {
+                    path: path.clone(),
+                    count: file.pricing.len(),
+                });
+            }
+        } else {
+            for (model, section) in &file.pricing {
+                pricing
+                    .entry(model.clone())
+                    .or_default()
+                    .merge_from(section);
+            }
         }
         if untrusted {
             if !file.endpoints.is_empty() {
@@ -1165,6 +1262,22 @@ pub fn load_layered_with(
             RuleOrigin::Project,
         )?);
     }
+    if !project.pricing.is_empty() {
+        notices.push(Notice::PricingIgnored {
+            path: project_path.clone(),
+            count: project.pricing.len(),
+        });
+    }
+    pricing.retain(|model, section| match section.invalid_field() {
+        Some(field) => {
+            notices.push(Notice::PricingInvalid {
+                model: model.clone(),
+                field,
+            });
+            false
+        }
+        None => true,
+    });
     for (name, section) in &project.endpoints {
         if endpoints.contains_key(name) {
             notices.push(Notice::ProjectEndpointIgnored {
@@ -1215,6 +1328,7 @@ pub fn load_layered_with(
         rules,
         settings,
         endpoints,
+        pricing,
         notices,
     })
 }
@@ -1456,6 +1570,15 @@ mod tests {
                     api_key_env: Some("LITELLM_KEY".into()),
                     api_key: None,
                     priority: Some(2),
+                },
+            )]),
+            pricing: BTreeMap::from([(
+                "gpt-5.4".to_string(),
+                PricingSection {
+                    input: Some(1.25),
+                    output: Some(10.0),
+                    cached_input: None,
+                    cache_write: None,
                 },
             )]),
         };
@@ -1953,6 +2076,62 @@ mod tests {
                 .matches_deny("shell", &["git push".to_string()])
                 .is_some()
         );
+    }
+
+    #[test]
+    fn pricing_layers_merge_by_field_and_only_user_layers_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (realm, project) = (tmp.path().join("realm"), tmp.path().join("p"));
+        let global = tmp.path().join("global").join(RULES_FILE_NAME);
+        write(
+            global.parent().unwrap(),
+            "[pricing.\"claude-opus-4-6\"]\ninput = 5\noutput = 25\ncached_input = 0.5\n",
+        );
+        write(
+            &realm,
+            "[pricing.\"claude-opus-4-6\"]\noutput = 30\n[pricing.bad]\ninput = -1\noutput = 1\n",
+        );
+        write(&project, "[pricing.\"gpt-5.4\"]\ninput = 0\noutput = 0\n");
+        let overlay = cli("[pricing.\"claude-opus-4-6\"]\ninput = 15\n");
+        let layered = load_layered_with(
+            &realm,
+            Some(&global),
+            &project,
+            RealmTrust::Owned,
+            Some(&overlay),
+        )
+        .unwrap();
+        assert_eq!(
+            layered.pricing.get("claude-opus-4-6"),
+            Some(&PricingSection {
+                input: Some(15.0),
+                output: Some(30.0),
+                cached_input: Some(0.5),
+                cache_write: None,
+            })
+        );
+        assert!(
+            !layered.pricing.contains_key("gpt-5.4"),
+            "project prices ignored"
+        );
+        assert!(
+            !layered.pricing.contains_key("bad"),
+            "negative price dropped"
+        );
+        let texts: Vec<String> = layered.notices.iter().map(ToString::to_string).collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("ignored 1 [pricing] entry")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("`input` must be")),
+            "{texts:?}"
+        );
+        // A tracked realm file's prices are ignored too.
+        let layered = load_layered_with(&realm, None, &project, RealmTrust::Tracked, None).unwrap();
+        assert!(layered.pricing.is_empty());
     }
 
     #[test]

@@ -184,10 +184,11 @@ fn diff_block_snapshot() {
             removed: 1,
         }),
         depth: 0,
+        collapsed: false,
     });
     let buf = render_buffer(&mut app, W, 14);
     let rows = rows(&buf);
-    assert_eq!(rows[0], "✓ edit_file({\"path\":\"src/a.rs\"}) (4ms)");
+    assert_eq!(rows[0], "✓ edit_file({\"path\":\"src/a.rs\"}) (4ms) ▾");
     assert_eq!(rows[1], "  src/a.rs (+1 -1)");
     assert_eq!(rows[2], "  --- a/src/a.rs");
     assert_eq!(rows[3], "  +++ b/src/a.rs");

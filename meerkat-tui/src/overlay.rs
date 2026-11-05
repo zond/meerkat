@@ -159,6 +159,9 @@ pub fn merge(base: &mut Table, overlay: Table) {
 
 /// Parse `--set key.path=value` into a one-entry document.
 ///
+/// A key segment may be double-quoted to hold dots or other characters
+/// (`pricing."gpt-5.4".input=1.25`).
+///
 /// The value is TOML (`true`, `85`, `"x"`, `[{tool = "shell"}]`); anything
 /// that does not parse as TOML is taken as a string, so `auto.compact=auto`
 /// needs no quotes.
@@ -167,18 +170,67 @@ pub fn merge(base: &mut Table, overlay: Table) {
 ///
 /// A missing `=` or an invalid key path.
 pub fn parse_set(arg: &str) -> Result<Table, OverlayError> {
-    let (key, raw) = arg
-        .split_once('=')
+    let (path, raw) = split_key_path(arg)
         .ok_or_else(|| OverlayError::new("--set", arg, "expected <dotted.key>=<value>"))?;
-    let path: Vec<&str> = key.trim().split('.').collect();
-    if let Some(bad) = path.iter().find(|segment| !is_valid_endpoint_name(segment)) {
+    if let Some(bad) = path.iter().find(|segment| match segment {
+        KeySegment::Bare(name) => !is_valid_endpoint_name(name),
+        KeySegment::Quoted(name) => name.is_empty(),
+    }) {
         return Err(OverlayError::new(
             "--set",
             arg,
-            format!("invalid key segment `{bad}` (letters, digits, `_`, `-`; `.` separates)"),
+            format!(
+                "invalid key segment `{}` (letters, digits, `_`, `-`, or \"quoted\"; `.` separates)",
+                bad.as_str()
+            ),
         ));
     }
+    let path: Vec<&str> = path.iter().map(KeySegment::as_str).collect();
     Ok(nested(&path, parse_value(raw)))
+}
+
+/// One segment of a `--set` key path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeySegment<'a> {
+    /// `name`
+    Bare(&'a str),
+    /// `"name"` (may contain `.`, e.g. a model id like `gpt-5.4`).
+    Quoted(&'a str),
+}
+
+impl<'a> KeySegment<'a> {
+    fn as_str(&self) -> &'a str {
+        match *self {
+            Self::Bare(name) | Self::Quoted(name) => name,
+        }
+    }
+}
+
+/// Split `a."b.c".d=value` into its key segments and the raw value. A quoted
+/// segment runs to the next `"` (no escapes). `None` without a `=` after the
+/// key, or with an unterminated quote.
+fn split_key_path(arg: &str) -> Option<(Vec<KeySegment<'_>>, &str)> {
+    let mut segments = Vec::new();
+    let mut rest = arg.trim_start();
+    loop {
+        let (segment, after) = if let Some(quoted) = rest.strip_prefix('"') {
+            let end = quoted.find('"')?;
+            (
+                KeySegment::Quoted(quoted.get(..end)?),
+                quoted.get(end + 1..)?,
+            )
+        } else {
+            let end = rest.find(['.', '='])?;
+            (KeySegment::Bare(rest.get(..end)?.trim()), rest.get(end..)?)
+        };
+        segments.push(segment);
+        let after = after.trim_start();
+        if let Some(next) = after.strip_prefix('.') {
+            rest = next.trim_start();
+        } else {
+            return after.strip_prefix('=').map(|raw| (segments, raw));
+        }
+    }
 }
 
 /// `raw` as a TOML value, or a string when it is not one.
@@ -276,6 +328,13 @@ fn validate(piece: &Table) -> Result<(), String> {
             ));
         }
     }
+    for (model, section) in &file.pricing {
+        if let Some(field) = section.invalid_field() {
+            return Err(format!(
+                "pricing.\"{model}\".{field} must be a non-negative number"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -367,6 +426,31 @@ mod tests {
         let litellm = &f.endpoints["litellm"];
         assert_eq!(litellm.base_url.as_deref(), Some("http://host:4000"));
         assert_eq!(litellm.priority, Some(3));
+    }
+
+    #[test]
+    fn set_quoted_segments_take_model_ids() {
+        let f = file(&[
+            "--set",
+            r#"pricing."claude-opus-5-5".input=15"#,
+            "--set",
+            r#"pricing."gpt-5.4".output=10.5"#,
+            "--set",
+            r#"pricing."claude-opus-5-5".cached_input=1.5"#,
+        ]);
+        let opus = f.pricing["claude-opus-5-5"];
+        assert_eq!(opus.input, Some(15.0));
+        assert_eq!(opus.cached_input, Some(1.5));
+        assert_eq!(f.pricing["gpt-5.4"].output, Some(10.5));
+        for (argv, needle) in [
+            (["--set", r#"pricing."x.input=1"#], "expected <dotted.key>"),
+            (["--set", r#"pricing."".input=1"#], "invalid key segment"),
+            (["--set", r#"pricing."m".input=-1"#], "non-negative"),
+            (["--set", r#"pricing."m".bogus=1"#], "unknown field"),
+        ] {
+            let err = overlay(&argv).expect_err(needle).to_string();
+            assert!(err.contains(needle), "{argv:?}: {err}");
+        }
     }
 
     #[test]

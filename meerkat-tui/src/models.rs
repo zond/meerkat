@@ -17,6 +17,7 @@ use serde::de::DeserializeOwned;
 
 use crate::bootstrap::credentials::ProviderCredentials;
 use crate::endpoints::{Dialect, Endpoint};
+use crate::pricing::ModelPrice;
 
 /// Default Anthropic API base (mirrors `meerkat-client`).
 const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
@@ -147,30 +148,55 @@ pub async fn list_endpoint_models(
     endpoint: &Endpoint,
     timeout: Duration,
 ) -> Result<Vec<ModelEntry>, ListModelsError> {
+    Ok(list_endpoint(endpoint, timeout).await?.models)
+}
+
+/// What listing one endpoint yields: its models and, for a LiteLLM proxy,
+/// the per-model prices from `/model/info` (USD per million tokens).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EndpointListing {
+    /// The endpoint's models.
+    pub models: Vec<ModelEntry>,
+    /// Prices by model id, first deployment first.
+    pub prices: Vec<(String, ModelPrice)>,
+}
+
+/// [`list_endpoint_models`] plus the LiteLLM prices, when there are any.
+///
+/// # Errors
+///
+/// See [`list_models`].
+pub async fn list_endpoint(
+    endpoint: &Endpoint,
+    timeout: Duration,
+) -> Result<EndpointListing, ListModelsError> {
     let creds = endpoint.credentials();
-    let mut entries = list_models(&creds, timeout).await?;
+    let mut listing = EndpointListing {
+        models: list_models(&creds, timeout).await?,
+        prices: Vec::new(),
+    };
     if endpoint.dialect == Dialect::OpenAi
         && let Some(base) = &endpoint.base_url
     {
         match litellm_model_info(base, &creds.api_key, timeout).await {
-            Ok(info) => apply_litellm_info(&mut entries, info),
+            Ok(info) => apply_litellm_info(&mut listing, info),
             Err(err) => {
                 tracing::debug!(endpoint = %endpoint.name, error = %err, "no LiteLLM /model/info");
             }
         }
     }
-    Ok(entries)
+    Ok(listing)
 }
 
-/// [`list_endpoint_models`] for every endpoint in parallel; results in input order.
+/// [`list_endpoint`] for every endpoint in parallel; results in input order.
 pub async fn list_all_endpoints(
     endpoints: &[Endpoint],
     timeout: Duration,
-) -> Vec<(String, Result<Vec<ModelEntry>, ListModelsError>)> {
+) -> Vec<(String, Result<EndpointListing, ListModelsError>)> {
     let fetches = endpoints.iter().map(|endpoint| async move {
         (
             endpoint.name.clone(),
-            list_endpoint_models(endpoint, timeout).await,
+            list_endpoint(endpoint, timeout).await,
         )
     });
     futures::future::join_all(fetches).await
@@ -231,6 +257,27 @@ struct LiteLlmModelInfo {
     max_input_tokens: Option<u64>,
     #[serde(default)]
     max_output_tokens: Option<u64>,
+    #[serde(default, deserialize_with = "crate::pricing::lenient_f64")]
+    input_cost_per_token: Option<f64>,
+    #[serde(default, deserialize_with = "crate::pricing::lenient_f64")]
+    output_cost_per_token: Option<f64>,
+    #[serde(default, deserialize_with = "crate::pricing::lenient_f64")]
+    cache_read_input_token_cost: Option<f64>,
+    #[serde(default, deserialize_with = "crate::pricing::lenient_f64")]
+    cache_creation_input_token_cost: Option<f64>,
+}
+
+impl LiteLlmModelInfo {
+    /// Prices per million tokens, when input and output are both set.
+    fn price(&self) -> Option<ModelPrice> {
+        let price = ModelPrice::from_per_token(
+            self.input_cost_per_token?,
+            self.output_cost_per_token?,
+            self.cache_read_input_token_cost,
+            self.cache_creation_input_token_cost,
+        );
+        price.is_valid().then_some(price)
+    }
 }
 
 async fn litellm_model_info(
@@ -250,13 +297,20 @@ async fn litellm_model_info(
 }
 
 /// Fill missing windows from LiteLLM's model info (first deployment with a
-/// value wins).
-fn apply_litellm_info(entries: &mut [ModelEntry], info: LiteLlmInfoPage) {
+/// value wins) and collect its prices.
+fn apply_litellm_info(listing: &mut EndpointListing, info: LiteLlmInfoPage) {
     for model in info.data {
         let Some(details) = model.model_info else {
             continue;
         };
-        for entry in entries.iter_mut().filter(|e| e.id == model.model_name) {
+        if let Some(price) = details.price() {
+            listing.prices.push((model.model_name.clone(), price));
+        }
+        for entry in listing
+            .models
+            .iter_mut()
+            .filter(|e| e.id == model.model_name)
+        {
             if entry.context_window.is_none() {
                 entry.context_window = details.max_input_tokens;
             }
@@ -293,7 +347,7 @@ async fn fetch_json<T: DeserializeOwned>(
 }
 
 /// Whether `url` points at this machine (`localhost`, `127.0.0.0/8`, `::1`).
-fn is_loopback_url(url: &str) -> bool {
+pub(crate) fn is_loopback_url(url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(url) else {
         return false;
     };
@@ -705,14 +759,43 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let mut entries = vec![
-            entry("gpt-x", ModelSource::Provider),
-            entry("no-info", ModelSource::Provider),
-        ];
-        apply_litellm_info(&mut entries, info);
+        let mut listing = EndpointListing {
+            models: vec![
+                entry("gpt-x", ModelSource::Provider),
+                entry("no-info", ModelSource::Provider),
+            ],
+            prices: Vec::new(),
+        };
+        apply_litellm_info(&mut listing, info);
+        let entries = &listing.models;
         assert_eq!(entries[0].context_window, Some(200_000));
         assert_eq!(entries[0].max_output_tokens, Some(8192));
         assert_eq!(entries[1].context_window, None);
+        assert!(listing.prices.is_empty());
+    }
+
+    #[test]
+    fn litellm_info_yields_prices_per_million() {
+        let info: LiteLlmInfoPage = decode(
+            r#"{"data":[
+                {"model_name":"gpt-x","model_info":{"input_cost_per_token":2e-06,"output_cost_per_token":8e-06,"cache_read_input_token_cost":5e-07}},
+                {"model_name":"half","model_info":{"input_cost_per_token":1e-06,"output_cost_per_token":null}},
+                {"model_name":"odd","model_info":{"input_cost_per_token":"x","output_cost_per_token":1e-06,"max_input_tokens":42}}
+            ]}"#,
+        )
+        .unwrap();
+        let mut listing = EndpointListing {
+            models: vec![entry("odd", ModelSource::Provider)],
+            prices: Vec::new(),
+        };
+        apply_litellm_info(&mut listing, info);
+        assert_eq!(listing.models[0].context_window, Some(42));
+        assert_eq!(listing.prices.len(), 1);
+        let (id, price) = &listing.prices[0];
+        assert_eq!(id, "gpt-x");
+        assert!((price.input - 2.0).abs() < 1e-9);
+        assert!((price.output - 8.0).abs() < 1e-9);
+        assert!((price.cached_input.unwrap() - 0.5).abs() < 1e-9);
     }
 
     #[test]

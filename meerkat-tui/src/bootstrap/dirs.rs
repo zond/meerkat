@@ -99,6 +99,12 @@ impl GlobalDirs {
     pub fn history_file(&self) -> PathBuf {
         self.config.join("history")
     }
+
+    /// Cache of the community price list (see [`crate::pricing`]).
+    #[must_use]
+    pub fn pricing_cache(&self) -> PathBuf {
+        self.config.join(crate::pricing::CACHE_FILE)
+    }
 }
 
 #[cfg(test)]
