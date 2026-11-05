@@ -210,6 +210,20 @@ with a `▸` marker; `▾` when expanded); Ctrl-T does the same for the latest t
 call. Hold Shift to select text natively, or start with `--no-mouse` to turn
 capture off.
 
+Dragging over the transcript selects text (drag past the top or bottom edge to
+scroll); releasing the button copies it to the system clipboard. A double click
+selects a word (paths like `src/ui/mod.rs` count as one), a triple click a whole
+line; both copy at once. The selection stays put while you scroll; Esc (or any
+other key) clears it. Ctrl-Y copies the selection again, or the last assistant
+message (its markdown source) when nothing is selected. A one-line notice says
+how many characters were copied; at most 100 KiB of encoded text is sent.
+Copying uses the OSC 52 escape sequence, so it works over SSH too, in terminals
+that honour it: kitty, WezTerm, foot, Alacritty, iTerm2 (enable "Applications in
+terminal may access clipboard"), Windows Terminal, Ghostty and xterm (with
+`allowWindowOps`); GNOME Terminal/VTE ignores it — use Shift-drag there. Inside
+tmux the sequence is passed through automatically, but tmux must allow it:
+`set -g set-clipboard on` in `~/.tmux.conf`.
+
 While the agent is working, Enter queues the message and delivers it at the
 agent's next step (between tool calls). Esc recalls every queued message into
 the editor (and interrupts the turn when nothing is queued); ↑ on an empty

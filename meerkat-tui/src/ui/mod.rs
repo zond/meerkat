@@ -16,6 +16,7 @@ pub mod modal;
 pub mod render;
 pub mod runtime;
 pub mod search;
+pub mod selection;
 pub mod transcript;
 
 use crate::delivery::{CONTINUATION_PROMPT, DeliveryReport, InjectFailure, PendingId};
@@ -25,7 +26,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use meerkat_core::{AgentEvent, EventEnvelope, ScopedAgentEvent};
-use ratatui::crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
+use ratatui::text::Line;
 
 pub use commands::{AutoCommand, Command, CommandError, ModelCommand, RuleEffect, RulesCommand};
 pub use compaction::{CompactFailure, CompactMode, CompactionGauge, CompactionPolicy, GaugeAction};
@@ -39,6 +44,7 @@ pub use modal::{
 };
 pub use runtime::{TerminalGuard, UiChannels, UiError, install_panic_hook, run_ui};
 pub use search::{HistorySearch, SearchOutcome};
+pub use selection::{CellPos, SelectMode, Selection};
 pub use transcript::{Block, BlockId, DiffView, NoticeLevel, QueuedLabel, ToolState, Transcript};
 
 /// Window in which a second Ctrl-C on an idle, empty prompt quits.
@@ -50,6 +56,32 @@ pub const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 
 /// Window after Ctrl-X in which the second key of a chord is accepted.
 pub const CHORD_WINDOW: Duration = Duration::from_millis(1500);
+
+/// Window in which a second (third) left press on the same cell is a double
+/// (triple) click.
+pub const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(400);
+
+/// A left button press not yet released.
+#[derive(Debug, Clone, Copy)]
+struct Press {
+    /// Cell pressed.
+    pos: CellPos,
+    /// Screen row pressed (for click-to-expand).
+    row: u16,
+    /// 1 = single, 2 = double, 3 = triple click.
+    clicks: u8,
+    /// Whether the pointer moved with the button held.
+    dragged: bool,
+}
+
+/// The last left press, for multi-click detection.
+#[derive(Debug, Clone, Copy)]
+struct LastDown {
+    at: Instant,
+    row: u16,
+    column: u16,
+    clicks: u8,
+}
 
 /// How keys reach the input area.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -548,10 +580,17 @@ pub struct App {
     run_first_block: usize,
     last_ctrl_c: Option<Instant>,
     viewport_height: usize,
-    /// Screen row of the transcript's first line and the block drawn on each
-    /// transcript row, as of the last draw (for mouse hit-testing).
-    transcript_top: u16,
-    transcript_rows: Vec<BlockId>,
+    /// Screen area of the transcript and, per drawn row, the block and the
+    /// transcript logical line shown there, as of the last draw (for mouse
+    /// hit-testing and selection).
+    transcript_area: Rect,
+    transcript_rows: Vec<(BlockId, usize)>,
+    /// Mouse text selection (logical line coordinates).
+    selection: Option<Selection>,
+    press: Option<Press>,
+    last_down: Option<LastDown>,
+    /// Text to put on the system clipboard (drained by the runtime).
+    clipboard: Option<String>,
     dirty: bool,
 }
 
@@ -586,8 +625,12 @@ impl App {
             run_first_block: 0,
             last_ctrl_c: None,
             viewport_height: 20,
-            transcript_top: 0,
+            transcript_area: Rect::default(),
             transcript_rows: Vec::new(),
+            selection: None,
+            press: None,
+            last_down: None,
+            clipboard: None,
             dirty: true,
         }
     }
@@ -671,17 +714,232 @@ impl App {
         self.viewport_height = height.max(1);
     }
 
-    /// Record where the transcript was drawn: the screen row of its first
-    /// line and the block shown on each row (set by the renderer).
-    pub fn set_transcript_rows(&mut self, top: u16, rows: Vec<BlockId>) {
-        self.transcript_top = top;
-        self.transcript_rows = rows;
+    /// Record where the transcript was drawn: its screen area, the logical
+    /// line of its first row and the block shown on each row (set by the
+    /// renderer; row `i` shows logical line `first_line + i`).
+    pub fn set_transcript_rows(&mut self, area: Rect, first_line: usize, rows: Vec<BlockId>) {
+        self.transcript_area = area;
+        self.transcript_rows = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| (id, first_line + i))
+            .collect();
     }
 
     /// The transcript block drawn at screen row `row` in the last frame.
     pub fn block_at_row(&self, row: u16) -> Option<BlockId> {
-        let offset = row.checked_sub(self.transcript_top)?;
-        self.transcript_rows.get(usize::from(offset)).copied()
+        let offset = row.checked_sub(self.transcript_area.y)?;
+        self.transcript_rows
+            .get(usize::from(offset))
+            .map(|(id, _)| *id)
+    }
+
+    /// The transcript cell (logical line, display column) at a screen
+    /// position in the last frame.
+    pub fn cell_at(&self, row: u16, column: u16) -> Option<CellPos> {
+        let offset = row.checked_sub(self.transcript_area.y)?;
+        let col = column.checked_sub(self.transcript_area.x)?;
+        if col >= self.transcript_area.width {
+            return None;
+        }
+        let (_, line) = self.transcript_rows.get(usize::from(offset))?;
+        Some(CellPos::new(*line, usize::from(col)))
+    }
+
+    /// The current mouse selection.
+    pub fn selection(&self) -> Option<&Selection> {
+        self.selection.as_ref()
+    }
+
+    /// Text queued for the system clipboard since the last call (the runtime
+    /// writes it with OSC 52).
+    pub fn take_clipboard_text(&mut self) -> Option<String> {
+        self.clipboard.take()
+    }
+
+    /// Bring the layout up to date at the last drawn width (so logical line
+    /// indices match what is on screen) and return line `idx`.
+    fn layout_line(&mut self, idx: usize) -> Option<Line<'static>> {
+        if self.transcript_area.width > 0 {
+            self.transcript.ensure_layout(self.transcript_area.width);
+        }
+        self.transcript.line(idx).cloned()
+    }
+
+    fn mouse(&mut self, m: MouseEvent, now: Instant) -> bool {
+        match m.kind {
+            MouseEventKind::ScrollUp => self.scroll.up(keymap::LINE_SCROLL),
+            MouseEventKind::ScrollDown => self.scroll.down(keymap::LINE_SCROLL),
+            MouseEventKind::Down(MouseButton::Left) => {
+                return self.mouse_down(m.row, m.column, now);
+            }
+            MouseEventKind::Drag(MouseButton::Left) => return self.mouse_drag(m.row, m.column),
+            MouseEventKind::Up(MouseButton::Left) => return self.mouse_up(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Left press: a single click clears the selection (and may become a
+    /// click or a drag); a double click selects a word, a triple click a line.
+    fn mouse_down(&mut self, row: u16, column: u16, now: Instant) -> bool {
+        if self.modal.is_some() {
+            return false;
+        }
+        let had_selection = self.selection.take().is_some();
+        let Some(pos) = self.cell_at(row, column) else {
+            self.press = None;
+            self.last_down = None;
+            return had_selection;
+        };
+        let clicks = match self.last_down {
+            Some(d)
+                if d.row == row
+                    && d.column == column
+                    && now.saturating_duration_since(d.at) < MULTI_CLICK_WINDOW =>
+            {
+                d.clicks % 3 + 1
+            }
+            _ => 1,
+        };
+        self.last_down = Some(LastDown {
+            at: now,
+            row,
+            column,
+            clicks,
+        });
+        self.press = Some(Press {
+            pos,
+            row,
+            clicks,
+            dragged: false,
+        });
+        self.selection = match clicks {
+            1 => None,
+            2 => {
+                let line = self.layout_line(pos.line);
+                Some(Selection::new(pos, SelectMode::Word, line.as_ref()))
+            }
+            _ => Some(Selection::new(pos, SelectMode::Line, None)),
+        };
+        had_selection || clicks > 1
+    }
+
+    /// Drag with the left button: extend the selection, scrolling when the
+    /// pointer is past the top or bottom edge of the transcript.
+    fn mouse_drag(&mut self, row: u16, column: u16) -> bool {
+        if self.modal.is_some() {
+            return false;
+        }
+        let Some(press) = self.press.as_mut() else {
+            return false;
+        };
+        press.dragged = true;
+        let start = press.pos;
+        let Some(pos) = self.drag_target(row, column) else {
+            return false;
+        };
+        let line = self.layout_line(pos.line);
+        let sel = self
+            .selection
+            .get_or_insert_with(|| Selection::new(start, SelectMode::Char, None));
+        sel.extend(pos, line.as_ref());
+        true
+    }
+
+    /// The cell a drag at a screen position selects to. Past the top edge
+    /// (or below the transcript while scrolled back) it scrolls one line and
+    /// targets the line that scrolls in; below the last line it targets the
+    /// end of the last line.
+    fn drag_target(&mut self, row: u16, column: u16) -> Option<CellPos> {
+        let first = self.transcript_rows.first()?.1;
+        let last = self.transcript_rows.last()?.1;
+        let area = self.transcript_area;
+        let col = usize::from(column.saturating_sub(area.x));
+        if row < area.y {
+            if first > 0 {
+                self.scroll.up(1);
+            }
+            return Some(CellPos::new(first.saturating_sub(1), col));
+        }
+        if let Some((_, line)) = self.transcript_rows.get(usize::from(row - area.y)) {
+            return Some(CellPos::new(*line, col));
+        }
+        if row >= area.bottom() && self.scroll.offset_from_bottom > 0 {
+            self.scroll.down(1);
+            let max = self.transcript.line_count().saturating_sub(1);
+            return Some(CellPos::new((last + 1).min(max), col));
+        }
+        Some(CellPos::new(last, usize::MAX))
+    }
+
+    /// Left release: a press without drag is a click (expand/collapse a tool
+    /// block); after a drag or a double/triple click the selection is copied.
+    fn mouse_up(&mut self) -> bool {
+        let Some(press) = self.press.take() else {
+            return false;
+        };
+        if self.modal.is_some() {
+            return false;
+        }
+        if !press.dragged && press.clicks == 1 {
+            return self.click(press.row);
+        }
+        self.copy_selection();
+        true
+    }
+
+    /// Queue the selected text for the clipboard.
+    fn copy_selection(&mut self) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        let (start, end) = sel.range();
+        if self.transcript_area.width > 0 {
+            self.transcript.ensure_layout(self.transcript_area.width);
+        }
+        let lines = self
+            .transcript
+            .visible_lines(start.line, end.line - start.line + 1);
+        let text = sel.extract_window(start.line, &lines);
+        self.copy_text(&text);
+    }
+
+    /// Ctrl-Y: copy the selection again, or else the last assistant message.
+    fn copy_again(&mut self) {
+        if self.selection.is_some() {
+            self.copy_selection();
+            return;
+        }
+        let last = self.transcript.blocks().iter().rev().find_map(|b| match b {
+            Block::Assistant { md } if !md.trim().is_empty() => Some(md.clone()),
+            _ => None,
+        });
+        self.copy_text(last.as_deref().unwrap_or(""));
+    }
+
+    /// Queue `text` (capped) for the clipboard and say so in a notice.
+    fn copy_text(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            self.transcript
+                .push_notice(NoticeLevel::Info, "nothing to copy");
+            return;
+        }
+        let (capped, truncated) = selection::cap_clipboard(text);
+        let n = capped.chars().count();
+        let note = if truncated {
+            format!("copied {n} chars (truncated to 100 KiB)")
+        } else {
+            format!("copied {n} chars")
+        };
+        self.clipboard = Some(capped.to_string());
+        self.transcript.push_notice(NoticeLevel::Info, note);
+    }
+
+    /// Clear the selection and any press in progress.
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.press = None;
     }
 
     /// A left click: expand or collapse the tool block under it. Expanding
@@ -721,6 +979,16 @@ impl App {
         let mut dirty = true;
         match msg {
             Msg::Key(key) => {
+                let copy_key =
+                    key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL);
+                if self.selection.is_some() && !copy_key {
+                    self.clear_selection();
+                    if key.code == KeyCode::Esc && self.modal.is_none() {
+                        // Esc only dismisses the selection.
+                        self.dirty = true;
+                        return fx;
+                    }
+                }
                 if self.modal.is_some() {
                     self.modal_key(&key, &mut fx);
                 } else {
@@ -739,13 +1007,12 @@ impl App {
                     }
                 }
             }
-            Msg::Resize(..) => self.transcript.invalidate_all(),
-            Msg::Mouse(m) => match m.kind {
-                MouseEventKind::ScrollUp => self.scroll.up(keymap::LINE_SCROLL),
-                MouseEventKind::ScrollDown => self.scroll.down(keymap::LINE_SCROLL),
-                MouseEventKind::Down(MouseButton::Left) => dirty = self.click(m.row),
-                _ => dirty = false,
-            },
+            Msg::Resize(..) => {
+                // Logical lines change with the width.
+                self.clear_selection();
+                self.transcript.invalidate_all();
+            }
+            Msg::Mouse(m) => dirty = self.mouse(m, now),
             Msg::Agent(env) => {
                 self.last_seq = env.seq;
                 match &env.payload {
@@ -837,6 +1104,7 @@ impl App {
                 }
             }
             Msg::ResetTranscript(blocks) => {
+                self.clear_selection();
                 self.transcript.reset(blocks);
                 self.last_seq = 0;
                 self.pending.clear_settled();
@@ -888,7 +1156,6 @@ impl App {
         if let Some(started) = self.chord.take()
             && now.saturating_duration_since(started) < CHORD_WINDOW
         {
-            use ratatui::crossterm::event::{KeyCode, KeyModifiers};
             match key.code {
                 KeyCode::Esc => {
                     self.last_ctrl_c = None;
@@ -937,6 +1204,7 @@ impl App {
                     self.transcript.toggle_tool(id);
                 }
             }
+            Action::Copy => self.copy_again(),
             Action::HistorySearch => self.start_search(),
             Action::ChordPrefix => self.chord = Some(now),
             Action::ScrollUp(n) => self.scroll.up(n),
@@ -1001,7 +1269,6 @@ impl App {
     }
 
     fn modal_key(&mut self, key: &KeyEvent, fx: &mut Vec<Effect>) {
-        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
         let ctrl_c =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
         match &mut self.modal {
@@ -1985,16 +2252,35 @@ mod tests {
         let total = app.transcript.ensure_layout(width);
         let start = app.scroll.window(total, height);
         let rows = app.transcript.visible_blocks(start, height);
-        app.set_transcript_rows(top, rows);
+        let area = Rect::new(0, top, width, u16::try_from(height).unwrap());
+        app.set_transcript_rows(area, start, rows);
     }
 
-    fn click_at(row: u16) -> Msg {
+    fn mouse(kind: MouseEventKind, row: u16, column: u16) -> Msg {
         Msg::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 3,
+            kind,
+            column,
             row,
             modifiers: KeyModifiers::NONE,
         })
+    }
+
+    fn down(row: u16, column: u16) -> Msg {
+        mouse(MouseEventKind::Down(MouseButton::Left), row, column)
+    }
+
+    fn drag(row: u16, column: u16) -> Msg {
+        mouse(MouseEventKind::Drag(MouseButton::Left), row, column)
+    }
+
+    fn up(row: u16, column: u16) -> Msg {
+        mouse(MouseEventKind::Up(MouseButton::Left), row, column)
+    }
+
+    /// A left click (press and release without moving) at column 3.
+    fn click_at(app: &mut App, row: u16) {
+        app.update(down(row, 3));
+        app.update(up(row, 3));
     }
 
     fn tool_collapsed(app: &App, id: BlockId) -> bool {
@@ -2035,7 +2321,7 @@ mod tests {
         assert_eq!(app.block_at_row(30), None);
 
         app.take_dirty();
-        app.update(click_at(4));
+        click_at(&mut app, 4);
         assert!(!tool_collapsed(&app, t1));
         assert!(tool_collapsed(&app, t2));
         assert!(app.take_dirty());
@@ -2043,14 +2329,15 @@ mod tests {
         // output collapses it again.
         draw_rows(&mut app, 2, 60, 20);
         assert_eq!(app.block_at_row(6), Some(t1));
-        app.update(click_at(6));
+        click_at(&mut app, 6);
         assert!(tool_collapsed(&app, t1));
 
         // A click on a non-tool block changes nothing and needs no redraw.
         draw_rows(&mut app, 2, 60, 20);
         app.take_dirty();
-        app.update(click_at(2));
+        click_at(&mut app, 2);
         assert!(!app.take_dirty());
+        assert_eq!(app.take_clipboard_text(), None);
 
         app.update(ctrl('t'));
         assert!(!tool_collapsed(&app, t2));
@@ -2078,8 +2365,157 @@ mod tests {
         let t1 = app.transcript.tool_block("t1").unwrap();
         draw_rows(&mut app, 0, 60, 10);
         app.update(Msg::ShowResumePicker(vec![("a".into(), "a".into())]));
-        app.update(click_at(0));
+        click_at(&mut app, 0);
         assert!(tool_collapsed(&app, t1));
+        app.update(down(0, 0));
+        app.update(drag(0, 5));
+        app.update(up(0, 5));
+        assert!(app.selection().is_none());
+        assert_eq!(app.take_clipboard_text(), None);
+    }
+
+    /// `› hello world` / spacer / `› second line here` / spacer, drawn from
+    /// screen row 1 at width 60.
+    fn selection_app() -> App {
+        let mut app = App::new(StatusInfo::default());
+        app.transcript.push(user("hello world"));
+        app.transcript.push(user("second line here"));
+        draw_rows(&mut app, 1, 60, 20);
+        app
+    }
+
+    #[test]
+    fn drag_selects_and_queues_clipboard_text() {
+        let mut app = selection_app();
+        app.update(down(1, 2));
+        assert!(app.selection().is_none());
+        app.update(drag(1, 4));
+        app.update(drag(3, 7));
+        let sel = *app.selection().unwrap();
+        assert_eq!(sel.mode, SelectMode::Char);
+        assert_eq!(sel.range(), (CellPos::new(0, 2), CellPos::new(2, 7)));
+        assert_eq!(app.take_clipboard_text(), None);
+        app.update(up(3, 7));
+        assert_eq!(
+            app.take_clipboard_text().as_deref(),
+            Some("hello world\n\n› second")
+        );
+        assert_eq!(
+            last_notice(&app),
+            Some((NoticeLevel::Info, "copied 21 chars".into()))
+        );
+        // The selection stays visible after copying.
+        assert!(app.selection().is_some());
+    }
+
+    #[test]
+    fn double_and_triple_click_select_word_and_line() {
+        let mut app = selection_app();
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        app.update_at(down(1, 9), at(0));
+        app.update_at(up(1, 9), at(10));
+        assert_eq!(app.take_clipboard_text(), None);
+        app.update_at(down(1, 9), at(100));
+        assert_eq!(app.selection().unwrap().mode, SelectMode::Word);
+        app.update_at(up(1, 9), at(110));
+        assert_eq!(app.take_clipboard_text().as_deref(), Some("world"));
+        app.update_at(down(1, 9), at(200));
+        assert_eq!(app.selection().unwrap().mode, SelectMode::Line);
+        app.update_at(up(1, 9), at(210));
+        assert_eq!(app.take_clipboard_text().as_deref(), Some("› hello world"));
+        // Too slow, or elsewhere: a plain click again, which clears the selection.
+        app.update_at(down(1, 9), at(1000));
+        assert!(app.selection().is_none());
+        app.update_at(up(1, 9), at(1010));
+        app.update_at(down(1, 3), at(1100));
+        app.update_at(up(1, 3), at(1110));
+        assert_eq!(app.take_clipboard_text(), None);
+        // Dragging a double-click selection extends it by words.
+        app.update_at(down(3, 4), at(2000));
+        app.update_at(up(3, 4), at(2010));
+        app.update_at(down(3, 4), at(2100));
+        app.update_at(drag(3, 10), at(2150));
+        app.update_at(up(3, 10), at(2200));
+        assert_eq!(app.take_clipboard_text().as_deref(), Some("second line"));
+    }
+
+    #[test]
+    fn esc_and_other_keys_clear_the_selection() {
+        let mut app = selection_app();
+        app.update(down(1, 2));
+        app.update(drag(1, 6));
+        app.update(up(1, 6));
+        assert!(app.selection().is_some());
+        app.running = true;
+        // Esc only dismisses the selection; it does not interrupt.
+        assert!(app.update(key(KeyCode::Esc)).is_empty());
+        assert!(app.selection().is_none());
+        assert_eq!(app.update(key(KeyCode::Esc)), vec![Effect::Interrupt]);
+
+        app.update(down(1, 2));
+        app.update(drag(1, 6));
+        app.update(up(1, 6));
+        app.update(key(KeyCode::Char('x')));
+        assert!(app.selection().is_none());
+        assert_eq!(app.input.text(), "x");
+    }
+
+    #[test]
+    fn ctrl_y_recopies_the_selection_or_the_last_assistant_message() {
+        let mut app = selection_app();
+        app.update(ctrl('y'));
+        assert_eq!(app.take_clipboard_text(), None);
+        assert_eq!(
+            last_notice(&app),
+            Some((NoticeLevel::Info, "nothing to copy".into()))
+        );
+        app.transcript.push(Block::Assistant {
+            md: "first **answer**".into(),
+        });
+        app.transcript.push(Block::Assistant {
+            md: "the *last* answer".into(),
+        });
+        app.update(ctrl('y'));
+        assert_eq!(
+            app.take_clipboard_text().as_deref(),
+            Some("the *last* answer")
+        );
+
+        draw_rows(&mut app, 1, 60, 20);
+        app.update(down(1, 2));
+        app.update(drag(1, 6));
+        app.update(up(1, 6));
+        assert_eq!(app.take_clipboard_text().as_deref(), Some("hello"));
+        app.update(ctrl('y'));
+        assert_eq!(app.take_clipboard_text().as_deref(), Some("hello"));
+        assert!(app.selection().is_some());
+    }
+
+    #[test]
+    fn dragging_past_the_edges_scrolls() {
+        let mut app = App::new(StatusInfo::default());
+        for i in 0..20 {
+            app.transcript.push(user(&format!("line {i}")));
+        }
+        // 40 lines, 10 visible from screen row 2; following the bottom.
+        draw_rows(&mut app, 2, 40, 10);
+        assert_eq!(app.scroll.offset_from_bottom, 0);
+        app.update(down(5, 2));
+        app.update(drag(1, 2));
+        assert_eq!(app.scroll.offset_from_bottom, 1);
+        assert!(!app.scroll.follow);
+        // The head is on the line above the first visible one (line 30).
+        assert_eq!(app.selection().unwrap().range().0, CellPos::new(29, 2));
+        draw_rows(&mut app, 2, 40, 10);
+        app.update(drag(0, 2));
+        assert_eq!(app.scroll.offset_from_bottom, 2);
+        draw_rows(&mut app, 2, 40, 10);
+        // Below the transcript (input box rows) scrolls back down.
+        app.update(drag(13, 2));
+        assert_eq!(app.scroll.offset_from_bottom, 1);
+        app.update(up(13, 2));
+        assert!(app.take_clipboard_text().is_some());
     }
 
     fn agent_at(ev: AgentEvent, seq: u64) -> Msg {

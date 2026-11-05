@@ -62,9 +62,16 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.set_viewport_height(height);
     let total = app.transcript.ensure_layout(area.width);
     let start = app.scroll.window(total, height);
-    let lines = app.transcript.visible_lines(start, height);
+    let mut lines = app.transcript.visible_lines(start, height);
+    if let Some(sel) = app.selection() {
+        lines = lines
+            .into_iter()
+            .enumerate()
+            .map(|(i, line)| sel.highlight(start + i, line))
+            .collect();
+    }
     let rows = app.transcript.visible_blocks(start, height);
-    app.set_transcript_rows(area.y, rows);
+    app.set_transcript_rows(area, start, rows);
     frame.render_widget(Paragraph::new(lines), area);
 }
 

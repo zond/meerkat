@@ -368,6 +368,21 @@ impl Transcript {
             .collect()
     }
 
+    /// Laid-out line `idx` of the whole transcript, as of the last
+    /// [`Self::ensure_layout`] (`None` past the end or for stale blocks).
+    pub fn line(&self, idx: usize) -> Option<&Line<'static>> {
+        self.layout
+            .iter()
+            .flatten()
+            .flat_map(|c| c.lines.iter())
+            .nth(idx)
+    }
+
+    /// Number of laid-out lines as of the last [`Self::ensure_layout`].
+    pub fn line_count(&self) -> usize {
+        self.layout.iter().flatten().map(|c| c.lines.len()).sum()
+    }
+
     /// The block drawn on each of the lines `[start, start + len)`, matching
     /// [`Self::visible_lines`]. Call [`Self::ensure_layout`] first.
     pub fn visible_blocks(&self, start: usize, len: usize) -> Vec<BlockId> {

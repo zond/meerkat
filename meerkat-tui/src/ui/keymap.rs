@@ -53,6 +53,8 @@ pub enum Action {
     ToggleReasoning,
     /// Expand or collapse the output of the most recent tool call (Ctrl-T).
     ToggleToolOutput,
+    /// Copy the mouse selection again, or else the last assistant message (Ctrl-Y).
+    Copy,
     /// Start a reverse history search (Ctrl-R).
     HistorySearch,
     /// Ctrl-X: the first key of a chord, resolved by the app with the next key.
@@ -91,6 +93,7 @@ pub fn map_key(key: &KeyEvent, input_empty: bool) -> Action {
         KeyCode::Char('o') if ctrl => Action::ToggleReasoning,
         KeyCode::Char('t') if ctrl => Action::ToggleToolOutput,
         KeyCode::Char('r') if ctrl => Action::HistorySearch,
+        KeyCode::Char('y') if ctrl => Action::Copy,
         KeyCode::Char('x') if ctrl => Action::ChordPrefix,
         KeyCode::Char('a') if ctrl => Action::Edit(EditAction::Home),
         KeyCode::Char('e') if ctrl => Action::Edit(EditAction::End),
@@ -184,6 +187,10 @@ mod tests {
         assert_eq!(
             map_key(&k(KeyCode::Char('r'), KeyModifiers::CONTROL), false),
             Action::HistorySearch
+        );
+        assert_eq!(
+            map_key(&k(KeyCode::Char('y'), KeyModifiers::CONTROL), false),
+            Action::Copy
         );
         assert_eq!(
             map_key(&k(KeyCode::Char('x'), KeyModifiers::CONTROL), false),

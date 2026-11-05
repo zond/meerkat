@@ -26,6 +26,7 @@ use ratatui::crossterm::terminal::{
 use tokio::sync::mpsc;
 
 use super::render::draw;
+use super::selection::osc52;
 use super::{App, Effect, History, Msg};
 
 /// Render tick interval (~30 fps).
@@ -221,6 +222,16 @@ pub async fn run_ui(
     }
 }
 
+/// Put `text` on the system clipboard with OSC 52 (wrapped for tmux when
+/// `TMUX` is set). Failures are logged: copying must never end the UI.
+fn write_clipboard(text: &str) {
+    let seq = osc52(text, std::env::var_os("TMUX").is_some());
+    let mut out = io::stdout().lock();
+    if let Err(err) = out.write_all(seq.as_bytes()).and_then(|()| out.flush()) {
+        tracing::warn!(error = %err, "could not write the clipboard sequence");
+    }
+}
+
 /// Apply one message, record submitted lines and forward the effects.
 /// Returns whether the user quit.
 fn apply(
@@ -230,6 +241,9 @@ fn apply(
     histories: &mut [History],
 ) -> Result<bool, UiError> {
     let effects_now = app.update(msg);
+    if let Some(text) = app.take_clipboard_text() {
+        write_clipboard(&text);
+    }
     for entry in app.take_submitted() {
         for history in histories.iter_mut() {
             if let Err(err) = history.append(&entry) {

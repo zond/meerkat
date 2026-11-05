@@ -459,3 +459,32 @@ fn model_picker_snapshot() {
     assert_eq!(buffer[(3, 3)].fg, Color::Cyan);
     assert_eq!(buffer[(3, 8)].fg, Color::Yellow);
 }
+
+#[test]
+fn selected_cells_render_reversed() {
+    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let mouse = |kind, column| {
+        Msg::Mouse(MouseEvent {
+            kind,
+            column,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    let mut app = sample_app();
+    // The first draw records which logical line each row shows.
+    render_buffer(&mut app, W, H);
+    app.update(mouse(MouseEventKind::Down(MouseButton::Left), 2));
+    app.update(mouse(MouseEventKind::Drag(MouseButton::Left), 5));
+    let buffer = render_buffer(&mut app, W, H);
+    assert_eq!(rows(&buffer)[0], "› list files");
+    let reversed: Vec<u16> = (0..W)
+        .filter(|&x| buffer[(x, 0)].modifier.contains(Modifier::REVERSED))
+        .collect();
+    assert_eq!(reversed, vec![2, 3, 4, 5]);
+    // Other transcript rows are untouched.
+    assert!((0..W).all(|x| !buffer[(x, 2)].modifier.contains(Modifier::REVERSED)));
+
+    app.update(mouse(MouseEventKind::Up(MouseButton::Left), 5));
+    assert_eq!(app.take_clipboard_text().as_deref(), Some("list"));
+}
