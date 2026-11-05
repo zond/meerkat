@@ -20,6 +20,7 @@ pub mod cli;
 pub mod delivery;
 pub mod error;
 pub mod memory;
+pub mod models;
 pub mod paths;
 pub mod runner;
 pub mod session;

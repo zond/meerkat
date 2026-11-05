@@ -145,6 +145,7 @@ pub async fn bootstrap_in(
 ) -> Result<Runtime, TuiError> {
     let mut config = config;
     force_inproc_comms(&mut config);
+    disable_engine_auto_compaction(&mut config);
     let (model, provider) = resolve_model_and_provider(args, &config)?;
 
     let (manifest, persistence) = meerkat::open_realm_persistence_in(
@@ -209,6 +210,23 @@ pub async fn bootstrap_in(
 fn force_inproc_comms(config: &mut Config) {
     config.comms.mode = CommsRuntimeMode::Inproc;
     config.comms.auto_enable_for_subagents = false;
+}
+
+/// `compaction.auto_compact_threshold` that the engine never reaches: it must
+/// stay > 0 (config validation), and the engine only compares against it.
+pub const ENGINE_COMPACT_THRESHOLD_DISABLED: u64 = u64::MAX / 4;
+
+/// The engine's auto-compaction keeps the last `recent_turn_budget` *user*
+/// turns; in agentic sessions one user turn spans dozens of tool messages, so
+/// it often discards nothing and re-triggers every few tool rounds. The TUI
+/// decides instead (see [`crate::ui::compaction`]) and compacts with its own
+/// `/compact`. The other `compaction` settings still feed `/compact`.
+fn disable_engine_auto_compaction(config: &mut Config) {
+    tracing::info!(
+        configured = config.compaction.auto_compact_threshold,
+        "engine auto-compaction disabled; rkat-tui warns or runs /compact itself"
+    );
+    config.compaction.auto_compact_threshold = ENGINE_COMPACT_THRESHOLD_DISABLED;
 }
 
 /// Shell basenames whose `-c` syntax the Tier-1 lexer models.

@@ -221,3 +221,27 @@ async fn workspace_state_survives_a_rename() {
     let (text, _) = run_turn(&resumed, "still here?").await;
     assert_eq!(text, "ok");
 }
+
+#[tokio::test]
+async fn bootstrap_disables_engine_auto_compaction() {
+    let project = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let rt = runtime(project.path(), state.path()).await;
+    // The config handed to the session builder: the engine never reaches the
+    // threshold, the TUI's gauge decides instead.
+    assert_eq!(
+        rt.config.compaction.auto_compact_threshold,
+        bootstrap::ENGINE_COMPACT_THRESHOLD_DISABLED
+    );
+    assert!(rt.config.compaction.auto_compact_threshold > 0);
+    // The rest still feeds `/compact`.
+    let defaults = meerkat_core::config::CompactionRuntimeConfig::default();
+    assert_eq!(
+        rt.config.compaction.recent_turn_budget,
+        defaults.recent_turn_budget
+    );
+    assert_eq!(
+        rt.config.compaction.max_summary_tokens,
+        defaults.max_summary_tokens
+    );
+}

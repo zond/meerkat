@@ -53,6 +53,9 @@ interpreters, package-manager run commands) are dropped when auto mode starts.
 enabled = true
 classifier_model = "claude-sonnet-4-6"   # optional, per-provider default otherwise
 trust_project_builds = true              # cargo build/test/check are tier 1
+compact = "warn"                         # or "auto"; see "Context and compaction"
+compact_warn_percent = 75
+compact_auto_percent = 85
 
 [[allow]]
 tool = "shell"
@@ -86,10 +89,18 @@ model never received to `<workspace>/.rkat/tui/tui_unsent.txt` (the next start
 says so).
 
 `/help`, `/quit`, `/clear`, `/resume [ref]`, `/rules [list|add allow|deny <tool> [pattern]|rm <n>]`,
-`/auto [on|off|resume]`, `/model <id>`, `/remember <text>`, `/compact`.
-`/clear`, `/resume`, `/model <id>` and `/compact` work only while idle (no turn
+`/auto [on|off|resume]`, `/model [id|refresh]`, `/remember <text>`, `/compact`.
+`/clear`, `/resume`, `/model` and `/compact` work only while idle (no turn
 running, nothing queued); the transcript is replaced only once the new session
 is live.
+
+`/model` without an id opens a picker over the models the provider's
+list-models endpoint reports for your key (current model first; ↑/↓, type to
+filter, Enter switches, Esc closes), with display name and context window where
+the endpoint gives them. The list is fetched once in the background at start-up
+(10 s timeout) and cached; `/model refresh` refetches it. When the endpoint
+fails the picker shows only the current model and the error; `/model <id>`
+still switches directly. Only the session's provider is listed.
 
 A single-line prompt starting with `#` (`# use cargo nextest`) is the same as
 `/remember`; `##…`, multi-line input and `\#…` are sent as prompts.
@@ -97,7 +108,9 @@ A single-line prompt starting with `#` (`# use cargo nextest`) is the same as
 The status bar shows a context gauge, `ctx 42% (84k/200k)`, yellow from 70%
 and red from 90% (`~` marks an estimate, e.g. right after `/resume` or
 `/compact`, or a window borrowed from a related model or the provider default
-for a model the catalog does not know).
+for a model the catalog does not know). The window comes from the provider's
+list-models endpoint when it reports one (Anthropic, Gemini); otherwise (OpenAI,
+or the fetch failed) from the curated catalog.
 
 ## Instructions and memory
 
@@ -137,6 +150,23 @@ summary. The messages the summary replaced are indexed into the realm's
 semantic memory, so the agent can still find them with `memory_search` in this
 and later sessions. The semantic index is single-writer: a second `rkat-tui`
 on the same workspace runs without `memory_search` and says so at start-up.
+
+### Context and compaction
+
+Meerkat's built-in auto-compaction is switched off (its compactor keeps whole
+user turns, which in agentic sessions often frees nothing); rkat-tui decides
+instead, after every turn, from the context gauge. With `compact = "warn"`
+(the default, `[auto]` in `tui.toml`, any layer including the project file)
+it warns once when the context crosses `compact_warn_percent` (75%) and after
+every turn from `compact_auto_percent` (85%) on, suggesting `/compact`. With
+`compact = "auto"` (or `--auto-compact`; `--no-auto-compact` forces warnings)
+it runs `/compact` itself at `compact_auto_percent`, once the turn is over and
+nothing is queued; messages typed meanwhile wait for it. When a compaction frees
+nothing it is not retried until usage grows another 10 points. For a model
+whose window is unknown the thresholds are 120k (warn) and 150k (auto) tokens.
+`compact_auto_percent` below `compact_warn_percent` is raised to it, with a
+notice. The realm config's other `[compaction]` settings still apply to
+`/compact` (which keeps at most two turns).
 
 ## Where things live
 

@@ -382,3 +382,62 @@ fn status_bar_shows_context_gauge_with_threshold_colours() {
     assert_eq!(rows.len(), usize::from(H));
     assert!(rows[11].chars().count() <= 40);
 }
+
+#[test]
+fn model_picker_snapshot() {
+    use meerkat_tui::models::{ModelEntry, ModelSource};
+    let entry = |id: &str, name: &str, window: Option<u64>, source| ModelEntry {
+        id: id.into(),
+        display_name: Some(name.into()),
+        source,
+        context_window: window,
+        max_output_tokens: None,
+    };
+    let mut status = StatusInfo::default();
+    status.set_model("anthropic", "claude-sonnet-4-6");
+    let mut app = App::new(status);
+    app.update(Msg::ShowModelPicker(
+        vec![
+            entry(
+                "claude-sonnet-4-6",
+                "Sonnet 4.6",
+                Some(1_000_000),
+                ModelSource::Current,
+            ),
+            entry(
+                "claude-opus-4-6",
+                "Opus 4.6",
+                Some(200_000),
+                ModelSource::Provider,
+            ),
+            entry("claude-haiku-4-5", "Haiku 4.5", None, ModelSource::Provider),
+        ],
+        Some("HTTP 500".into()),
+    ));
+    app.update(Msg::Key(ratatui::crossterm::event::KeyEvent::from(
+        ratatui::crossterm::event::KeyCode::Down,
+    )));
+    let mut terminal = Terminal::new(TestBackend::new(72, H)).unwrap();
+    terminal
+        .draw(|f| draw_at(f, &mut app, Instant::now()))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let all = rows(buffer);
+    let modal: Vec<&str> = all[2..9].iter().map(String::as_str).collect();
+    assert_eq!(
+        modal,
+        vec![
+            "  ┌ Select model ────────────────────────────────────────────────────┐",
+            "  │filter: (type to filter)                                          │",
+            "  │HTTP 500                                                          │",
+            "  │claude-sonnet-4-6  Sonnet 4.6  1M ctx  current                    │",
+            "  │claude-opus-4-6    Opus 4.6  200k ctx  provider                   │",
+            "  │claude-haiku-4-5   Haiku 4.5  provider                            │",
+            "  │↑/↓ move · Enter select · Esc close                               │",
+        ]
+    );
+    // The selection (moved down once) is highlighted; the warning is yellow.
+    assert!(buffer[(3, 6)].modifier.contains(Modifier::REVERSED));
+    assert!(!buffer[(3, 5)].modifier.contains(Modifier::REVERSED));
+    assert_eq!(buffer[(3, 4)].fg, Color::Yellow);
+}

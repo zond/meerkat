@@ -10,6 +10,7 @@
 //! (committed with the repository, therefore untrusted: it may only add deny
 //! rules and `[auto]` settings, and may not loosen `trust_project_builds`).
 
+use crate::ui::compaction::{CompactMode, CompactionPolicy};
 use globset::{Glob, GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -624,15 +625,43 @@ pub struct AutoSettings {
     /// Whether `cargo build|test|nextest|check|clippy` are Tier 1. Off by
     /// default: builds execute project code (`build.rs`, tests, proc macros).
     pub trust_project_builds: bool,
+    /// What to do when the context fills up: warn (default) or run
+    /// `/compact` automatically.
+    pub compact: CompactMode,
+    /// Context usage (percent of the window) at which to warn once.
+    pub compact_warn_percent: u8,
+    /// Context usage (percent of the window) at which to auto-compact, or to
+    /// warn after every turn in warn mode. Never below `compact_warn_percent`
+    /// after [`load_layered`].
+    pub compact_auto_percent: u8,
 }
 
 impl Default for AutoSettings {
     fn default() -> Self {
+        let compaction = CompactionPolicy::default();
         Self {
             enabled: true,
             classifier_model: None,
             trust_project_builds: false,
+            compact: compaction.mode,
+            compact_warn_percent: compaction.warn_percent,
+            compact_auto_percent: compaction.auto_percent,
         }
+    }
+}
+
+impl AutoSettings {
+    /// The UI's context-compaction policy, with `mode` (from
+    /// `--auto-compact`/`--no-auto-compact`) overriding [`Self::compact`].
+    #[must_use]
+    pub fn compaction_policy(&self, mode: Option<CompactMode>) -> CompactionPolicy {
+        CompactionPolicy {
+            mode: mode.unwrap_or(self.compact),
+            warn_percent: self.compact_warn_percent,
+            auto_percent: self.compact_auto_percent,
+        }
+        .normalized()
+        .0
     }
 }
 
@@ -649,6 +678,15 @@ pub struct AutoSection {
     /// See [`AutoSettings::trust_project_builds`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_project_builds: Option<bool>,
+    /// See [`AutoSettings::compact`] (`"warn"` or `"auto"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact: Option<CompactMode>,
+    /// See [`AutoSettings::compact_warn_percent`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_warn_percent: Option<u8>,
+    /// See [`AutoSettings::compact_auto_percent`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_auto_percent: Option<u8>,
 }
 
 /// One `[[allow]]` / `[[deny]]` entry.
@@ -758,6 +796,14 @@ pub enum Notice {
         /// Where the global rules file now lives.
         new_path: PathBuf,
     },
+    /// The layered `compact_warn_percent`/`compact_auto_percent` were out of
+    /// range (`1..=100`, auto ≥ warn) and were clamped.
+    CompactPercentClamped {
+        /// The configured `(warn, auto)` percentages.
+        configured: (u8, u8),
+        /// The `(warn, auto)` percentages in effect.
+        applied: (u8, u8),
+    },
 }
 
 impl fmt::Display for Notice {
@@ -793,6 +839,13 @@ impl fmt::Display for Notice {
                 "{} is no longer read; move it to {}",
                 path.display(),
                 new_path.display()
+            ),
+            Self::CompactPercentClamped {
+                configured: (warn, auto),
+                applied: (applied_warn, applied_auto),
+            } => write!(
+                f,
+                "[auto] compact_warn_percent = {warn}, compact_auto_percent = {auto} are out of range (1..=100, auto ≥ warn); using {applied_warn} and {applied_auto}"
             ),
         }
     }
@@ -906,6 +959,20 @@ pub fn load_layered(
         }
         apply_auto(&mut settings, &auto);
     }
+    let (policy, clamped) = CompactionPolicy {
+        mode: settings.compact,
+        warn_percent: settings.compact_warn_percent,
+        auto_percent: settings.compact_auto_percent,
+    }
+    .normalized();
+    if clamped {
+        notices.push(Notice::CompactPercentClamped {
+            configured: (settings.compact_warn_percent, settings.compact_auto_percent),
+            applied: (policy.warn_percent, policy.auto_percent),
+        });
+        settings.compact_warn_percent = policy.warn_percent;
+        settings.compact_auto_percent = policy.auto_percent;
+    }
     Ok((rules, settings, notices))
 }
 
@@ -918,6 +985,15 @@ fn apply_auto(settings: &mut AutoSettings, auto: &AutoSection) {
     }
     if let Some(trust) = auto.trust_project_builds {
         settings.trust_project_builds = trust;
+    }
+    if let Some(mode) = auto.compact {
+        settings.compact = mode;
+    }
+    if let Some(percent) = auto.compact_warn_percent {
+        settings.compact_warn_percent = percent;
+    }
+    if let Some(percent) = auto.compact_auto_percent {
+        settings.compact_auto_percent = percent;
     }
 }
 
@@ -1086,6 +1162,7 @@ mod tests {
                 enabled: Some(true),
                 classifier_model: Some("claude-sonnet-4-6".into()),
                 trust_project_builds: Some(false),
+                ..AutoSection::default()
             }),
             allow: vec![
                 RuleEntry {
@@ -1374,6 +1451,98 @@ mod tests {
                 .unwrap()
                 .broad_reason()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn compaction_settings_default_layer_and_clamp() {
+        let defaults = AutoSettings::default();
+        assert_eq!(defaults.compact, CompactMode::Warn);
+        assert_eq!(
+            (defaults.compact_warn_percent, defaults.compact_auto_percent),
+            (75, 85)
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global.toml");
+        let realm = tmp.path().join("realm");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&realm).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let (_, settings, notices) =
+            load_layered(&realm, Some(&global), &project, RealmTrust::Owned).unwrap();
+        assert_eq!(settings, defaults);
+        assert!(notices.is_empty());
+
+        std::fs::write(
+            &global,
+            "[auto]\ncompact = \"auto\"\ncompact_warn_percent = 60\ncompact_auto_percent = 70\n",
+        )
+        .unwrap();
+        std::fs::write(
+            realm.join(RULES_FILE_NAME),
+            "[auto]\ncompact_auto_percent = 90\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(RULES_FILE_NAME),
+            "[auto]\ncompact = \"warn\"\n",
+        )
+        .unwrap();
+        let (_, settings, notices) =
+            load_layered(&realm, Some(&global), &project, RealmTrust::Owned).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(
+            settings.compact,
+            CompactMode::Warn,
+            "the project layer may set it"
+        );
+        assert_eq!(
+            (settings.compact_warn_percent, settings.compact_auto_percent),
+            (60, 90)
+        );
+        let policy = settings.compaction_policy(None);
+        assert_eq!(policy.mode, CompactMode::Warn);
+        assert_eq!((policy.warn_percent, policy.auto_percent), (60, 90));
+        assert_eq!(
+            settings.compaction_policy(Some(CompactMode::Auto)).mode,
+            CompactMode::Auto,
+            "--auto-compact overrides the file"
+        );
+
+        // auto below warn is clamped up, with a notice.
+        std::fs::write(
+            project.join(RULES_FILE_NAME),
+            "[auto]\ncompact_warn_percent = 95\ncompact_auto_percent = 80\n",
+        )
+        .unwrap();
+        let (_, settings, notices) =
+            load_layered(&realm, Some(&global), &project, RealmTrust::Owned).unwrap();
+        assert_eq!(
+            (settings.compact_warn_percent, settings.compact_auto_percent),
+            (95, 95)
+        );
+        assert_eq!(
+            notices,
+            vec![Notice::CompactPercentClamped {
+                configured: (95, 80),
+                applied: (95, 95),
+            }]
+        );
+
+        std::fs::write(
+            project.join(RULES_FILE_NAME),
+            "[auto]\ncompact = \"always\"\n",
+        )
+        .unwrap();
+        assert!(load_layered(&realm, Some(&global), &project, RealmTrust::Owned).is_err());
+        std::fs::write(
+            project.join(RULES_FILE_NAME),
+            "[auto]\ncompact_warn_percent = 300\n",
+        )
+        .unwrap();
+        assert!(
+            load_layered(&realm, Some(&global), &project, RealmTrust::Owned).is_err(),
+            "u8 overflow is a parse error"
         );
     }
 

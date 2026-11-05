@@ -42,6 +42,17 @@ pub enum AutoCommand {
     Resume,
 }
 
+/// `/model` subcommands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelCommand {
+    /// `/model`: open the picker (from the cached provider list).
+    Pick,
+    /// `/model refresh`: refetch the provider list, then open the picker.
+    Refresh,
+    /// `/model <id>`: switch to this model.
+    Set(String),
+}
+
 /// A parsed slash command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -55,8 +66,8 @@ pub enum Command {
     Rules(RulesCommand),
     /// `/auto [on|off|resume]`.
     Auto(AutoCommand),
-    /// `/model [id]`.
-    Model(Option<String>),
+    /// `/model [id | refresh]`.
+    Model(ModelCommand),
     /// `/help`.
     Help,
     /// `/remember <text>` or a single-line `#text` input: append a line to the
@@ -100,9 +111,13 @@ Commands:
   /rules rm <n>                  remove rule n
   /auto                          show auto-mode state and denial counters
   /auto on|off|resume            enable, disable, or resume auto mode after a pause
-  /model [id]                    show the model, or switch it (idle only)
+  /model                         pick a model from the provider's list (type to filter)
+  /model <id>                    switch to a model (idle only)
+  /model refresh                 refetch the provider's model list and pick
   /remember <text>, #<text>      add a line to the workspace AGENTS.md (\\# sends a literal #)
   /compact                       summarise the conversation to free context (idle only)
+                                 (tui.toml [auto] compact = \"warn\" (default) warns at 75%;
+                                 \"auto\" or --auto-compact runs it at 85%)
 Keys:
   Enter                          send; while the agent is working, queues the message
                                  and delivers it at the next step
@@ -185,9 +200,10 @@ fn parse_command(name: &str, args: &[&str]) -> Result<Command, CommandError> {
             _ => Err(CommandError::Usage("/resume [last | ~N | id-prefix]")),
         },
         "model" => match args {
-            [] => Ok(Command::Model(None)),
-            [m] => Ok(Command::Model(Some((*m).to_string()))),
-            _ => Err(CommandError::Usage("/model <id>")),
+            [] => Ok(Command::Model(ModelCommand::Pick)),
+            ["refresh"] => Ok(Command::Model(ModelCommand::Refresh)),
+            [m] => Ok(Command::Model(ModelCommand::Set((*m).to_string()))),
+            _ => Err(CommandError::Usage("/model [id | refresh]")),
         },
         "auto" => match args {
             [] => Ok(Command::Auto(AutoCommand::Status)),
@@ -248,8 +264,16 @@ mod tests {
         assert_eq!(ok("/help"), Command::Help);
         assert_eq!(ok("/resume"), Command::Resume(None));
         assert_eq!(ok("/resume ~2"), Command::Resume(Some("~2".into())));
-        assert_eq!(ok("/model gpt-5.4"), Command::Model(Some("gpt-5.4".into())));
-        assert_eq!(ok("/model"), Command::Model(None));
+        assert_eq!(
+            ok("/model gpt-5.4"),
+            Command::Model(ModelCommand::Set("gpt-5.4".into()))
+        );
+        assert_eq!(ok("/model"), Command::Model(ModelCommand::Pick));
+        assert_eq!(ok("/model refresh"), Command::Model(ModelCommand::Refresh));
+        assert!(matches!(
+            parse("/model a b"),
+            Some(Err(CommandError::Usage(_)))
+        ));
     }
 
     #[test]
@@ -361,7 +385,8 @@ mod tests {
             "newest queued message",
             "delivers it at the next step",
             "press again",
-            "switch it (idle only)",
+            "switch to a model (idle only)",
+            "/model refresh",
         ] {
             assert!(HELP_TEXT.contains(needle), "help is missing {needle}");
         }

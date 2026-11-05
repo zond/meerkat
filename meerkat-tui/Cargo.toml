@@ -46,6 +46,7 @@ tracing-subscriber = { workspace = true }
 dirs = { workspace = true }
 indexmap = { workspace = true }
 parking_lot = { workspace = true }
+reqwest = { workspace = true }
 
 # Terminal UI
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }

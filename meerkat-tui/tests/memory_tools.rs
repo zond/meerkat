@@ -59,6 +59,7 @@ fn harness() -> Harness {
             enabled: true,
             classifier_model: None,
             trust_project_builds: true,
+            ..AutoSettings::default()
         },
         classifier: classifier.clone(),
         broker: None,

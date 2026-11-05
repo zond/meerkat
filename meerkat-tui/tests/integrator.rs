@@ -8,19 +8,25 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::{ScriptedLlmClient, Step, all_text, isolated_args, within};
 use meerkat::SessionStore;
 use meerkat_client::LlmClient;
+use meerkat_core::Provider;
 use meerkat_core::service::{SessionQuery, SessionService};
 use meerkat_core::{Message, SessionId};
+use meerkat_tui::bootstrap::credentials::ProviderCredentials;
 use meerkat_tui::bootstrap::{self, TuiSessionService};
 use meerkat_tui::delivery::PendingId;
-use meerkat_tui::runner::testing::{IntegratorHarness, spawn_integrator_for_tests};
+use meerkat_tui::models::ModelSource;
+use meerkat_tui::runner::testing::{IntegratorHarness, spawn_integrator_with_model_list};
 use meerkat_tui::session::load_session;
 use meerkat_tui::ui::{Effect, Msg, NoticeLevel, StatusUpdate};
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::{Notify, mpsc};
 
 const OTHER_MODEL: &str = "claude-sonnet-4-5";
@@ -40,6 +46,10 @@ struct Rig {
 
 impl Rig {
     async fn new(script: Vec<Step>) -> Self {
+        Self::with_model_list(script, None).await
+    }
+
+    async fn with_model_list(script: Vec<Step>, creds: Option<ProviderCredentials>) -> Self {
         let project_dir = tempfile::tempdir().unwrap();
         let state_dir = tempfile::tempdir().unwrap();
         let project = std::fs::canonicalize(project_dir.path()).unwrap();
@@ -61,7 +71,7 @@ impl Rig {
             first_session,
             unsent_path,
             task,
-        } = spawn_integrator_for_tests(runtime)
+        } = spawn_integrator_with_model_list(runtime, creds)
             .await
             .expect("integrator");
         // The UI would render these; nobody may let the session task block.
@@ -317,4 +327,108 @@ async fn quit_mid_turn_interrupts_persists_and_saves_unsent() {
         users.iter().any(|t| t.contains("FIRST-PROMPT")),
         "{users:?}"
     );
+}
+
+/// A stub Anthropic `/v1/models` endpoint answering every request with
+/// `body`; returns its base URL and a request counter.
+async fn models_stub(body: &'static str) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+#[tokio::test]
+async fn model_list_feeds_the_gauge_and_the_picker() {
+    let (base, hits) = models_stub(
+        r#"{"data":[{"id":"claude-opus-4-6","display_name":"Opus"},{"id":"claude-sonnet-4-6","display_name":"Sonnet","max_input_tokens":123456}],"has_more":false}"#,
+    )
+    .await;
+    let creds = ProviderCredentials {
+        provider: Provider::Anthropic,
+        api_key: "test-key".to_string(),
+        base_url: Some(base),
+    };
+    let mut rig = Rig::with_model_list(Vec::new(), Some(creds)).await;
+    // Start-up fetch: the gauge window comes from the endpoint.
+    rig.expect("endpoint window", |m| {
+        matches!(m, Msg::Status(StatusUpdate::ContextWindow(Some(123_456))))
+    })
+    .await;
+
+    rig.send(Effect::RequestModelPicker { refresh: false });
+    let Msg::ShowModelPicker(items, warning) = rig
+        .expect("picker", |m| matches!(m, Msg::ShowModelPicker(..)))
+        .await
+    else {
+        unreachable!()
+    };
+    assert!(warning.is_none());
+    let ids: Vec<(&str, ModelSource)> = items.iter().map(|e| (e.id.as_str(), e.source)).collect();
+    assert_eq!(
+        ids,
+        vec![
+            ("claude-sonnet-4-6", ModelSource::Current),
+            ("claude-opus-4-6", ModelSource::Provider),
+        ]
+    );
+    assert_eq!(items[0].context_window, Some(123_456));
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "picker reuses the cache");
+
+    rig.send(Effect::RequestModelPicker { refresh: true });
+    rig.expect("refreshed picker", |m| {
+        matches!(m, Msg::ShowModelPicker(..))
+    })
+    .await;
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "refresh refetches");
+
+    // The endpoint has no window for opus: the catalog estimate is used.
+    rig.send(Effect::SetModel("claude-opus-4-6".to_string()));
+    rig.expect("fallback window", |m| {
+        matches!(
+            m,
+            Msg::Status(StatusUpdate::ContextWindow(Some(w)) | StatusUpdate::ApproxContextWindow(w))
+                if *w != 123_456
+        )
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn model_picker_without_endpoint_offers_current_with_warning() {
+    let mut rig = Rig::new(Vec::new()).await;
+    rig.send(Effect::RequestModelPicker { refresh: false });
+    let Msg::ShowModelPicker(items, warning) = rig
+        .expect("picker", |m| matches!(m, Msg::ShowModelPicker(..)))
+        .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, "claude-sonnet-4-6");
+    assert_eq!(items[0].source, ModelSource::Current);
+    assert!(warning.is_some());
 }

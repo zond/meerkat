@@ -125,6 +125,7 @@ fn harness(opts: Options) -> Harness {
             enabled: opts.enabled,
             classifier_model: None,
             trust_project_builds: opts.trust_project_builds,
+            ..AutoSettings::default()
         },
         classifier: classifier.clone(),
         broker,

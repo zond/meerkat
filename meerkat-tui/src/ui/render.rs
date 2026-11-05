@@ -227,7 +227,7 @@ pub fn fmt_tokens(n: u64) -> String {
 }
 
 /// Short token count for the context gauge: `950`, `8.5k`, `84k`, `1M`, `1.2M`.
-fn fmt_ctx_tokens(n: u64) -> String {
+pub(crate) fn fmt_ctx_tokens(n: u64) -> String {
     let (value, unit) = match n {
         0..1_000 => return n.to_string(),
         1_000..10_000 => (format!("{:.1}", n as f64 / 1_000.0), "k"),

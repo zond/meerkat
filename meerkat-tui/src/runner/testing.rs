@@ -23,6 +23,7 @@ use crate::approval::escalation::EscalationBroker;
 use crate::approval::rules::{AutoSettings, RuleSet};
 use crate::approval::{ApprovalConfig, ApprovalEngine};
 use crate::bootstrap::Runtime;
+use crate::bootstrap::credentials::ProviderCredentials;
 use crate::error::TuiError;
 use crate::memory::{MemoryToolDispatcher, NoteStore, Scope};
 use crate::session::SessionHandle;
@@ -48,12 +49,26 @@ pub struct IntegratorHarness {
     pub task: JoinHandle<Option<SavedUnsent>>,
 }
 
-/// Spawn an integrator on `runtime` with a fresh first session.
+/// Spawn an integrator on `runtime` with a fresh first session and no
+/// list-models endpoint (`/model` offers only the current model).
 ///
 /// # Errors
 ///
 /// When the approval engine or the first session cannot be built.
 pub async fn spawn_integrator_for_tests(runtime: Runtime) -> Result<IntegratorHarness, TuiError> {
+    spawn_integrator_with_model_list(runtime, None).await
+}
+
+/// Like [`spawn_integrator_for_tests`], fetching the model list with `creds`
+/// (point `base_url` at a stub server).
+///
+/// # Errors
+///
+/// When the approval engine or the first session cannot be built.
+pub async fn spawn_integrator_with_model_list(
+    runtime: Runtime,
+    creds: Option<ProviderCredentials>,
+) -> Result<IntegratorHarness, TuiError> {
     let (approval_tx, approval_rx) = mpsc::unbounded_channel();
     let (broker, escalation_rx) = EscalationBroker::new(ESCALATION_CAPACITY);
     let root = runtime.scope.project_root.clone();
@@ -113,6 +128,7 @@ pub async fn spawn_integrator_for_tests(runtime: Runtime) -> Result<IntegratorHa
         approval_rx,
         diff_rx,
         last_context: None,
+        creds,
     });
     Ok(IntegratorHarness {
         effects,

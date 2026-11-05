@@ -11,17 +11,27 @@ use meerkat_core::service::SessionError;
 use meerkat_core::{AgentEvent, EventEnvelope, Message, Session};
 use tokio::sync::mpsc;
 
-use super::{Integrator, blocks_from_session, provider_name, window_status};
+use super::{Integrator, blocks_from_session, provider_name};
 use crate::bootstrap::instructions::{append_remember_line, remember_target, remembered_context};
 use crate::error::TuiError;
 use crate::session::lifecycle::{
-    compact_session, estimate_tokens, index_discarded, retire_session,
+    CompactError, compact_session, estimate_tokens, index_discarded, retire_session,
 };
 use crate::session::{SessionHandle, load_session, resolve_session_ref};
-use crate::ui::{Msg, NoticeLevel, StatusUpdate};
+use crate::ui::{CompactFailure, Msg, NoticeLevel, StatusUpdate};
 
 /// Capacity of the compaction event channel.
 const COMPACTION_EVENT_CAPACITY: usize = 16;
+
+/// The UI's view of a [`CompactError`]: whether retrying at the same usage
+/// is pointless ([`CompactFailure::NoGain`]/[`CompactFailure::TooShort`]).
+fn compact_failure(err: CompactError) -> CompactFailure {
+    match err {
+        CompactError::NoGain(messages) => CompactFailure::NoGain(messages),
+        CompactError::TooShort(messages) => CompactFailure::TooShort(messages),
+        other => CompactFailure::Other(other.to_string()),
+    }
+}
 
 impl Integrator {
     /// Whether a turn (or a delivery still being reconciled) blocks a session
@@ -180,28 +190,20 @@ impl Integrator {
         Ok(())
     }
 
-    /// Context window of the current model, for the gauge.
-    pub(super) fn push_context_window(&self) {
-        self.send(Msg::Status(window_status(
-            self.session.provider(),
-            &self.current_model,
-        )));
-    }
-
     /// `/compact`: summarize the history, index what the summary replaces
     /// into the semantic memory, and rebuild the session (same id) from the
     /// compacted history, which also reloads instructions and notes.
     pub(super) async fn compact(&mut self) {
         if self.turn.is_some() || !self.inflight.is_empty() {
-            self.send(Msg::CompactFinished(Err(
+            self.send(Msg::CompactFinished(Err(CompactFailure::Other(
                 "cannot compact while a turn is running".to_string(),
-            )));
+            ))));
             return;
         }
         if self.dead {
-            self.send(Msg::CompactFinished(Err(
+            self.send(Msg::CompactFinished(Err(CompactFailure::Other(
                 "no live session; use /resume last".to_string(),
-            )));
+            ))));
             return;
         }
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(COMPACTION_EVENT_CAPACITY);
@@ -231,7 +233,7 @@ impl Integrator {
         let compacted = match result {
             Ok(compacted) => compacted,
             Err(err) => {
-                self.send(Msg::CompactFinished(Err(err.to_string())));
+                self.send(Msg::CompactFinished(Err(compact_failure(err))));
                 return;
             }
         };
@@ -292,7 +294,7 @@ impl Integrator {
                     "compaction not applied to the live session ({err}); the compacted copy is saved, the session continues uncompacted"
                 );
                 self.notice(NoticeLevel::Warn, text.clone());
-                self.send(Msg::CompactFinished(Err(text)));
+                self.send(Msg::CompactFinished(Err(CompactFailure::Other(text))));
             }
             Err(restore) => {
                 tracing::warn!(error = %restore, "could not restore the session after compaction");
@@ -301,7 +303,7 @@ impl Integrator {
                     "no live session ({err}); the compacted session is saved: use /resume last"
                 );
                 self.notice(NoticeLevel::Error, text.clone());
-                self.send(Msg::CompactFinished(Err(text)));
+                self.send(Msg::CompactFinished(Err(CompactFailure::Other(text))));
             }
         }
     }

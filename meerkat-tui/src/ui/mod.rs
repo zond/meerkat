@@ -5,6 +5,7 @@
 //! Everything the integrator wants to show is pushed back in as a [`Msg`].
 
 pub mod commands;
+pub mod compaction;
 pub mod delivery;
 pub mod history;
 pub mod input;
@@ -17,18 +18,22 @@ pub mod search;
 pub mod transcript;
 
 use crate::delivery::{CONTINUATION_PROMPT, DeliveryReport, InjectFailure, PendingId};
+use crate::models::ModelEntry;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use meerkat_core::{AgentEvent, EventEnvelope, ScopedAgentEvent};
 use ratatui::crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
 
-pub use commands::{AutoCommand, Command, CommandError, RuleEffect, RulesCommand};
+pub use commands::{AutoCommand, Command, CommandError, ModelCommand, RuleEffect, RulesCommand};
+pub use compaction::{CompactFailure, CompactMode, CompactionGauge, CompactionPolicy, GaugeAction};
 pub use delivery::{Pending, PendingQueue, PendingState};
 pub use history::History;
 pub use input::InputEditor;
 pub use keymap::{Action, EditAction};
-pub use modal::{EscalationAnswer, EscalationId, EscalationPrompt, Modal, ResumePicker};
+pub use modal::{
+    EscalationAnswer, EscalationId, EscalationPrompt, Modal, ModelPicker, ResumePicker,
+};
 pub use runtime::{TerminalGuard, UiChannels, UiError, install_panic_hook, run_ui};
 pub use search::{HistorySearch, SearchOutcome};
 pub use transcript::{Block, BlockId, DiffView, NoticeLevel, QueuedLabel, ToolState, Transcript};
@@ -198,10 +203,13 @@ pub enum Msg {
     Status(StatusUpdate),
     /// Open the resume picker with `(ref, label)` items.
     ShowResumePicker(Vec<(String, String)>),
+    /// Open the model picker (answer to [`Effect::RequestModelPicker`]): the
+    /// models, current first, and a warning when the provider list failed.
+    ShowModelPicker(Vec<ModelEntry>, Option<String>),
     /// Replace the transcript (e.g. after resuming a session).
     ResetTranscript(Vec<Block>),
     /// `/compact` finished (the integrator rebuilt the session).
-    CompactFinished(Result<(), String>),
+    CompactFinished(Result<(), CompactFailure>),
     /// Animation tick.
     Tick,
 }
@@ -260,6 +268,12 @@ pub enum Effect {
     ResumeAutoMode,
     /// Switch model.
     SetModel(String),
+    /// Load the provider's model list (cached for the session unless
+    /// `refresh`); answer with [`Msg::ShowModelPicker`].
+    RequestModelPicker {
+        /// Refetch instead of using the cached list.
+        refresh: bool,
+    },
     /// Append a line to the workspace AGENTS.md and push it live.
     Remember(String),
     /// Compact the session's context (idle only); answered with
@@ -490,6 +504,8 @@ pub struct App {
     /// When a Ctrl-D / `/quit` was refused because work is in flight; a
     /// second one within [`QUIT_CONFIRM_WINDOW`] quits anyway.
     pub quit_confirm: Option<Instant>,
+    /// Context-gauge policy: warn about or auto-compact a filling context.
+    gauge: CompactionGauge,
     /// Whether assistant text streamed during the current turn (the turn
     /// summary is shown only when nothing did).
     streamed_text: bool,
@@ -534,6 +550,7 @@ impl App {
             chord: None,
             compacting: false,
             quit_confirm: None,
+            gauge: CompactionGauge::default(),
             streamed_text: false,
             continuation_watermark: None,
             answer_hint: false,
@@ -555,6 +572,18 @@ impl App {
     pub fn with_history(mut self, history: Vec<String>) -> Self {
         self.input = InputEditor::new().with_history(history);
         self
+    }
+
+    /// Set the context-compaction policy (default: warn at 75%, repeat at 85%).
+    #[must_use]
+    pub fn with_compaction_policy(mut self, policy: CompactionPolicy) -> Self {
+        self.gauge = CompactionGauge::new(policy);
+        self
+    }
+
+    /// The context-compaction policy in effect.
+    pub fn compaction_policy(&self) -> CompactionPolicy {
+        self.gauge.policy()
     }
 
     /// Seed the global prompt history (oldest first), searched by Ctrl-R after
@@ -730,6 +759,13 @@ impl App {
             Msg::ShowResumePicker(items) => {
                 if self.modal.is_none() {
                     self.modal = Some(Modal::Resume(ResumePicker { items, selected: 0 }));
+                }
+            }
+            Msg::ShowModelPicker(items, warning) => {
+                if self.modal.is_none() {
+                    self.modal = Some(Modal::Model(ModelPicker::new(items, warning)));
+                } else if let Some(warning) = warning {
+                    self.transcript.push_notice(NoticeLevel::Warn, warning);
                 }
             }
             Msg::ResetTranscript(blocks) => {
@@ -926,7 +962,57 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q') => self.modal = None,
                 _ => {}
             },
+            Some(Modal::Model(picker)) => match key.code {
+                _ if ctrl_c => self.modal = None,
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Up => picker.up(),
+                KeyCode::Down => picker.down(),
+                KeyCode::Backspace => picker.pop_filter(),
+                KeyCode::Enter => {
+                    let selected = picker.selected_id().map(str::to_string);
+                    if let Some(model) = selected {
+                        self.modal = None;
+                        if model != self.status.model {
+                            self.switch_model(model, fx);
+                        }
+                    }
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    picker.push_filter(c);
+                }
+                _ => {}
+            },
             None => {}
+        }
+    }
+
+    /// Whether the model may change now; pushes the reason when not.
+    fn model_switch_allowed(&mut self) -> bool {
+        if self.running || !self.pending.is_empty() {
+            self.transcript.push_notice(
+                NoticeLevel::Warn,
+                "/model is only available while idle; wait for the turn or interrupt it (Ctrl-C)",
+            );
+            false
+        } else if self.compacting {
+            self.transcript.push_notice(
+                NoticeLevel::Warn,
+                "compaction is running; wait for it to finish",
+            );
+            false
+        } else {
+            true
+        }
+    }
+
+    /// `/model <id>` or a picker selection: switch when idle.
+    fn switch_model(&mut self, model: String, fx: &mut Vec<Effect>) {
+        if self.model_switch_allowed() {
+            fx.push(Effect::SetModel(model));
         }
     }
 
@@ -1029,8 +1115,15 @@ impl App {
 
     /// `/compact` finished: send what was typed meanwhile, or hand it back to
     /// the editor when compaction failed.
-    fn compact_finished(&mut self, result: Result<(), String>, now: Instant, fx: &mut Vec<Effect>) {
+    fn compact_finished(
+        &mut self,
+        result: Result<(), CompactFailure>,
+        now: Instant,
+        fx: &mut Vec<Effect>,
+    ) {
         self.compacting = false;
+        let auto = self.gauge.auto_running();
+        self.gauge.finished(&result);
         let deferred = self
             .pending
             .take_where(|p| p.state == PendingState::Deferred);
@@ -1048,8 +1141,13 @@ impl App {
                 }
             }
             Err(err) => {
-                self.transcript
-                    .push_notice(NoticeLevel::Error, format!("compaction failed: {err}"));
+                if auto && err.is_no_gain() {
+                    self.transcript
+                        .push_notice(NoticeLevel::Info, format!("auto-compaction skipped: {err}"));
+                } else {
+                    self.transcript
+                        .push_notice(NoticeLevel::Error, format!("compaction failed: {err}"));
+                }
                 self.drop_blocks(deferred.iter().map(|p| p.block));
                 self.prepend_to_editor(deferred.into_iter().map(|p| p.text).collect());
             }
@@ -1317,6 +1415,36 @@ impl App {
             );
         }
         self.unanswered_texts = unanswered;
+        self.check_context(fx);
+    }
+
+    /// After a turn: let the context gauge warn or start an automatic
+    /// compaction (only when nothing else is going on).
+    fn check_context(&mut self, fx: &mut Vec<Effect>) {
+        let Some(used) = self.status.context_used else {
+            return;
+        };
+        let idle = !self.running
+            && !self.compacting
+            && self.pending.is_empty()
+            && self.send_next.is_none()
+            && self.modal.is_none()
+            && self.pending_escalations.is_empty();
+        match self
+            .gauge
+            .after_turn(used, self.status.context_window, idle)
+        {
+            None => {}
+            Some(GaugeAction::Warn(text)) => {
+                self.transcript.push_notice(NoticeLevel::Warn, text);
+            }
+            Some(GaugeAction::Compact(text)) => {
+                self.compacting = true;
+                self.transcript.push_notice(NoticeLevel::Info, text);
+                self.scroll.bottom();
+                fx.push(Effect::Compact);
+            }
+        }
     }
 
     /// Apply a delivery report: delivered messages become user blocks; returns
@@ -1544,27 +1672,20 @@ impl App {
                     );
                 } else {
                     self.compacting = true;
+                    self.gauge.started(self.status.context_used);
                     self.transcript
                         .push_notice(NoticeLevel::Info, "compacting…");
                     self.scroll.bottom();
                     fx.push(Effect::Compact);
                 }
             }
-            Command::Model(Some(model)) => {
-                if self.running || !self.pending.is_empty() {
-                    self.transcript.push_notice(
-                        NoticeLevel::Warn,
-                        "/model is only available while idle; wait for the turn or interrupt it (Ctrl-C)",
-                    );
-                } else if self.compacting {
-                    compacting(self);
-                } else {
-                    fx.push(Effect::SetModel(model));
+            Command::Model(ModelCommand::Set(model)) => self.switch_model(model, fx),
+            Command::Model(cmd @ (ModelCommand::Pick | ModelCommand::Refresh)) => {
+                if self.model_switch_allowed() {
+                    fx.push(Effect::RequestModelPicker {
+                        refresh: cmd == ModelCommand::Refresh,
+                    });
                 }
-            }
-            Command::Model(None) => {
-                let text = format!("model: {}/{}", self.status.provider, self.status.model);
-                self.transcript.push_notice(NoticeLevel::Info, text);
             }
             Command::Auto(AutoCommand::Status) => {
                 let (c, cm, t, tm) = self.status.denials;
@@ -2572,6 +2693,99 @@ mod tests {
         assert!(app.modal.is_none());
     }
 
+    fn picker_models() -> Vec<ModelEntry> {
+        use crate::models::ModelSource;
+        let entry = |id: &str, source| ModelEntry {
+            id: id.into(),
+            display_name: None,
+            source,
+            context_window: None,
+            max_output_tokens: None,
+        };
+        vec![
+            entry("claude-sonnet-4-6", ModelSource::Current),
+            entry("claude-opus-4-6", ModelSource::Provider),
+            entry("claude-haiku-4-5", ModelSource::Provider),
+        ]
+    }
+
+    fn app_on_sonnet() -> App {
+        let mut status = StatusInfo::default();
+        status.set_model("anthropic", "claude-sonnet-4-6");
+        App::new(status)
+    }
+
+    #[test]
+    fn model_command_requests_picker_or_refresh() {
+        let mut app = app_on_sonnet();
+        type_str(&mut app, "/model");
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            vec![Effect::RequestModelPicker { refresh: false }]
+        );
+        type_str(&mut app, "/model refresh");
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            vec![Effect::RequestModelPicker { refresh: true }]
+        );
+        let mut running = running_app();
+        type_str(&mut running, "/model");
+        assert!(running.update(key(KeyCode::Enter)).is_empty());
+    }
+
+    #[test]
+    fn model_picker_filters_and_selects() {
+        let mut app = app_on_sonnet();
+        app.update(Msg::ShowModelPicker(picker_models(), None));
+        assert!(matches!(app.modal, Some(Modal::Model(_))));
+        // `j`/`k`/`q` are filter characters here, not navigation.
+        type_str(&mut app, "haiku");
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            vec![Effect::SetModel("claude-haiku-4-5".into())]
+        );
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn model_picker_navigation_backspace_and_esc() {
+        let mut app = app_on_sonnet();
+        app.update(Msg::ShowModelPicker(picker_models(), None));
+        type_str(&mut app, "zz");
+        // Nothing matches: Enter keeps the picker open.
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert!(app.modal.is_some());
+        app.update(key(KeyCode::Backspace));
+        app.update(key(KeyCode::Backspace));
+        app.update(key(KeyCode::Down));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            vec![Effect::SetModel("claude-opus-4-6".into())]
+        );
+        // Selecting the current model changes nothing.
+        app.update(Msg::ShowModelPicker(picker_models(), None));
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert!(app.modal.is_none());
+        app.update(Msg::ShowModelPicker(picker_models(), None));
+        assert!(app.update(key(KeyCode::Esc)).is_empty());
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn model_picker_warning_becomes_notice_when_modal_busy() {
+        let mut app = app_on_sonnet();
+        app.update(Msg::ShowResumePicker(vec![("a".into(), "x".into())]));
+        app.update(Msg::ShowModelPicker(
+            picker_models(),
+            Some("could not list models".into()),
+        ));
+        assert!(matches!(app.modal, Some(Modal::Resume(_))));
+        assert!(app.transcript.blocks().iter().any(|b| matches!(
+            b,
+            Block::Notice { text, .. } if text.contains("could not list models")
+        )));
+    }
+
     #[test]
     fn status_updates_and_dirty_tracking() {
         let mut app = App::new(StatusInfo::default());
@@ -2856,7 +3070,9 @@ mod tests {
         submit(&mut app, "one");
         submit(&mut app, "two");
         type_str(&mut app, "draft");
-        let fx = app.update(Msg::CompactFinished(Err("boom".into())));
+        let fx = app.update(Msg::CompactFinished(Err(CompactFailure::Other(
+            "boom".into(),
+        ))));
         assert!(fx.is_empty());
         assert!(!app.compacting);
         assert!(!app.is_running());
@@ -2921,5 +3137,196 @@ mod tests {
         assert_eq!(app.status.context_window, Some(128_000));
         app.update(Msg::Status(StatusUpdate::ContextWindow(Some(200_000))));
         assert!(!app.status.window_approx);
+    }
+
+    fn gauge_app(mode: CompactMode) -> App {
+        let mut app = App::new(StatusInfo::default()).with_compaction_policy(CompactionPolicy {
+            mode,
+            ..CompactionPolicy::default()
+        });
+        app.update(Msg::Status(StatusUpdate::ContextWindow(Some(100_000))));
+        app
+    }
+
+    /// Run one turn that ends with `used` context tokens.
+    fn turn_at(app: &mut App, used: u64) -> Vec<Effect> {
+        assert_eq!(submit(app, "go"), vec![Effect::StartTurn("go".into())]);
+        app.update(agent(AgentEvent::TurnCompleted {
+            stop_reason: StopReason::EndTurn,
+            usage: Usage {
+                input_tokens: used,
+                ..Usage::default()
+            },
+        }));
+        app.update(finished(Ok(summary()), DeliveryReport::default()))
+    }
+
+    fn warn_count(app: &App) -> usize {
+        app.transcript
+            .blocks()
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b,
+                    Block::Notice {
+                        level: NoticeLevel::Warn,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn warn_mode_warns_once_on_crossing_then_every_turn_at_auto() {
+        let mut app = gauge_app(CompactMode::Warn);
+        assert!(turn_at(&mut app, 50_000).is_empty());
+        assert_eq!(warn_count(&app), 0);
+        assert!(turn_at(&mut app, 76_000).is_empty());
+        assert_eq!(
+            last_notice(&app),
+            Some((
+                NoticeLevel::Warn,
+                "context 76% full (76k/100k tokens); run /compact to free space".into()
+            ))
+        );
+        assert!(turn_at(&mut app, 80_000).is_empty());
+        assert_eq!(warn_count(&app), 1, "no repeat below the auto threshold");
+        assert!(
+            turn_at(&mut app, 86_000).is_empty(),
+            "warn mode never compacts"
+        );
+        assert!(turn_at(&mut app, 87_000).is_empty());
+        assert_eq!(
+            warn_count(&app),
+            3,
+            "repeats every turn at the auto threshold"
+        );
+        assert!(last_notice(&app).is_some_and(|(_, t)| t.contains("--auto-compact")));
+        assert!(!app.compacting);
+    }
+
+    #[test]
+    fn auto_mode_compacts_when_idle_and_full() {
+        let mut app = gauge_app(CompactMode::Auto);
+        assert!(turn_at(&mut app, 80_000).is_empty());
+        assert_eq!(warn_count(&app), 0);
+        assert_eq!(turn_at(&mut app, 90_000), vec![Effect::Compact]);
+        assert!(app.compacting);
+        assert_eq!(
+            last_notice(&app),
+            Some((
+                NoticeLevel::Info,
+                "context 90% full (90k/100k tokens), compacting…".into()
+            ))
+        );
+        // Prompts typed meanwhile are deferred like for a manual /compact.
+        assert!(submit(&mut app, "next").is_empty());
+        let fx = app.update(Msg::CompactFinished(Ok(())));
+        assert_eq!(fx, vec![Effect::StartTurn("next".into())]);
+    }
+
+    #[test]
+    fn auto_mode_waits_while_messages_are_pending() {
+        let mut app = gauge_app(CompactMode::Auto);
+        assert_eq!(submit(&mut app, "go"), vec![Effect::StartTurn("go".into())]);
+        // Typed mid-turn and never delivered: the next turn sends it.
+        submit(&mut app, "more");
+        app.update(agent(AgentEvent::TurnCompleted {
+            stop_reason: StopReason::EndTurn,
+            usage: Usage {
+                input_tokens: 90_000,
+                ..Usage::default()
+            },
+        }));
+        let fx = app.update(finished(
+            Ok(summary()),
+            DeliveryReport {
+                undelivered: vec![PendingId(1)],
+                ..DeliveryReport::default()
+            },
+        ));
+        assert!(!fx.contains(&Effect::Compact), "{fx:?}");
+        assert!(app.is_running());
+        assert!(!app.compacting);
+    }
+
+    #[test]
+    fn auto_mode_not_while_running_or_compacting() {
+        let mut app = gauge_app(CompactMode::Auto);
+        // Still running: TurnCompleted alone does not compact.
+        assert_eq!(submit(&mut app, "go"), vec![Effect::StartTurn("go".into())]);
+        let fx = app.update(agent(AgentEvent::TurnCompleted {
+            stop_reason: StopReason::EndTurn,
+            usage: Usage {
+                input_tokens: 95_000,
+                ..Usage::default()
+            },
+        }));
+        assert!(fx.is_empty());
+        assert!(!app.compacting);
+        // A manual /compact is running: no second one.
+        let mut app = gauge_app(CompactMode::Auto);
+        app.status.context_used = Some(95_000);
+        assert_eq!(submit(&mut app, "/compact"), vec![Effect::Compact]);
+        let mut fx = Vec::new();
+        app.check_context(&mut fx);
+        assert!(fx.is_empty());
+    }
+
+    #[test]
+    fn auto_mode_backs_off_after_no_gain() {
+        let mut app = gauge_app(CompactMode::Auto);
+        assert_eq!(turn_at(&mut app, 86_000), vec![Effect::Compact]);
+        assert!(
+            app.update(Msg::CompactFinished(Err(CompactFailure::NoGain(6))))
+                .is_empty()
+        );
+        assert_eq!(
+            last_notice(&app),
+            Some((
+                NoticeLevel::Info,
+                "auto-compaction skipped: nothing to compact: all 6 messages are recent turns"
+                    .into()
+            ))
+        );
+        assert!(turn_at(&mut app, 90_000).is_empty());
+        assert!(turn_at(&mut app, 95_000).is_empty());
+        assert_eq!(turn_at(&mut app, 96_000), vec![Effect::Compact]);
+    }
+
+    #[test]
+    fn unknown_window_falls_back_to_token_thresholds() {
+        let mut app = App::new(StatusInfo::default()).with_compaction_policy(CompactionPolicy {
+            mode: CompactMode::Auto,
+            ..CompactionPolicy::default()
+        });
+        assert!(turn_at(&mut app, 149_000).is_empty());
+        assert_eq!(turn_at(&mut app, 150_000), vec![Effect::Compact]);
+        assert_eq!(
+            last_notice(&app),
+            Some((
+                NoticeLevel::Info,
+                "context at 150k tokens, compacting…".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn auto_compact_flag_overrides_settings() {
+        let settings = crate::approval::rules::AutoSettings::default();
+        let args =
+            <crate::cli::Args as clap::Parser>::try_parse_from(["rkat-tui", "--auto-compact"])
+                .unwrap();
+        let app = App::new(StatusInfo::default())
+            .with_compaction_policy(settings.compaction_policy(args.compact_mode_override()));
+        assert_eq!(app.compaction_policy().mode, CompactMode::Auto);
+        assert_eq!(
+            App::new(StatusInfo::default())
+                .with_compaction_policy(settings.compaction_policy(None))
+                .compaction_policy()
+                .mode,
+            CompactMode::Warn
+        );
     }
 }

@@ -3,6 +3,8 @@
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
+use crate::ui::compaction::CompactMode;
+
 /// Interactive coding harness for Meerkat.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "rkat-tui", version)]
@@ -72,7 +74,8 @@ pub struct Args {
     #[arg(long)]
     pub classifier_model: Option<String>,
 
-    /// Capture mouse events (disables native terminal text selection).
+    /// Capture mouse events for wheel scrolling and click-to-toggle. Off by
+    /// default so the terminal's native text selection keeps working.
     #[arg(long)]
     pub mouse: bool,
 
@@ -80,6 +83,30 @@ pub struct Args {
     /// the first turn (default: connect in the background).
     #[arg(long)]
     pub wait_for_mcp: bool,
+
+    /// Compact the context automatically once it reaches the `[auto]`
+    /// `compact_auto_percent` (overrides `compact` in tui.toml).
+    #[arg(long, conflicts_with = "no_auto_compact")]
+    pub auto_compact: bool,
+
+    /// Only warn when the context fills up; never compact automatically
+    /// (overrides `compact` in tui.toml).
+    #[arg(long)]
+    pub no_auto_compact: bool,
+}
+
+impl Args {
+    /// The compaction mode forced by `--auto-compact` / `--no-auto-compact`.
+    #[must_use]
+    pub fn compact_mode_override(&self) -> Option<CompactMode> {
+        if self.auto_compact {
+            Some(CompactMode::Auto)
+        } else if self.no_auto_compact {
+            Some(CompactMode::Warn)
+        } else {
+            None
+        }
+    }
 }
 
 /// Session store backend for a newly created realm.
@@ -153,6 +180,17 @@ mod tests {
         );
         let args = Args::try_parse_from(["rkat-tui"]).unwrap();
         assert!(args.config_dir.is_none());
+    }
+
+    #[test]
+    fn auto_compact_flags() {
+        let args = Args::try_parse_from(["rkat-tui"]).unwrap();
+        assert_eq!(args.compact_mode_override(), None);
+        let args = Args::try_parse_from(["rkat-tui", "--auto-compact"]).unwrap();
+        assert_eq!(args.compact_mode_override(), Some(CompactMode::Auto));
+        let args = Args::try_parse_from(["rkat-tui", "--no-auto-compact"]).unwrap();
+        assert_eq!(args.compact_mode_override(), Some(CompactMode::Warn));
+        assert!(Args::try_parse_from(["rkat-tui", "--auto-compact", "--no-auto-compact"]).is_err());
     }
 
     #[test]

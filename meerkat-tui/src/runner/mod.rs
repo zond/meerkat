@@ -6,6 +6,7 @@
 //! [`Msg`]s. Nothing here touches the terminal directly.
 
 mod lifecycle;
+mod models;
 mod quit;
 #[doc(hidden)]
 pub mod testing;
@@ -19,13 +20,14 @@ use crate::approval::policy::VerdictSummary;
 use crate::approval::rules::{self, AutoSettings, Rule, RuleId, RuleKind, RuleOrigin, RuleSet};
 use crate::approval::{ApprovalConfig, ApprovalEngine, ApprovalEvent};
 use crate::bootstrap::credentials::{
-    build_llm_client, resolve_model_and_provider, resolve_provider_credentials,
+    ProviderCredentials, build_llm_client, resolve_model_and_provider, resolve_provider_credentials,
 };
 use crate::bootstrap::{self, Runtime};
 use crate::cli::Args;
 use crate::delivery::{InjectFailure, PendingId, frame};
 use crate::error::TuiError;
 use crate::memory::{MemoryToolDispatcher, NoteStore, Scope};
+use crate::models::ModelEntry;
 use crate::session::delivery::{recall, reconcile, user_texts};
 use crate::session::lifecycle::{
     context_window, estimate_tokens, probe_memory, session_instructions,
@@ -74,7 +76,7 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
     // Shared LLM client: the session and the classifier use the same credentials.
     let (model, provider) = resolve_model_and_provider(&args, &config)?;
     let creds = resolve_provider_credentials(&config, provider)?;
-    let llm = build_llm_client(&AgentFactory::new(scope.realm_root()), creds).await?;
+    let llm = build_llm_client(&AgentFactory::new(scope.realm_root()), creds.clone()).await?;
 
     // Approval engine, built before the agent so its hooks are in the engine.
     let realm_dir = scope.realm_root();
@@ -117,6 +119,7 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
     let (broker, escalation_rx) = EscalationBroker::new(ESCALATION_CAPACITY);
     let cwd = std::env::current_dir().map_err(|e| TuiError::io("read current directory", e))?;
     let environment = Environment::detect(scope.project_root.as_path(), &cwd).await;
+    let compaction_policy = settings.compaction_policy(args.compact_mode_override());
     let classifier = make_classifier(&settings, Arc::clone(&llm), provider);
     let engine = ApprovalEngine::new(ApprovalConfig {
         root: scope.project_root.clone(),
@@ -202,6 +205,7 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         .as_ref()
         .map(|global| History::load(global.history_file()));
     let app = App::new(status)
+        .with_compaction_policy(compaction_policy)
         .with_history(history.entries().to_vec())
         .with_global_history(
             global_history
@@ -263,6 +267,7 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         approval_rx,
         diff_rx,
         last_context: resumed_context,
+        creds: Some(creds),
     });
     let integrator_task = tokio::spawn(integrator.run());
 
@@ -567,6 +572,9 @@ struct IntegratorParts {
     approval_rx: mpsc::UnboundedReceiver<ApprovalEvent>,
     diff_rx: mpsc::UnboundedReceiver<FileDiff>,
     last_context: Option<u64>,
+    /// Credentials for the provider's list-models endpoint; `None` disables
+    /// the fetch (tests).
+    creds: Option<ProviderCredentials>,
 }
 
 struct Integrator {
@@ -597,6 +605,14 @@ struct Integrator {
     dead: bool,
     /// Messages the UI still held when the user quit ([`Effect::SaveUnsent`]).
     held_unsent: Vec<(Option<PendingId>, String)>,
+    /// Credentials for the provider's list-models endpoint.
+    creds: Option<ProviderCredentials>,
+    /// The provider's model list, cached after the first successful fetch.
+    models: Option<Vec<ModelEntry>>,
+    /// A list-models request in flight.
+    model_fetch: Option<models::ModelFetch>,
+    /// `/model` is waiting for [`Integrator::model_fetch`] to open the picker.
+    picker_waiting: bool,
 }
 
 /// A turn in flight and the session it runs on (which stays the one to
@@ -620,8 +636,12 @@ impl Integrator {
             approval_rx,
             diff_rx,
             last_context,
+            creds,
         } = parts;
         let current_model = session.model().to_string();
+        // Fetch the model list right away so the context gauge uses the
+        // endpoint's window from the first turn.
+        let model_fetch = creds.as_ref().map(models::spawn_model_fetch);
         Self {
             runtime,
             engine,
@@ -641,6 +661,10 @@ impl Integrator {
             last_context,
             dead: false,
             held_unsent: Vec::new(),
+            creds,
+            models: None,
+            model_fetch,
+            picker_waiting: false,
         }
     }
 
@@ -667,6 +691,9 @@ impl Integrator {
                 }),
                 result = async { match self.turn.as_mut() { Some(turn) => (&mut turn.task).await, None => std::future::pending().await } } => {
                     self.turn_finished(result).await;
+                }
+                joined = async { match self.model_fetch.as_mut() { Some(fetch) => fetch.await, None => std::future::pending().await } } => {
+                    self.model_fetch_finished(joined);
                 }
             }
         }
@@ -835,6 +862,7 @@ impl Integrator {
                 );
             }
             Effect::SetModel(model) => self.set_model(model).await,
+            Effect::RequestModelPicker { refresh } => self.request_model_picker(refresh),
             Effect::Remember(text) => self.remember(&text),
             Effect::Compact => self.compact().await,
         }
@@ -1001,7 +1029,12 @@ impl Integrator {
     }
 
     async fn set_model(&mut self, model: String) {
-        if Provider::infer_from_model(&model) != Some(self.session.provider()) {
+        // Ids the provider lists are accepted even without a known prefix
+        // (e.g. OpenAI's `o3`).
+        let provider = self.session.provider();
+        let listed = self.model_is_listed(&model);
+        let inferred = Provider::infer_from_model(&model);
+        if inferred.is_some_and(|p| p != provider) || (inferred.is_none() && !listed) {
             self.notice(
                 NoticeLevel::Warn,
                 format!(
