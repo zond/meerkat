@@ -637,3 +637,75 @@ async fn hook_classifier_block_reports_safety_violation() {
     // The classifier saw the user's prompt.
     assert!(h.classifier.seen_transcripts.lock()[0].contains("ship it"));
 }
+
+#[tokio::test]
+async fn workspace_memory_save_is_in_project_edit() {
+    let h = harness(Options::default());
+    let v = h
+        .decide(
+            "memory_save",
+            json!({"scope": "workspace", "name": "build", "content": "make ci"}),
+        )
+        .await;
+    assert!(v.is_allowed());
+    assert_eq!(tier_of(&v), Tier::InProjectEdit);
+    assert_eq!(h.classifier.calls(), 0);
+}
+
+#[tokio::test]
+async fn user_memory_save_reaches_classifier() {
+    let h = harness(Options {
+        verdicts: vec![block("planting a user-level note")],
+        ..Options::default()
+    });
+    let v = h
+        .decide(
+            "memory_save",
+            json!({"scope": "user", "name": "style", "content": "x"}),
+        )
+        .await;
+    assert_eq!(h.classifier.calls(), 1);
+    assert!(matches!(
+        v,
+        Verdict::Deny {
+            tier: Tier::Classifier,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn memory_list_is_tier_one() {
+    let h = harness(Options::default());
+    let v = h.decide("memory_list", json!({})).await;
+    assert!(v.is_allowed());
+    assert_eq!(tier_of(&v), Tier::AlwaysAllow);
+    assert_eq!(h.classifier.calls(), 0);
+}
+
+#[tokio::test]
+async fn allow_rule_makes_user_memory_save_tier_one() {
+    let mut rules = RuleSet::default();
+    rules.push(
+        Rule::new(
+            RuleKind::Allow,
+            "memory_save",
+            Some("user/*"),
+            RuleOrigin::Realm,
+        )
+        .unwrap(),
+    );
+    let h = harness(Options {
+        rules,
+        ..Options::default()
+    });
+    let v = h
+        .decide(
+            "memory_save",
+            json!({"scope": "user", "name": "style", "content": "x"}),
+        )
+        .await;
+    assert!(v.is_allowed());
+    assert_eq!(tier_of(&v), Tier::AlwaysAllow);
+    assert_eq!(h.classifier.calls(), 0);
+}

@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use meerkat_core::{Config, ConfigStore, FileConfigStore, RealmConfig, RealmSelection};
 use meerkat_store::{RealmBackend, RealmOrigin, realm_paths_in};
 
+use super::dirs::GlobalDirs;
 use crate::cli::{Args, RealmBackendArg};
 use crate::error::TuiError;
 use crate::paths::{PathError, ProjectRoot};
@@ -36,6 +37,9 @@ pub struct RuntimeScope {
     /// User-global conventions root (`--user-config-root`, else the home
     /// directory). `None` when neither is available.
     pub user_config_root: Option<PathBuf>,
+    /// User-global `rkat-tui` directories (`--config-dir`, else
+    /// `~/.config/rkat-tui`). `None` when nothing resolves.
+    pub global: Option<GlobalDirs>,
     /// Realm the sessions and config are stored in.
     pub realm_id: String,
     /// Directory containing realm directories.
@@ -96,6 +100,7 @@ pub fn resolve_scope(args: &Args) -> Result<RuntimeScope, TuiError> {
     let project_root = project_root_from(&context_root)?;
     let context_root = project_root.as_path().to_path_buf();
     let user_config_root = args.user_config_root.clone().or_else(dirs::home_dir);
+    let global = GlobalDirs::resolve(args.config_dir.as_deref(), args.user_config_root.as_deref());
 
     let uses_shared_realm = args.realm.is_some() || args.isolated || args.state_root.is_some();
     if !uses_shared_realm {
@@ -105,6 +110,7 @@ pub fn resolve_scope(args: &Args) -> Result<RuntimeScope, TuiError> {
             project_root,
             context_root,
             user_config_root,
+            global,
             realm_id: WORKSPACE_REALM_ID.to_string(),
             state_root,
             backend_hint: args.realm_backend.map(Into::into),
@@ -137,6 +143,7 @@ pub fn resolve_scope(args: &Args) -> Result<RuntimeScope, TuiError> {
         project_root,
         context_root,
         user_config_root,
+        global,
         realm_id: locator.realm_id,
         state_root: locator.state_root,
         // Only an explicit request pins a backend; existing realms are opened
@@ -271,5 +278,28 @@ mod tests {
         assert_ne!(scope.realm_id, WORKSPACE_REALM_ID);
         assert_eq!(scope.state_root, state.path());
         assert!(!dir.path().join(".rkat/tui").exists());
+    }
+
+    #[test]
+    fn global_dirs_follow_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_str().unwrap();
+        let cfg = dir.path().join("cfg");
+        let scope = resolve_scope(&args(&[
+            "-w",
+            ws,
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--user-config-root",
+            ws,
+        ]))
+        .unwrap();
+        assert_eq!(scope.global, Some(GlobalDirs { config: cfg }));
+
+        let scope = resolve_scope(&args(&["-w", ws, "--user-config-root", ws])).unwrap();
+        assert_eq!(
+            scope.global.map(|g| g.config),
+            Some(dir.path().join(".config").join("rkat-tui"))
+        );
     }
 }

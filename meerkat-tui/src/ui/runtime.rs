@@ -150,14 +150,15 @@ fn translate(event: Event, mouse: bool) -> Option<Msg> {
 /// Run the UI until the user quits.
 ///
 /// Effects produced by [`App::update`] are forwarded on `effects`; [`Effect::Quit`]
-/// is forwarded too and then ends the loop. The terminal is restored on return,
-/// on error and on panic.
+/// is forwarded too and then ends the loop. Every submitted line is appended to
+/// each of `histories` (e.g. the workspace and the global history file). The
+/// terminal is restored on return, on error and on panic.
 pub async fn run_ui(
     mut app: App,
     mut channels: UiChannels,
     effects: mpsc::UnboundedSender<Effect>,
     mouse: bool,
-    mut history: Option<History>,
+    mut histories: Vec<History>,
 ) -> Result<(), UiError> {
     install_panic_hook();
     let _guard = TerminalGuard::enter(mouse)?;
@@ -192,10 +193,14 @@ pub async fn run_ui(
             _ = tick.tick() => Msg::Tick,
         };
         let effects_now = app.update(msg);
-        if let Some(history) = history.as_mut() {
-            for entry in app.take_submitted() {
+        for entry in app.take_submitted() {
+            for history in &mut histories {
                 if let Err(err) = history.append(&entry) {
-                    tracing::warn!(error = %err, "could not append to input history");
+                    tracing::warn!(
+                        error = %err,
+                        path = %history.path().display(),
+                        "could not append to input history"
+                    );
                 }
             }
         }

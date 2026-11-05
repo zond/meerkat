@@ -6,6 +6,7 @@
 //! classifier and injected tool output cannot reach it either.
 
 use super::policy::VerdictSummary;
+use crate::session::delivery::user_texts;
 use meerkat_core::{Message, Session};
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -187,9 +188,12 @@ impl ApprovalTranscript {
         for message in session.messages() {
             match message {
                 Message::User(user) => {
-                    let text = user.text_content();
-                    if !text.trim().is_empty() {
-                        self.push_user(text);
+                    // Injected mid-turn messages are recorded as the user's
+                    // plain words; continuation prompts are plumbing.
+                    for text in user_texts(user) {
+                        if !text.trim().is_empty() {
+                            self.push_user(text);
+                        }
                     }
                 }
                 Message::BlockAssistant(assistant) => {

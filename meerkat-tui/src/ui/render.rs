@@ -11,7 +11,7 @@ use ratatui::widgets::{Block as BorderBlock, Borders, Paragraph};
 use super::markdown::{display_width, render_markdown, sanitize, truncate_to_width, wrap_text};
 use super::modal::draw_modal;
 use super::transcript::{Block, NoticeLevel, ToolState, args_preview};
-use super::{App, StatusInfo};
+use super::{App, HistorySearch, StatusInfo};
 
 /// Maximum visible input lines.
 pub const MAX_INPUT_LINES: usize = 6;
@@ -32,7 +32,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 /// [`draw`] with an explicit clock (for deterministic tests).
 pub fn draw_at(frame: &mut Frame<'_>, app: &mut App, now: Instant) {
     let area = frame.area();
-    let input_rows = app.input.lines().len().clamp(1, MAX_INPUT_LINES) as u16;
+    let input_rows = if app.search().is_some() {
+        1
+    } else {
+        app.input.lines().len().clamp(1, MAX_INPUT_LINES) as u16
+    };
     let [transcript_area, input_area, status_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(input_rows + 1),
@@ -65,6 +69,12 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect, now: Instant) {
     let title = if app.quit_armed(now) {
         " press Ctrl-C again to quit "
+    } else if app.chord_pending(now) {
+        " C-x- "
+    } else if app.search().is_some() {
+        " Ctrl-R older · Enter accept · Esc cancel "
+    } else if app.has_recallable() {
+        " Esc recall all · ↑ edit last queued "
     } else if app.is_running() {
         " Enter queues · Esc/Ctrl-C interrupts "
     } else {
@@ -76,6 +86,19 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect, now: Instant) {
         .title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    if let Some((search, corpus)) = app.search() {
+        let (line, cursor_col) = search_line(search, corpus, usize::from(inner.width));
+        frame.render_widget(Paragraph::new(line), inner);
+        if app.modal.is_none() {
+            let x = inner.x + cursor_col.min(usize::from(u16::MAX)) as u16;
+            frame.set_cursor_position(Position::new(
+                x.min(inner.right().saturating_sub(1)),
+                inner.y,
+            ));
+        }
+        return;
+    }
 
     let prefix_w = 2usize;
     let avail = usize::from(inner.width).saturating_sub(prefix_w).max(1);
@@ -115,6 +138,68 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect, now: Instant) {
     }
 }
 
+/// Flatten an entry for one-line display (newlines shown as `⏎`).
+fn flatten(s: &str) -> String {
+    sanitize(s).replace('\n', "⏎")
+}
+
+/// The reverse-search prompt line, `(reverse-i-search)`query': match`, with the
+/// matched substring highlighted, and the cursor column (end of the query).
+pub fn search_line(
+    search: &HistorySearch,
+    corpus: &[String],
+    width: usize,
+) -> (Line<'static>, usize) {
+    let label = if search.failing() {
+        "(failing reverse-i-search)`"
+    } else {
+        "(reverse-i-search)`"
+    };
+    let query = flatten(&search.query);
+    let cursor_col = display_width(label) + display_width(&query);
+    let head = format!("{label}{query}': ");
+    let label_style = Style::default().fg(Color::Cyan);
+    let mut spans = vec![Span::styled(head.clone(), label_style)];
+    let avail = width.saturating_sub(display_width(&head));
+    if let Some(entry) = search.current(corpus)
+        && avail > 0
+    {
+        let range = super::search::find_smart_case(entry, &search.query).unwrap_or(0..0);
+        let before = flatten(entry.get(..range.start).unwrap_or(""));
+        let mid = flatten(entry.get(range.clone()).unwrap_or(""));
+        let after = flatten(entry.get(range.end..).unwrap_or(""));
+        // Keep the match visible: elide the start of `before` when it is too long.
+        let mid_w = display_width(&mid).min(avail);
+        let before_room = avail - mid_w;
+        let before = if display_width(&before) > before_room {
+            if before_room == 0 {
+                String::new()
+            } else {
+                let keep = before_room - 1;
+                let skip = display_width(&before) - keep;
+                format!("…{}", skip_columns(&before, skip))
+            }
+        } else {
+            before
+        };
+        let mid = truncate_to_width(&mid, avail.saturating_sub(display_width(&before)));
+        let after = truncate_to_width(
+            &after,
+            avail.saturating_sub(display_width(&before) + display_width(&mid)),
+        );
+        spans.push(Span::raw(before));
+        spans.push(Span::styled(
+            mid,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(after));
+    }
+    (Line::from(spans), cursor_col)
+}
+
 fn skip_columns(s: &str, cols: usize) -> String {
     let mut skipped = 0;
     let mut out = String::new();
@@ -137,6 +222,49 @@ pub fn fmt_tokens(n: u64) -> String {
     } else {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     }
+}
+
+/// Short token count for the context gauge: `950`, `8.5k`, `84k`, `1M`, `1.2M`.
+fn fmt_ctx_tokens(n: u64) -> String {
+    let (value, unit) = match n {
+        0..1_000 => return n.to_string(),
+        1_000..10_000 => (format!("{:.1}", n as f64 / 1_000.0), "k"),
+        10_000..1_000_000 => (format!("{:.0}", n as f64 / 1_000.0), "k"),
+        _ => (format!("{:.1}", n as f64 / 1_000_000.0), "M"),
+    };
+    let value = value.strip_suffix(".0").unwrap_or(&value);
+    format!("{value}{unit}")
+}
+
+/// Context-gauge level at which the segment turns yellow (percent).
+pub const CONTEXT_WARN_PERCENT: u64 = 70;
+/// Context-gauge level at which the segment turns red (percent).
+pub const CONTEXT_CRITICAL_PERCENT: u64 = 90;
+
+/// The context-gauge segment: `ctx 42% (84k/200k)` (with `~` when estimated),
+/// `ctx 84k` when the window is unknown, `None` when usage is unknown.
+pub fn context_segment(status: &StatusInfo) -> Option<Span<'static>> {
+    let used = status.context_used?;
+    let approx = if status.context_approx { "~" } else { "" };
+    let Some(window) = status.context_window.filter(|w| *w > 0) else {
+        return Some(Span::raw(format!("ctx {approx}{}", fmt_ctx_tokens(used))));
+    };
+    let percent = used.saturating_mul(100) / window;
+    let style = if percent >= CONTEXT_CRITICAL_PERCENT {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else if percent >= CONTEXT_WARN_PERCENT {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    Some(Span::styled(
+        format!(
+            "ctx {approx}{percent}% ({}/{})",
+            fmt_ctx_tokens(used),
+            fmt_ctx_tokens(window)
+        ),
+        style,
+    ))
 }
 
 /// Spinner glyph for the elapsed time since `since` (first frame when `None`).
@@ -177,6 +305,7 @@ pub fn status_bar(status: &StatusInfo, now: Instant) -> Line<'static> {
         fmt_tokens(status.input_tokens),
         fmt_tokens(status.output_tokens)
     )));
+    segs.extend(context_segment(status));
     if !status.auto_state.is_empty() {
         let (c, cm, t, tm) = status.denials;
         let text = if status.auto_state.eq_ignore_ascii_case("off") {
@@ -272,6 +401,11 @@ pub fn block_lines(block: &Block, width: u16) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD);
             prefixed(text, w, "› ", "  ", style, &mut out);
         }
+        Block::Queued { text, label, .. } => {
+            let style = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
+            let shown = format!("{text}  · {}", label.text());
+            prefixed(&shown, w, "› ", "  ", style, &mut out);
+        }
         Block::Assistant { md } => {
             for (i, line) in render_markdown(md, (w - 2) as u16).into_iter().enumerate() {
                 let p = if i == 0 { "• " } else { "  " };
@@ -285,7 +419,7 @@ pub fn block_lines(block: &Block, width: u16) -> Vec<Line<'static>> {
             if *collapsed {
                 let n = text.chars().count();
                 out.push(Line::styled(
-                    truncate_to_width(&format!("✻ thinking ({n} chars, Ctrl-R to expand)"), w),
+                    truncate_to_width(&format!("✻ thinking ({n} chars, Ctrl-O to expand)"), w),
                     style.fg(Color::Magenta),
                 ));
             } else {
@@ -474,6 +608,45 @@ mod tests {
                 .contains(Modifier::DIM)
         );
         assert!(status_line(&s, now).ends_with("│ auto: off"));
+    }
+
+    #[test]
+    fn context_token_formatting() {
+        assert_eq!(fmt_ctx_tokens(950), "950");
+        assert_eq!(fmt_ctx_tokens(8_500), "8.5k");
+        assert_eq!(fmt_ctx_tokens(84_000), "84k");
+        assert_eq!(fmt_ctx_tokens(84_400), "84k");
+        assert_eq!(fmt_ctx_tokens(200_000), "200k");
+        assert_eq!(fmt_ctx_tokens(1_000_000), "1M");
+        assert_eq!(fmt_ctx_tokens(1_250_000), "1.2M");
+    }
+
+    #[test]
+    fn context_gauge_text_and_thresholds() {
+        let now = Instant::now();
+        let mut s = StatusInfo::default();
+        s.set_tokens(1500, 20);
+        assert_eq!(status_line(&s, now), " ↑1.5k ↓20");
+        s.context_used = Some(84_000);
+        assert_eq!(status_line(&s, now), " ↑1.5k ↓20 │ ctx 84k");
+        s.context_window = Some(200_000);
+        assert_eq!(status_line(&s, now), " ↑1.5k ↓20 │ ctx 42% (84k/200k)");
+        let bar = status_bar(&s, now);
+        assert_eq!(seg_style(&bar, "ctx"), Style::default());
+        s.context_approx = true;
+        assert_eq!(status_line(&s, now), " ↑1.5k ↓20 │ ctx ~42% (84k/200k)");
+        s.context_used = Some(139_000);
+        assert_eq!(seg_style(&status_bar(&s, now), "ctx").fg, None);
+        s.context_used = Some(140_000);
+        assert_eq!(
+            seg_style(&status_bar(&s, now), "ctx").fg,
+            Some(Color::Yellow)
+        );
+        s.context_used = Some(180_000);
+        assert_eq!(seg_style(&status_bar(&s, now), "ctx").fg, Some(Color::Red));
+        // A zero window is treated as unknown.
+        s.context_window = Some(0);
+        assert_eq!(status_line(&s, now), " ↑1.5k ↓20 │ ctx ~180k");
     }
 
     #[test]

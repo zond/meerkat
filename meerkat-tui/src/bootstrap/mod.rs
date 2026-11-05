@@ -13,6 +13,8 @@
 
 pub mod agent_builder;
 pub mod credentials;
+pub mod dirs;
+pub mod instructions;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod persona;
@@ -22,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use meerkat::{AgentFactory, EphemeralSessionService, LlmClient, SessionStore};
-use meerkat_core::{Config, HookEngine, HooksConfig, Provider};
+use meerkat_core::{CommsRuntimeMode, Config, HookEngine, HooksConfig, Provider};
 use meerkat_store::{RealmBackend, RealmManifest, realm_paths_in};
 
 use crate::cli::Args;
@@ -32,6 +34,7 @@ pub use agent_builder::{TuiAgent, TuiAgentBuilder};
 pub use credentials::{
     ProviderCredentials, build_llm_client, resolve_model_and_provider, resolve_provider_credentials,
 };
+pub use dirs::GlobalDirs;
 pub use persona::CODING_PERSONA;
 pub use scope::{RuntimeScope, load_config, resolve_scope};
 
@@ -64,6 +67,10 @@ pub struct Runtime {
     pub backend: RealmBackend,
     /// Hook engine injected into every agent, if any.
     pub hook_engine: Option<Arc<dyn HookEngine>>,
+    /// Directory of the semantic memory index (`<factory.store_path>/memory`)
+    /// the factory opens for every agent. It is a single-writer redb file:
+    /// only one live session may hold it at a time.
+    pub memory_dir: PathBuf,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -74,6 +81,7 @@ impl std::fmt::Debug for Runtime {
             .field("provider", &self.provider)
             .field("backend", &self.backend)
             .field("hook_engine", &self.hook_engine.is_some())
+            .field("memory_dir", &self.memory_dir)
             .finish_non_exhaustive()
     }
 }
@@ -135,6 +143,8 @@ pub async fn bootstrap_in(
     hook_engine: Option<Arc<dyn HookEngine>>,
     llm_override: Option<Arc<dyn LlmClient>>,
 ) -> Result<Runtime, TuiError> {
+    let mut config = config;
+    force_inproc_comms(&mut config);
     let (model, provider) = resolve_model_and_provider(args, &config)?;
 
     let (manifest, persistence) = meerkat::open_realm_persistence_in(
@@ -176,6 +186,7 @@ pub async fn bootstrap_in(
         llm: Some(Arc::clone(&llm)),
     };
     let service = Arc::new(EphemeralSessionService::new(builder, MAX_SESSIONS));
+    let memory_dir = factory.store_path.join("memory");
 
     Ok(Runtime {
         scope,
@@ -188,7 +199,16 @@ pub async fn bootstrap_in(
         store,
         backend: manifest.backend,
         hook_engine,
+        memory_dir,
     })
+}
+
+/// Comms exists only to deliver messages typed mid-turn into the agent's own
+/// inbox: keep it in-process (no sockets, no key files) and never let it
+/// spread to sub-agents, whatever the realm config says.
+fn force_inproc_comms(config: &mut Config) {
+    config.comms.mode = CommsRuntimeMode::Inproc;
+    config.comms.auto_enable_for_subagents = false;
 }
 
 /// Store path for the factory, matching `rkat`'s `realm_store_path`.

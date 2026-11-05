@@ -59,6 +59,11 @@ pub enum Command {
     Model(Option<String>),
     /// `/help`.
     Help,
+    /// `/remember <text>` or a single-line `#text` input: append a line to the
+    /// workspace AGENTS.md.
+    Remember(String),
+    /// `/compact`: summarise the session's context.
+    Compact,
 }
 
 /// Slash-command parse failure.
@@ -96,19 +101,43 @@ Commands:
   /auto                          show auto-mode state and denial counters
   /auto on|off|resume            enable, disable, or resume auto mode after a pause
   /model [id]                    show or switch the model
+  /remember <text>, #<text>      add a line to the workspace AGENTS.md (\\# sends a literal #)
+  /compact                       summarise the conversation to free context (idle only)
 Keys:
   Enter                          send (queues while a turn is running)
   Alt+Enter, Shift+Enter, Ctrl+J insert a newline
   Ctrl-C                         interrupt the turn · clear the input · press twice to quit
   Esc                            interrupt the running turn
   Ctrl-D                         quit (on empty input)
-  Ctrl-R                         toggle the last reasoning block
+  Ctrl-O                         toggle the last reasoning block
+  Ctrl-R                         search history (Ctrl-R again: older · Enter accept · Esc cancel)
+  Ctrl-X Ctrl-S                  interrupt and send the input (sends normally when idle)
   Up/Down                        move between lines · recall prompt history
   PgUp/PgDn, Shift+Up/Down       scroll the transcript
   Home/End                       scroll to top/bottom when the input is empty (Ctrl+Home/End always)
 Approval prompt:
   y allow once · a allow and add a rule · n/Esc deny · s stop the turn (Ctrl-C stops all)
 Start a prompt with // to send a literal leading slash.";
+
+/// A single-line `#text` input (not `##…`) as a remember request: returns the
+/// text after `#`, trimmed. Multi-line input and `\#` escapes are prompts.
+#[must_use]
+pub fn parse_remember(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.contains('\n') || trimmed.starts_with("##") {
+        return None;
+    }
+    let text = trimmed.strip_prefix('#')?.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// Undo a leading `\#` escape (`\#foo` sends the prompt `#foo`).
+#[must_use]
+pub fn unescape_hash(input: &str) -> Option<String> {
+    let start = input.len() - input.trim_start().len();
+    let rest = input.get(start..)?.strip_prefix("\\#")?;
+    Some(format!("#{rest}"))
+}
 
 /// Parse a submitted line. Returns `None` when the line is not a slash command
 /// (no leading `/`, or a `//` escape).
@@ -120,6 +149,19 @@ pub fn parse(input: &str) -> Option<Result<Command, CommandError>> {
     }
     let mut words = body.split_whitespace();
     let name = words.next().unwrap_or_default();
+    if name == "remember" {
+        // Keep the text verbatim (inner whitespace included).
+        let text = body
+            .trim_start()
+            .get(name.len()..)
+            .unwrap_or_default()
+            .trim();
+        return Some(if text.is_empty() {
+            Err(CommandError::Usage("/remember <text>"))
+        } else {
+            Ok(Command::Remember(text.to_string()))
+        });
+    }
     let args: Vec<&str> = words.collect();
     Some(parse_command(name, &args))
 }
@@ -129,6 +171,10 @@ fn parse_command(name: &str, args: &[&str]) -> Result<Command, CommandError> {
         "quit" | "exit" | "q" => Ok(Command::Quit),
         "clear" | "new" => Ok(Command::Clear),
         "help" | "?" => Ok(Command::Help),
+        "compact" => match args {
+            [] => Ok(Command::Compact),
+            _ => Err(CommandError::Usage("/compact")),
+        },
         "resume" => match args {
             [] => Ok(Command::Resume(None)),
             [r] => Ok(Command::Resume(Some((*r).to_string()))),
@@ -203,6 +249,37 @@ mod tests {
     }
 
     #[test]
+    fn remember_and_compact_commands() {
+        assert_eq!(
+            ok("/remember use  cargo nextest"),
+            Command::Remember("use  cargo nextest".into())
+        );
+        assert_eq!(
+            parse("/remember"),
+            Some(Err(CommandError::Usage("/remember <text>")))
+        );
+        assert_eq!(ok("/compact"), Command::Compact);
+        assert!(matches!(
+            parse("/compact now"),
+            Some(Err(CommandError::Usage(_)))
+        ));
+    }
+
+    #[test]
+    fn hash_remember_and_escape() {
+        assert_eq!(parse_remember("#use tabs "), Some("use tabs".into()));
+        assert_eq!(parse_remember("  #  use tabs"), Some("use tabs".into()));
+        assert_eq!(parse_remember("#"), None);
+        assert_eq!(parse_remember("#   "), None);
+        assert_eq!(parse_remember("## heading"), None);
+        assert_eq!(parse_remember("#one\ntwo"), None);
+        assert_eq!(parse_remember("\\#tag"), None);
+        assert_eq!(parse_remember("plain"), None);
+        assert_eq!(unescape_hash("\\#tag it"), Some("#tag it".into()));
+        assert_eq!(unescape_hash("#tag"), None);
+    }
+
+    #[test]
     fn auto_commands() {
         assert_eq!(ok("/auto"), Command::Auto(AutoCommand::Status));
         assert_eq!(ok("/auto on"), Command::Auto(AutoCommand::On));
@@ -256,13 +333,18 @@ mod tests {
             "/rules",
             "/auto",
             "/model",
+            "/remember",
+            "#<text>",
+            "/compact",
             "Enter",
             "Alt+Enter",
             "Ctrl+J",
             "Ctrl-C",
             "Esc",
             "Ctrl-D",
+            "Ctrl-O",
             "Ctrl-R",
+            "Ctrl-X Ctrl-S",
             "PgUp",
             "PgDn",
             "Home",

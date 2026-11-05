@@ -49,8 +49,12 @@ pub enum Action {
     CtrlD,
     /// Esc: interrupt a running turn.
     Escape,
-    /// Toggle collapse of the last reasoning block.
+    /// Toggle collapse of the last reasoning block (Ctrl-O).
     ToggleReasoning,
+    /// Start a reverse history search (Ctrl-R).
+    HistorySearch,
+    /// Ctrl-X: the first key of a chord, resolved by the app with the next key.
+    ChordPrefix,
     /// Scroll the transcript up by lines.
     ScrollUp(usize),
     /// Scroll the transcript down by lines.
@@ -82,7 +86,9 @@ pub fn map_key(key: &KeyEvent, input_empty: bool) -> Action {
         KeyCode::Char('j') if ctrl => Action::Newline,
         KeyCode::Char('c') if ctrl => Action::CtrlC,
         KeyCode::Char('d') if ctrl => Action::CtrlD,
-        KeyCode::Char('r') if ctrl => Action::ToggleReasoning,
+        KeyCode::Char('o') if ctrl => Action::ToggleReasoning,
+        KeyCode::Char('r') if ctrl => Action::HistorySearch,
+        KeyCode::Char('x') if ctrl => Action::ChordPrefix,
         KeyCode::Char('a') if ctrl => Action::Edit(EditAction::Home),
         KeyCode::Char('e') if ctrl => Action::Edit(EditAction::End),
         KeyCode::Char('w') if ctrl => Action::Edit(EditAction::DeleteWordBack),
@@ -165,11 +171,24 @@ mod tests {
             Action::CtrlC
         );
         assert_eq!(
-            map_key(&k(KeyCode::Char('r'), KeyModifiers::CONTROL), false),
+            map_key(&k(KeyCode::Char('o'), KeyModifiers::CONTROL), false),
             Action::ToggleReasoning
         );
         assert_eq!(
+            map_key(&k(KeyCode::Char('r'), KeyModifiers::CONTROL), false),
+            Action::HistorySearch
+        );
+        assert_eq!(
             map_key(&k(KeyCode::Char('x'), KeyModifiers::CONTROL), false),
+            Action::ChordPrefix
+        );
+        // Ctrl-S only means something inside a Ctrl-X chord (resolved by the app).
+        assert_eq!(
+            map_key(&k(KeyCode::Char('s'), KeyModifiers::CONTROL), false),
+            Action::None
+        );
+        assert_eq!(
+            map_key(&k(KeyCode::Char('q'), KeyModifiers::CONTROL), false),
             Action::None
         );
         assert_eq!(

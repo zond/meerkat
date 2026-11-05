@@ -5,6 +5,8 @@
 //! agent events, approval decisions, escalations and diffs back as
 //! [`Msg`]s. Nothing here touches the terminal directly.
 
+mod lifecycle;
+
 use crate::approval::classifier::{
     ActionClassifier, Environment, LlmClassifier, UnavailableClassifier, classifier_default_model,
 };
@@ -18,14 +20,21 @@ use crate::bootstrap::credentials::{
 };
 use crate::bootstrap::{self, Runtime};
 use crate::cli::Args;
+use crate::delivery::{InjectFailure, PendingId, frame};
 use crate::error::TuiError;
+use crate::memory::{MemoryToolDispatcher, NoteStore, Scope};
+use crate::session::delivery::{recall, reconcile, user_texts};
+use crate::session::lifecycle::{
+    context_window, estimate_tokens, probe_memory, session_instructions,
+};
 use crate::session::{
     SessionHandle, SessionOptions, TurnTask, list_sessions, load_session, resolve_session_ref,
 };
 use crate::tools::{FileDiff, FileToolDispatcher};
 use crate::ui::{
     App, ApprovalNotice, Block, Effect, EscalationAnswer, EscalationId, EscalationPrompt, History,
-    Msg, NoticeLevel, StatusInfo, StatusUpdate, ToolState, TurnSummary, UiChannels, run_ui,
+    Msg, NoticeLevel, StatusInfo, StatusUpdate, ToolState, TurnOutcome, TurnSummary, UiChannels,
+    run_ui,
 };
 use meerkat::{AgentFactory, SessionService, ToolGatewayBuilder};
 use meerkat_client::LlmClient;
@@ -36,9 +45,8 @@ use meerkat_core::{
     Session, SessionMeta,
 };
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
 use tokio::sync::{mpsc, oneshot};
 
 /// Capacity of the primary agent-event channel.
@@ -55,8 +63,10 @@ const RULES_FILE: &str = "tui.toml";
 /// Returns a [`TuiError`] when bootstrap fails, the session cannot be created,
 /// or the terminal cannot be driven.
 pub async fn run(args: Args) -> Result<(), TuiError> {
-    let (scope, config) = bootstrap::prepare(&args).await?;
+    let (scope, mut config) = bootstrap::prepare(&args).await?;
     init_logging(&scope.realm_root())?;
+    // Before `bootstrap_in`, which hands copies of the config to the factory.
+    bootstrap::instructions::apply_system_md(&mut config, scope.global.as_ref());
 
     // Shared LLM client: the session and the classifier use the same credentials.
     let (model, provider) = resolve_model_and_provider(&args, &config)?;
@@ -65,12 +75,18 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
 
     // Approval engine, built before the agent so its hooks are in the engine.
     let realm_dir = scope.realm_root();
-    let home_rkat = scope.user_config_root.as_ref().map(|h| h.join(".rkat"));
+    let global_rules = scope.global.as_ref().map(bootstrap::GlobalDirs::rules_file);
     let (mut rule_set, mut settings, mut notices) = rules::load_layered(
         &realm_dir,
-        home_rkat.as_deref(),
+        global_rules.as_deref(),
         &scope.context_root.join(".rkat"),
     )?;
+    if let Some(notice) = rules::legacy_global_rules_notice(
+        scope.user_config_root.as_deref(),
+        global_rules.as_deref(),
+    ) {
+        notices.push(notice);
+    }
     // The realm rules file lives inside the workspace. If it is tracked by git it
     // arrived with the repository, so its allow rules are not the user's.
     let realm_rules = realm_dir.join(RULES_FILE);
@@ -122,7 +138,25 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         Some(diff_tx),
     ));
     let (scoped_tx, scoped_rx) = mpsc::channel(AGENT_EVENT_CAPACITY);
-    let (external_tools, mcp_notice) = compose_external_tools(&runtime, &args, &file_tools).await?;
+    let notes = Arc::new(MemoryToolDispatcher::new(
+        runtime
+            .scope
+            .global
+            .as_ref()
+            .map(|global| NoteStore::open(global.notes_dir(), Scope::User)),
+        NoteStore::open(
+            workspace_notes_dir(&runtime.scope.context_root),
+            Scope::Workspace,
+        ),
+    ));
+    let (external_tools, mcp_notice) =
+        compose_external_tools(&runtime, &args, &file_tools, &notes).await?;
+    // The semantic index is single-writer: another rkat-tui on the same realm
+    // keeps this one's agents from opening it (they then lack `memory_search`).
+    let memory_notice = probe_memory(&runtime.memory_dir).await.err().map(|err| {
+        tracing::warn!(error = %err, dir = %runtime.memory_dir.display(), "semantic memory probe failed");
+        "semantic memory unavailable: another rkat-tui holds the index".to_string()
+    });
     let resume_ref = if args.continue_last {
         Some("last")
     } else {
@@ -136,19 +170,19 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         None => None,
     };
     let resumed_blocks = resumed.as_ref().map(blocks_from_session);
+    let resumed_context = resumed.as_ref().map(|s| estimate_tokens(s.messages()));
     if let Some(session) = &resumed {
         engine.seed_transcript(session.id(), session);
     }
-    let session = SessionHandle::create(
-        &runtime,
-        SessionOptions {
-            resume: resumed,
-            external_tools: Some(Arc::clone(&external_tools)),
-            scoped_event_tx: Some(scoped_tx.clone()),
-            additional_instructions: Vec::new(),
-        },
-    )
-    .await?;
+    let template = SessionTemplate {
+        workspace: runtime.scope.context_root.clone(),
+        global: runtime.scope.global.clone(),
+        notes,
+        external_tools,
+        scoped_tx: scoped_tx.clone(),
+    };
+    let session = SessionHandle::create(&runtime, template.options(resumed, None)).await?;
+    let current_model = session.model().to_string();
 
     // UI state and channels.
     let mut status = StatusInfo::default();
@@ -157,7 +191,20 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
     let (auto_state, denials) = auto_status(&engine);
     status.set_auto(auto_state, denials);
     let history = History::load(runtime.scope.realm_root().join("tui_history"));
-    let app = App::new(status).with_history(history.entries().to_vec());
+    let global_history = runtime
+        .scope
+        .global
+        .as_ref()
+        .map(|global| History::load(global.history_file()));
+    let app = App::new(status)
+        .with_history(history.entries().to_vec())
+        .with_global_history(
+            global_history
+                .as_ref()
+                .map(|h| h.entries().to_vec())
+                .unwrap_or_default(),
+        );
+    let histories: Vec<History> = std::iter::once(history).chain(global_history).collect();
     let (agent_tx, agent_rx) = mpsc::channel(AGENT_EVENT_CAPACITY);
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<Msg>();
     let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
@@ -173,6 +220,22 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
             text,
         });
     }
+    if let Some(text) = memory_notice {
+        let _ = ui_tx.send(Msg::Notice {
+            level: NoticeLevel::Warn,
+            text,
+        });
+    }
+    let _ = ui_tx.send(Msg::Status(StatusUpdate::ContextWindow(context_window(
+        provider,
+        &current_model,
+    ))));
+    if let Some(used) = resumed_context {
+        let _ = ui_tx.send(Msg::Status(StatusUpdate::Context {
+            used: Some(used),
+            approx: true,
+        }));
+    }
     if let Some(blocks) = resumed_blocks {
         let _ = ui_tx.send(Msg::ResetTranscript(blocks));
     }
@@ -184,8 +247,7 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         runtime,
         engine,
         session,
-        external_tools,
-        scoped_tx,
+        template,
         agent_tx,
         ui_tx,
         effect_rx,
@@ -195,6 +257,9 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         pending: HashMap::new(),
         next_escalation: 0,
         turn: None,
+        inflight: Vec::new(),
+        current_model,
+        last_context: resumed_context,
     };
     let integrator_task = tokio::spawn(integrator.run());
 
@@ -207,33 +272,39 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         },
         effect_tx,
         args.mouse,
-        Some(history),
+        histories,
     )
     .await;
     integrator_task.abort();
     ui_result.map_err(TuiError::from)
 }
 
-/// The session's external tools: the in-crate file tools plus any configured
-/// MCP servers, composed behind one gateway. Returns a notice describing the
-/// MCP servers when any are configured.
+/// Directory of the workspace's memory notes.
+fn workspace_notes_dir(workspace: &Path) -> PathBuf {
+    workspace.join(".rkat").join("tui").join("notes")
+}
+
+/// The session's external tools: the in-crate file and memory-note tools plus
+/// any configured MCP servers, composed behind one gateway. Returns a notice
+/// describing the MCP servers when any are configured.
 async fn compose_external_tools(
     runtime: &Runtime,
     args: &Args,
     file_tools: &Arc<FileToolDispatcher>,
+    notes: &Arc<MemoryToolDispatcher>,
 ) -> Result<(Arc<dyn AgentToolDispatcher>, Option<String>), TuiError> {
-    let file_tools: Arc<dyn AgentToolDispatcher> =
-        Arc::clone(file_tools) as Arc<dyn AgentToolDispatcher>;
+    #[cfg_attr(not(feature = "mcp"), allow(unused_mut))]
+    let mut builder = ToolGatewayBuilder::new()
+        .add_dispatcher(Arc::clone(file_tools) as Arc<dyn AgentToolDispatcher>)
+        .add_dispatcher(Arc::clone(notes) as Arc<dyn AgentToolDispatcher>);
+    #[cfg_attr(not(feature = "mcp"), allow(unused_mut))]
+    let mut notice = None;
     #[cfg(feature = "mcp")]
     {
         use crate::bootstrap::mcp::load_mcp_tools;
         if let Some(mcp) = load_mcp_tools(&runtime.scope, args.wait_for_mcp).await? {
-            let gateway = ToolGatewayBuilder::new()
-                .add_dispatcher(file_tools)
-                .add_dispatcher(Arc::clone(&mcp.dispatcher))
-                .build()
-                .map_err(|e| TuiError::Mcp(format!("compose tool dispatchers: {e}")))?;
-            let notice = format!(
+            builder = builder.add_dispatcher(Arc::clone(&mcp.dispatcher));
+            notice = Some(format!(
                 "MCP servers: {} ({})",
                 mcp.server_names.join(", "),
                 if args.wait_for_mcp {
@@ -241,15 +312,17 @@ async fn compose_external_tools(
                 } else {
                     "connecting in the background"
                 }
-            );
-            return Ok((Arc::new(gateway), Some(notice)));
+            ));
         }
     }
     #[cfg(not(feature = "mcp"))]
     {
-        let _ = (runtime, args, ToolGatewayBuilder::new());
+        let _ = (runtime, args);
     }
-    Ok((file_tools, None))
+    let gateway = builder
+        .build()
+        .map_err(|e| TuiError::Mcp(format!("compose tool dispatchers: {e}")))?;
+    Ok((Arc::new(gateway), notice))
 }
 
 /// Whether `path` is tracked by the git repository at `workspace`.
@@ -345,9 +418,13 @@ fn blocks_from_session(session: &Session) -> Vec<Block> {
     let mut blocks = Vec::new();
     for message in session.messages() {
         match message {
-            Message::User(user) => blocks.push(Block::User {
-                text: user.text_content(),
-            }),
+            Message::User(user) => {
+                blocks.extend(
+                    user_texts(user)
+                        .into_iter()
+                        .map(|text| Block::User { text }),
+                );
+            }
             Message::Assistant(assistant) => {
                 if !assistant.content.is_empty() {
                     blocks.push(Block::Assistant {
@@ -416,12 +493,39 @@ struct PendingEscalation {
     args_preview: String,
 }
 
+/// What every session build shares: where instructions and notes come from,
+/// the external tools and the scoped-event sink.
+struct SessionTemplate {
+    workspace: PathBuf,
+    global: Option<bootstrap::GlobalDirs>,
+    notes: Arc<MemoryToolDispatcher>,
+    external_tools: Arc<dyn AgentToolDispatcher>,
+    scoped_tx: mpsc::Sender<ScopedAgentEvent>,
+}
+
+impl SessionTemplate {
+    /// Options for a session build. Instruction files and the notes index are
+    /// re-read every time, so `/clear`, `/resume` and `/compact` reload them.
+    fn options(&self, resume: Option<Session>, model: Option<String>) -> SessionOptions {
+        SessionOptions {
+            resume,
+            external_tools: Some(Arc::clone(&self.external_tools)),
+            scoped_event_tx: Some(self.scoped_tx.clone()),
+            additional_instructions: session_instructions(
+                &self.workspace,
+                self.global.as_ref(),
+                Some(&self.notes),
+            ),
+            model,
+        }
+    }
+}
+
 struct Integrator {
     runtime: Runtime,
     engine: Arc<ApprovalEngine>,
     session: SessionHandle,
-    external_tools: Arc<dyn AgentToolDispatcher>,
-    scoped_tx: mpsc::Sender<ScopedAgentEvent>,
+    template: SessionTemplate,
     agent_tx: mpsc::Sender<EventEnvelope<AgentEvent>>,
     ui_tx: mpsc::UnboundedSender<Msg>,
     effect_rx: mpsc::UnboundedReceiver<Effect>,
@@ -430,7 +534,23 @@ struct Integrator {
     diff_rx: mpsc::UnboundedReceiver<FileDiff>,
     pending: HashMap<u64, PendingEscalation>,
     next_escalation: u64,
-    turn: Option<TurnTask>,
+    turn: Option<RunningTurn>,
+    /// Messages injected into the running turn, `(id, framed body)` in
+    /// injection order; reconciled when the turn ends.
+    inflight: Vec<(PendingId, String)>,
+    /// The model sessions run on (start-up model, then `/model`); kept across
+    /// `/clear` and `/compact` rebuilds.
+    current_model: String,
+    /// Estimated context of the current session after its last turn, for
+    /// `CompactionStarted`.
+    last_context: Option<u64>,
+}
+
+/// A turn in flight and the session it runs on (which stays the one to
+/// reconcile against even if the UI switches sessions meanwhile).
+struct RunningTurn {
+    task: TurnTask,
+    session: SessionHandle,
 }
 
 impl Integrator {
@@ -454,15 +574,62 @@ impl Integrator {
                     added: diff.added,
                     removed: diff.removed,
                 }),
-                result = async { match self.turn.as_mut() { Some(turn) => turn.await, None => std::future::pending().await } } => {
-                    self.turn = None;
-                    if result.is_err() {
-                        self.persist_session().await;
-                    }
-                    self.send(Msg::TurnFinished(turn_summary(result)));
+                result = async { match self.turn.as_mut() { Some(turn) => (&mut turn.task).await, None => std::future::pending().await } } => {
+                    self.turn_finished(result).await;
                 }
             }
         }
+    }
+
+    /// Branch order: persist on error, reconcile injected messages, report.
+    async fn turn_finished(&mut self, result: Result<meerkat_core::RunResult, SessionError>) {
+        let Some(RunningTurn { session, .. }) = self.turn.take() else {
+            return;
+        };
+        if result.is_err() {
+            self.persist_session(&session).await;
+        }
+        let delivery = reconcile(&session, &mut self.inflight).await;
+        if session.id() == self.session.id() {
+            match session.export().await {
+                Ok(snapshot) => self.last_context = Some(estimate_tokens(snapshot.messages())),
+                Err(err) => {
+                    tracing::debug!(error = %err, "could not export session for the context estimate");
+                }
+            }
+        }
+        self.send(Msg::TurnFinished(TurnOutcome {
+            result: turn_summary(result),
+            delivery,
+        }));
+    }
+
+    /// Answer [`Effect::Inject`]: frame the text and put it in the running
+    /// turn's inbox.
+    async fn inject(&mut self, id: PendingId, text: &str) {
+        let result = match &self.turn {
+            None => Err(InjectFailure::NotRunning),
+            Some(turn) => {
+                let framed = frame(text);
+                let result = turn.session.inject(framed.clone()).await;
+                if result.is_ok() {
+                    // The classifier must see mid-turn instructions as user intent.
+                    self.engine.record_prompt(turn.session.id(), text);
+                    self.inflight.push((id, framed));
+                }
+                result
+            }
+        };
+        self.send(Msg::InjectAck { id, result });
+    }
+
+    /// Answer [`Effect::RecallPending`].
+    async fn recall_pending(&mut self) {
+        let recalled = match &self.turn {
+            Some(turn) => recall(&turn.session, &mut self.inflight).await,
+            None => Vec::new(),
+        };
+        self.send(Msg::Recalled(recalled));
     }
 
     fn send(&self, msg: Msg) {
@@ -472,8 +639,8 @@ impl Integrator {
     /// Save the live session to the store. The engine only persists a session
     /// when a run completes, so after a failed or interrupted turn the user's
     /// prompt would otherwise be lost to `--continue`.
-    async fn persist_session(&self) {
-        match self.runtime.service.export_session(self.session.id()).await {
+    async fn persist_session(&self, session: &SessionHandle) {
+        match session.export().await {
             Ok(session) => {
                 if let Err(err) = self.runtime.store.save(&session).await {
                     tracing::warn!(error = %err, "could not persist session after failed turn");
@@ -505,7 +672,11 @@ impl Integrator {
     async fn handle_effect(&mut self, effect: Effect) {
         match effect {
             Effect::StartTurn(prompt) => self.start_turn(prompt),
-            Effect::Interrupt => {
+            Effect::Inject { id, text } => self.inject(id, &text).await,
+            Effect::RecallPending => self.recall_pending().await,
+            // The UI keeps the text of `InterruptAndSend` and starts the next
+            // turn itself once `TurnFinished` arrives.
+            Effect::Interrupt | Effect::InterruptAndSend(_) => {
                 self.stop_pending();
                 if let Err(err) = self.session.interrupt().await
                     && !matches!(err, SessionError::NotRunning { .. })
@@ -514,7 +685,7 @@ impl Integrator {
                 }
             }
             Effect::Quit => {}
-            Effect::NewSession => self.new_session(None).await,
+            Effect::NewSession => self.new_session().await,
             Effect::ResumeSession(reference) => self.resume_session(&reference).await,
             Effect::RequestResumePicker => self.show_resume_picker().await,
             Effect::RespondEscalation(id, answer) => self.respond_escalation(id, answer),
@@ -549,6 +720,8 @@ impl Integrator {
                 self.notice(NoticeLevel::Info, "auto mode resumed");
             }
             Effect::SetModel(model) => self.set_model(model).await,
+            Effect::Remember(text) => self.remember(&text),
+            Effect::Compact => self.compact().await,
         }
     }
 
@@ -557,53 +730,10 @@ impl Integrator {
             self.notice(NoticeLevel::Warn, "a turn is already running");
             return;
         }
-        self.turn = Some(self.session.spawn_turn(prompt, self.agent_tx.clone()));
-    }
-
-    async fn new_session(&mut self, resume: Option<Session>) {
-        let resumed_blocks = resume.as_ref().map(blocks_from_session);
-        if let Some(session) = &resume {
-            self.engine.seed_transcript(session.id(), session);
-        }
-        let options = SessionOptions {
-            resume,
-            external_tools: Some(Arc::clone(&self.external_tools)),
-            scoped_event_tx: Some(self.scoped_tx.clone()),
-            additional_instructions: Vec::new(),
-        };
-        match SessionHandle::create(&self.runtime, options).await {
-            Ok(handle) => {
-                self.send(Msg::Status(StatusUpdate::Session(handle.id().to_string())));
-                self.send(Msg::Status(StatusUpdate::Model {
-                    provider: provider_name(handle.provider()).to_string(),
-                    model: handle.model().to_string(),
-                }));
-                if let Some(blocks) = resumed_blocks {
-                    self.send(Msg::ResetTranscript(blocks));
-                }
-                self.session = handle;
-            }
-            Err(err) => self.notice(NoticeLevel::Error, format!("session: {err}")),
-        }
-    }
-
-    async fn resume_session(&mut self, reference: &str) {
-        let store = Arc::clone(&self.runtime.store);
-        let loaded = match resolve_session_ref(&*store, reference).await {
-            Ok(id) => load_session(&*store, &id).await,
-            Err(err) => Err(err),
-        };
-        match loaded {
-            Ok(session) => {
-                let usage = session.total_usage();
-                self.new_session(Some(session)).await;
-                self.send(Msg::Status(StatusUpdate::Tokens {
-                    input: usage.input_tokens,
-                    output: usage.output_tokens,
-                }));
-            }
-            Err(err) => self.notice(NoticeLevel::Error, err.to_string()),
-        }
+        self.turn = Some(RunningTurn {
+            task: self.session.spawn_turn(prompt, self.agent_tx.clone()),
+            session: self.session.clone(),
+        });
     }
 
     async fn show_resume_picker(&self) {
@@ -744,7 +874,7 @@ impl Integrator {
         }
     }
 
-    async fn set_model(&self, model: String) {
+    async fn set_model(&mut self, model: String) {
         if Provider::infer_from_model(&model) != Some(self.session.provider()) {
             self.notice(
                 NoticeLevel::Warn,
@@ -769,8 +899,10 @@ impl Integrator {
             Ok(()) => {
                 self.send(Msg::Status(StatusUpdate::Model {
                     provider: provider_name(self.session.provider()).to_string(),
-                    model,
+                    model: model.clone(),
                 }));
+                self.current_model = model;
+                self.push_context_window();
             }
             Err(err) => self.notice(NoticeLevel::Error, format!("model not changed: {err}")),
         }
@@ -865,9 +997,6 @@ fn describe_rule(rule: &Rule) -> String {
         None => format!("{kind} {}", rule.tool.as_str()),
     }
 }
-
-#[allow(dead_code)]
-fn _unused_markers(_: PathBuf, _: SystemTime) {}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

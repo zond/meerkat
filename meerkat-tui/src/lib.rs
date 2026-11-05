@@ -17,7 +17,9 @@
 pub mod approval;
 pub mod bootstrap;
 pub mod cli;
+pub mod delivery;
 pub mod error;
+pub mod memory;
 pub mod paths;
 pub mod runner;
 pub mod session;

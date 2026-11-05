@@ -11,6 +11,8 @@ use meerkat_core::{AgentEvent, HookPoint, ScopedAgentEvent, StreamScopeFrame, Us
 use ratatui::text::Line;
 use serde_json::Value;
 
+use crate::delivery::PendingId;
+
 use super::markdown::truncate_chars;
 use super::render::block_lines;
 
@@ -58,6 +60,32 @@ pub enum ToolState {
     },
 }
 
+/// Delivery state shown on a [`Block::Queued`] placeholder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuedLabel {
+    /// Waiting for the integrator to accept it.
+    Queued,
+    /// In the agent's inbox, waiting for the next turn boundary.
+    Delivering,
+    /// Could not be injected; sent when the turn ends.
+    Deferred,
+    /// Being pulled back into the editor.
+    Recalling,
+}
+
+impl QueuedLabel {
+    /// Text shown after the message.
+    #[must_use]
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Delivering => "delivering…",
+            Self::Deferred => "will send after this turn",
+            Self::Recalling => "recalling…",
+        }
+    }
+}
+
 /// A file diff attached to a tool block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffView {
@@ -78,6 +106,16 @@ pub enum Block {
     User {
         /// Prompt text.
         text: String,
+    },
+    /// A message typed while a turn was running, not yet seen by the model.
+    /// Replaced in place by [`Block::User`] once delivered.
+    Queued {
+        /// Pending-queue id.
+        id: PendingId,
+        /// Message text.
+        text: String,
+        /// Delivery state.
+        label: QueuedLabel,
     },
     /// Assistant output (markdown source).
     Assistant {
@@ -211,6 +249,38 @@ impl Transcript {
             *slot = None;
         }
         self.blocks.get_mut(id.0)
+    }
+
+    /// Replace a block in place (keeps transcript order). Returns whether `id`
+    /// existed.
+    pub fn replace_block(&mut self, id: BlockId, block: Block) -> bool {
+        match self.block_mut(id) {
+            Some(slot) => {
+                *slot = block;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove a block. Later block ids shift down by one; the tool-id index and
+    /// open streams are fixed up, callers holding other ids must adjust them.
+    pub fn remove_block(&mut self, id: BlockId) -> Option<Block> {
+        if id.0 >= self.blocks.len() {
+            return None;
+        }
+        let block = self.blocks.remove(id.0);
+        if id.0 < self.layout.len() {
+            self.layout.remove(id.0);
+        }
+        let shift = |b: BlockId| if b.0 > id.0 { BlockId(b.0 - 1) } else { b };
+        self.by_tool_id.retain(|_, b| *b != id);
+        for b in self.by_tool_id.values_mut() {
+            *b = shift(*b);
+        }
+        self.open_assistant = self.open_assistant.filter(|b| *b != id).map(shift);
+        self.open_reasoning = self.open_reasoning.filter(|b| *b != id).map(shift);
+        Some(block)
     }
 
     /// Drop every cached layout (e.g. on resize).
@@ -827,5 +897,33 @@ mod tests {
         t.apply_agent_event(&text("\ntwo\nthree"));
         let h2 = t.ensure_layout(40);
         assert_eq!(h2, h1 + 2);
+    }
+
+    #[test]
+    fn replace_and_remove_blocks_keep_order_and_indices() {
+        let mut t = Transcript::new();
+        t.push(Block::User { text: "a".into() });
+        let q = t.push(Block::Queued {
+            id: PendingId(1),
+            text: "b".into(),
+            label: QueuedLabel::Queued,
+        });
+        t.apply_agent_event(&AgentEvent::ToolCallRequested {
+            id: "t1".into(),
+            name: "glob".into(),
+            args: json!({}),
+        });
+        assert_eq!(t.tool_block("t1"), Some(BlockId(2)));
+        assert!(t.replace_block(q, Block::User { text: "b".into() }));
+        assert_eq!(t.block(q), Some(&Block::User { text: "b".into() }));
+        assert!(!t.replace_block(BlockId(9), Block::User { text: "x".into() }));
+        assert_eq!(
+            t.remove_block(BlockId(1)),
+            Some(Block::User { text: "b".into() })
+        );
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.tool_block("t1"), Some(BlockId(1)));
+        assert!(t.remove_block(BlockId(5)).is_none());
+        assert_eq!(t.ensure_layout(40), t.visible_lines(0, 100).len());
     }
 }

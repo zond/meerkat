@@ -485,10 +485,10 @@ impl Harness {
         let (scope, config) = bootstrap::prepare(&args).await.expect("prepare");
 
         let realm_dir = scope.realm_root();
-        let home_rkat = scope.user_config_root.as_ref().map(|h| h.join(".rkat"));
+        let global_rules = scope.global.as_ref().map(bootstrap::GlobalDirs::rules_file);
         let (mut rule_set, settings, _notices) = rules::load_layered(
             &realm_dir,
-            home_rkat.as_deref(),
+            global_rules.as_deref(),
             &scope.context_root.join(".rkat"),
         )
         .expect("load rules");

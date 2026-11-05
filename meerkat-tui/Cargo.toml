@@ -17,8 +17,9 @@ name = "rkat-tui"
 path = "src/main.rs"
 
 [dependencies]
-# Meerkat engine (feature-gated: no comms, no mob, no semantic memory)
-meerkat = { workspace = true, features = ["anthropic", "openai", "gemini", "jsonl-store", "memory-store", "session-store", "session-compaction", "skills"] }
+# Meerkat engine (feature-gated: no mob; comms is in-process only, for mid-turn delivery;
+# semantic memory backs `memory_search` and indexes what `/compact` discards)
+meerkat = { workspace = true, features = ["anthropic", "openai", "gemini", "jsonl-store", "memory-store", "memory-store-session", "session-store", "session-compaction", "skills", "comms"] }
 meerkat-core = { workspace = true }
 meerkat-client = { workspace = true }
 meerkat-store = { workspace = true }
@@ -26,6 +27,7 @@ meerkat-session = { workspace = true }
 meerkat-hooks = { workspace = true }
 meerkat-tools = { workspace = true }
 meerkat-models = { workspace = true }
+meerkat-memory = { workspace = true }
 
 # Async + serialization
 tokio = { workspace = true }

@@ -227,3 +227,158 @@ fn markdown_assistant_block_snapshot() {
     assert!(buf[(6, 2)].modifier.contains(Modifier::BOLD));
     assert_eq!(buf[(15, 2)].fg, Color::Yellow);
 }
+
+#[test]
+fn history_search_prompt_line() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = App::new(StatusInfo::default())
+        .with_history(vec!["cargo build --release".into(), "git status".into()]);
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('r'),
+        KeyModifiers::CONTROL,
+    )));
+    for c in "build".chars() {
+        app.update(Msg::Key(KeyEvent::from(KeyCode::Char(c))));
+    }
+    let buf = render_buffer(&mut app, W, H);
+    let lines = rows(&buf);
+    assert!(lines[9].contains("Ctrl-R older"), "title: {:?}", lines[9]);
+    assert_eq!(
+        lines[10],
+        "(reverse-i-search)`build': cargo build --release"
+    );
+    // The matched substring is highlighted; the rest of the entry is not.
+    let at = "(reverse-i-search)`build': cargo ".chars().count() as u16;
+    assert_eq!(buf[(at, 10)].bg, Color::Yellow);
+    assert_eq!(buf[(at + 4, 10)].bg, Color::Yellow);
+    assert_ne!(buf[(at + 5, 10)].bg, Color::Yellow);
+    assert_ne!(buf[(at - 1, 10)].bg, Color::Yellow);
+    for c in "zz".chars() {
+        app.update(Msg::Key(KeyEvent::from(KeyCode::Char(c))));
+    }
+    let lines = rows(&render_buffer(&mut app, W, H));
+    assert_eq!(lines[10], "(failing reverse-i-search)`buildzz':");
+}
+
+#[test]
+fn queued_block_status_count_and_recall_hint() {
+    use meerkat_tui::delivery::PendingId;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    let mut app = sample_app();
+    let now = Instant::now();
+    for c in "go".chars() {
+        app.update(Msg::Key(KeyEvent::from(KeyCode::Char(c))));
+    }
+    app.update_at(Msg::Key(KeyEvent::from(KeyCode::Enter)), now);
+    for c in "also fix tests".chars() {
+        app.update(Msg::Key(KeyEvent::from(KeyCode::Char(c))));
+    }
+    app.update_at(Msg::Key(KeyEvent::from(KeyCode::Enter)), now);
+    let rows = render_sized(&mut app, now, 100);
+    assert!(
+        rows.iter().any(|r| r == "› also fix tests  · queued"),
+        "rows: {rows:#?}"
+    );
+    assert!(
+        rows[9].contains("Esc recall all · ↑ edit last queued"),
+        "input title: {:?}",
+        rows[9]
+    );
+    assert!(
+        rows[11].ends_with("│ queued 1"),
+        "status row: {:?}",
+        rows[11]
+    );
+
+    app.update(Msg::InjectAck {
+        id: PendingId(1),
+        result: Ok(()),
+    });
+    let rows = render_sized(&mut app, now, 100);
+    assert!(
+        rows.iter().any(|r| r == "› also fix tests  · delivering…"),
+        "rows: {rows:#?}"
+    );
+    // The placeholder is dim.
+    let buffer = render_buffer(&mut app, 100, H);
+    let y = (0..H)
+        .find(|&y| buffer[(0, y)].symbol() == "›" && buffer[(2, y)].symbol() == "a")
+        .expect("queued row");
+    assert!(buffer[(2, y)].modifier.contains(Modifier::DIM));
+}
+
+#[test]
+fn status_bar_shows_context_gauge_with_threshold_colours() {
+    use meerkat_tui::ui::StatusUpdate;
+    let mut app = sample_app();
+    let now = Instant::now();
+    app.update(Msg::Status(StatusUpdate::ContextWindow(Some(200_000))));
+    app.update(Msg::Status(StatusUpdate::Context {
+        used: Some(84_000),
+        approx: false,
+    }));
+    let rows = render_sized(&mut app, now, 100);
+    assert_eq!(
+        rows[11],
+        " anthropic/claude-sonnet-4-6 │ session abc123ef │ ↑1.2k ↓345 │ ctx 42% (84k/200k)"
+    );
+
+    app.update(Msg::Status(StatusUpdate::Context {
+        used: Some(84_000),
+        approx: true,
+    }));
+    let rows = render_sized(&mut app, now, 100);
+    assert!(
+        rows[11].ends_with("│ ctx ~42% (84k/200k)"),
+        "status row: {:?}",
+        rows[11]
+    );
+
+    // Colour of the gauge cell (`c` of `ctx`) at each threshold.
+    let gauge_fg = |app: &mut App| {
+        let buffer = render_buffer(app, 100, H);
+        let x = (0..98)
+            .find(|&x| {
+                (0..3)
+                    .map(|i| buffer[(x + i, H - 1)].symbol())
+                    .eq(["c", "t", "x"])
+            })
+            .expect("ctx segment");
+        buffer[(x, H - 1)].fg
+    };
+    let normal = gauge_fg(&mut app);
+    assert_ne!(normal, Color::Yellow);
+    assert_ne!(normal, Color::Red);
+    for (used, colour) in [(140_000, Color::Yellow), (180_000, Color::Red)] {
+        app.update(Msg::Status(StatusUpdate::Context {
+            used: Some(used),
+            approx: false,
+        }));
+        assert_eq!(gauge_fg(&mut app), colour, "used {used}");
+    }
+
+    // Window unknown: plain usage; nothing at all when usage is unknown.
+    app.update(Msg::Status(StatusUpdate::ContextWindow(None)));
+    let rows = render_sized(&mut app, now, 100);
+    assert!(
+        rows[11].ends_with("│ ctx 180k"),
+        "status row: {:?}",
+        rows[11]
+    );
+    app.update(Msg::Status(StatusUpdate::Context {
+        used: None,
+        approx: false,
+    }));
+    let rows = render_sized(&mut app, now, 100);
+    assert!(!rows[11].contains("ctx"), "status row: {:?}", rows[11]);
+
+    // A narrow terminal clips the bar instead of wrapping it.
+    app.update(Msg::Status(StatusUpdate::ContextWindow(Some(200_000))));
+    app.update(Msg::Status(StatusUpdate::Context {
+        used: Some(84_000),
+        approx: false,
+    }));
+    let rows = render_sized(&mut app, now, 40);
+    assert_eq!(rows.len(), usize::from(H));
+    assert!(rows[11].chars().count() <= 40);
+}

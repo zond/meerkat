@@ -4,6 +4,7 @@
 
 use super::rules::{RuleId, RuleSet};
 use super::shell;
+use crate::memory::{MEMORY_FORGET, MEMORY_LIST, MEMORY_READ, MEMORY_SAVE, slug};
 use crate::paths::ProjectRoot;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -90,6 +91,7 @@ pub const READ_ONLY_BUILTINS: &[&str] = &[
     "agent_list",
     "shell_jobs",
     "shell_job_status",
+    "memory_search",
 ];
 
 /// `apply_patch` target markers (mirrors `meerkat-tools/src/builtin/utility/apply_patch.rs`).
@@ -131,6 +133,15 @@ pub enum ActionKind<'a> {
     },
     /// A builtin from [`READ_ONLY_BUILTINS`].
     ReadOnlyBuiltin,
+    /// `memory_list` / `memory_read`.
+    MemoryRead,
+    /// `memory_save` / `memory_forget` with a valid scope.
+    MemoryWrite {
+        /// `"user"` or `"workspace"`.
+        scope: &'a str,
+        /// Note name as supplied (rule subjects use its slug when valid).
+        name: &'a str,
+    },
     /// Anything else, including calls with malformed arguments.
     Other,
 }
@@ -181,6 +192,13 @@ impl<'a> Action<'a> {
                 Some(paths) if !paths.is_empty() => ActionKind::FileWrite { paths },
                 _ => ActionKind::Other,
             },
+            MEMORY_LIST | MEMORY_READ => ActionKind::MemoryRead,
+            MEMORY_SAVE | MEMORY_FORGET => match (str_arg("scope"), str_arg("name")) {
+                (Some(scope @ ("user" | "workspace")), Some(name)) => {
+                    ActionKind::MemoryWrite { scope, name }
+                }
+                _ => ActionKind::Other,
+            },
             n if READ_ONLY_BUILTINS.contains(&n) => ActionKind::ReadOnlyBuiltin,
             _ => ActionKind::Other,
         };
@@ -188,7 +206,7 @@ impl<'a> Action<'a> {
     }
 
     /// Canonical rule subjects: the command for `shell`, display paths for file
-    /// tools, pretty JSON for everything else.
+    /// tools, `<scope>/<slug>` for memory writes, pretty JSON for everything else.
     pub fn subjects(&self, root: &ProjectRoot) -> Vec<String> {
         let display = |raw: &str| match root.resolve(raw) {
             Ok(resolved) => root.display_of(&resolved).to_string(),
@@ -199,7 +217,11 @@ impl<'a> Action<'a> {
             ActionKind::FileRead { path } => vec![display(path)],
             ActionKind::Search { path, .. } => vec![path.map_or_else(|| ".".to_string(), display)],
             ActionKind::FileWrite { paths } => paths.iter().map(|p| display(p)).collect(),
-            ActionKind::ReadOnlyBuiltin | ActionKind::Other => {
+            ActionKind::MemoryWrite { scope, name } => {
+                let name = slug(name).unwrap_or_else(|_| (*name).to_string());
+                vec![format!("{scope}/{name}")]
+            }
+            ActionKind::ReadOnlyBuiltin | ActionKind::MemoryRead | ActionKind::Other => {
                 vec![serde_json::to_string_pretty(self.args).unwrap_or_default()]
             }
         }
@@ -287,6 +309,17 @@ fn builtin_tier(action: &Action<'_>, ctx: &PolicyContext<'_>) -> Result<TierDeci
     match &action.kind {
         ActionKind::ReadOnlyBuiltin => {
             Ok(TierDecision::new(Tier::AlwaysAllow, "read-only builtin"))
+        }
+        ActionKind::MemoryRead => Ok(TierDecision::new(Tier::AlwaysAllow, "memory read")),
+        ActionKind::MemoryWrite { scope, .. } => {
+            if *scope == "workspace" {
+                Ok(TierDecision::new(
+                    Tier::InProjectEdit,
+                    "workspace memory note",
+                ))
+            } else {
+                Err("user-level memory persists into every project's system prompt".to_string())
+            }
         }
         ActionKind::FileRead { path } => {
             require_inside(ctx.root, path)?;
@@ -575,6 +608,55 @@ mod tests {
                 Tier::Classifier,
             ),
             ("unknown_tool", json!({}), true, Tier::Classifier),
+            ("memory_list", json!({}), true, Tier::AlwaysAllow),
+            (
+                "memory_read",
+                json!({"scope": "user", "name": "x"}),
+                true,
+                Tier::AlwaysAllow,
+            ),
+            (
+                "memory_search",
+                json!({"query": "x"}),
+                true,
+                Tier::AlwaysAllow,
+            ),
+            (
+                "memory_save",
+                json!({"scope": "workspace", "name": "x", "content": "y"}),
+                true,
+                Tier::InProjectEdit,
+            ),
+            (
+                "memory_forget",
+                json!({"scope": "workspace", "name": "x"}),
+                true,
+                Tier::InProjectEdit,
+            ),
+            (
+                "memory_save",
+                json!({"scope": "user", "name": "x", "content": "y"}),
+                true,
+                Tier::Classifier,
+            ),
+            (
+                "memory_forget",
+                json!({"scope": "user", "name": "x"}),
+                true,
+                Tier::Classifier,
+            ),
+            (
+                "memory_save",
+                json!({"scope": "global", "name": "x", "content": "y"}),
+                true,
+                Tier::Classifier,
+            ),
+            (
+                "memory_save",
+                json!({"scope": "workspace"}),
+                true,
+                Tier::Classifier,
+            ),
         ];
         for (name, args, trust, expected) in &cases {
             assert_eq!(
@@ -683,6 +765,68 @@ mod tests {
         assert_eq!(
             Action::parse("mcp__a__b", &args).subjects(&root),
             ["{\n  \"x\": 1\n}"]
+        );
+    }
+
+    #[test]
+    fn memory_writes_parse_and_match_rules() {
+        let (_dir, root) = project();
+        let args = json!({"scope": "user", "name": "Prefers Rust!", "content": "x"});
+        let action = Action::parse("memory_save", &args);
+        assert_eq!(
+            action.kind,
+            ActionKind::MemoryWrite {
+                scope: "user",
+                name: "Prefers Rust!"
+            }
+        );
+        assert_eq!(action.subjects(&root), ["user/prefers-rust"]);
+        let ctx = PolicyContext {
+            root: &root,
+            trust_project_builds: true,
+            posix_shell: true,
+        };
+        let decision = classify_tier(&action, &RuleSet::default(), &ctx);
+        assert_eq!(decision.tier, Tier::Classifier);
+        assert_eq!(
+            decision.detail,
+            "user-level memory persists into every project's system prompt"
+        );
+        let ws = json!({"scope": "workspace", "name": "x", "content": "y"});
+        let decision = classify_tier(
+            &Action::parse("memory_save", &ws),
+            &RuleSet::default(),
+            &ctx,
+        );
+        assert_eq!(decision.detail, "workspace memory note");
+
+        let mut rules = RuleSet::default();
+        rules.push(
+            Rule::new(
+                RuleKind::Allow,
+                "memory_save",
+                Some("user/*"),
+                RuleOrigin::Realm,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            tier(&root, &rules, true, "memory_save", &args),
+            Tier::AlwaysAllow
+        );
+        let mut rules = RuleSet::default();
+        rules.push(
+            Rule::new(
+                RuleKind::Deny,
+                "memory_save",
+                Some("workspace/*"),
+                RuleOrigin::Realm,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            tier(&root, &rules, true, "memory_save", &ws),
+            Tier::UserDeny
         );
     }
 }

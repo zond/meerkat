@@ -41,6 +41,12 @@ pub struct Args {
     #[arg(long)]
     pub user_config_root: Option<PathBuf>,
 
+    /// Directory for user-global rkat-tui files: AGENTS.md, SYSTEM.md, tui.toml
+    /// rules, notes, history. Defaults to $XDG_CONFIG_HOME/rkat-tui
+    /// (~/.config/rkat-tui); on Windows the platform config dir.
+    #[arg(long)]
+    pub config_dir: Option<PathBuf>,
+
     /// Join a shared realm by ID instead of using the workspace-local state
     /// directory (the realm model `rkat` uses).
     #[arg(long)]
@@ -136,6 +142,17 @@ mod tests {
             args.context_root.as_deref(),
             Some(std::path::Path::new("/tmp/y"))
         );
+    }
+
+    #[test]
+    fn parses_config_dir() {
+        let args = Args::try_parse_from(["rkat-tui", "--config-dir", "/tmp/cfg"]).unwrap();
+        assert_eq!(
+            args.config_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/cfg"))
+        );
+        let args = Args::try_parse_from(["rkat-tui"]).unwrap();
+        assert!(args.config_dir.is_none());
     }
 
     #[test]

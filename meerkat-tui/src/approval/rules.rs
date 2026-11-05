@@ -4,7 +4,8 @@
 //! action's canonical subject ([`ArgPattern`]): the command string for `shell`,
 //! the display path for file tools, pretty JSON for everything else.
 //!
-//! Three files are layered: `~/.rkat/tui.toml` (global), `<realm>/tui.toml`
+//! Three files are layered: `~/.config/rkat-tui/tui.toml` (global, see
+//! [`crate::bootstrap::GlobalDirs`]), `<realm>/tui.toml`
 //! (per-workspace, the default write target) and `<project>/.rkat/tui.toml`
 //! (committed with the repository, therefore untrusted: it may only add deny
 //! rules and `[auto]` settings, and may not loosen `trust_project_builds`).
@@ -556,6 +557,14 @@ pub enum Notice {
         /// Number of ignored allow rules.
         count: usize,
     },
+    /// A global rules file exists at the pre-`GlobalDirs` location and is no
+    /// longer read.
+    LegacyGlobalRulesIgnored {
+        /// The old file (`<user config root>/.rkat/tui.toml`).
+        path: PathBuf,
+        /// Where the global rules file now lives.
+        new_path: PathBuf,
+    },
 }
 
 impl fmt::Display for Notice {
@@ -576,11 +585,39 @@ impl fmt::Display for Notice {
                 "{} is tracked by git; ignored {count} allow rule(s) from it",
                 path.display()
             ),
+            Self::LegacyGlobalRulesIgnored { path, new_path } => write!(
+                f,
+                "{} is no longer read; move it to {}",
+                path.display(),
+                new_path.display()
+            ),
         }
     }
 }
 
+/// A [`Notice::LegacyGlobalRulesIgnored`] when the old global rules file
+/// `<user_config_root>/.rkat/tui.toml` exists.
+///
+/// `new_path` is the current global rules file; without one the notice is not
+/// emitted (there is nowhere to point the user).
+#[must_use]
+pub fn legacy_global_rules_notice(
+    user_config_root: Option<&Path>,
+    new_path: Option<&Path>,
+) -> Option<Notice> {
+    let path = user_config_root?.join(".rkat").join(RULES_FILE_NAME);
+    let new_path = new_path?;
+    (path.is_file() && path != new_path).then(|| Notice::LegacyGlobalRulesIgnored {
+        path,
+        new_path: new_path.to_path_buf(),
+    })
+}
+
 /// Load and merge the three rule layers.
+///
+/// `global_rules_file` is the user-global rules file itself (typically
+/// [`crate::bootstrap::GlobalDirs::rules_file`]); the realm and project layers
+/// are `tui.toml` inside `realm_dir` and `project_rkat_dir`.
 ///
 /// Settings precedence (later wins): global, realm, project. The project layer
 /// contributes only deny rules and `[auto]` settings, and cannot turn
@@ -591,7 +628,7 @@ impl fmt::Display for Notice {
 /// Returns [`RulesError`] when a file cannot be read or parsed.
 pub fn load_layered(
     realm_dir: &Path,
-    home_rkat_dir: Option<&Path>,
+    global_rules_file: Option<&Path>,
     project_rkat_dir: &Path,
 ) -> Result<(RuleSet, AutoSettings, Vec<Notice>), RulesError> {
     let mut rules = RuleSet::default();
@@ -599,8 +636,8 @@ pub fn load_layered(
     let mut notices = Vec::new();
 
     let mut user_layers = Vec::new();
-    if let Some(home) = home_rkat_dir {
-        user_layers.push((home.join(RULES_FILE_NAME), RuleOrigin::Global));
+    if let Some(global) = global_rules_file {
+        user_layers.push((global.to_path_buf(), RuleOrigin::Global));
     }
     user_layers.push((realm_dir.join(RULES_FILE_NAME), RuleOrigin::Realm));
 
@@ -866,7 +903,8 @@ mod tests {
             "[auto]\ntrust_project_builds = true\nenabled = false\n[[allow]]\ntool = \"shell\"\n[[deny]]\ntool = \"agent_spawn\"\n",
         )
         .unwrap();
-        let (rules, settings, notices) = load_layered(&realm, Some(&home), &project).unwrap();
+        let (rules, settings, notices) =
+            load_layered(&realm, Some(&home.join(RULES_FILE_NAME)), &project).unwrap();
         assert_eq!(rules.allow.len(), 1);
         assert_eq!(rules.allow[0].origin, RuleOrigin::Realm);
         assert_eq!(rules.deny.len(), 2);
@@ -879,6 +917,64 @@ mod tests {
                 .iter()
                 .any(|n| matches!(n, Notice::ProjectAllowIgnored { count: 1, .. }))
         );
+    }
+
+    #[test]
+    fn global_rules_come_from_the_file_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("cfg").join("custom.toml");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(
+            &global,
+            "[[allow]]\ntool = \"shell\"\narg = \"make test\"\n[[deny]]\ntool = \"shell\"\narg = \"rm *\"\n",
+        )
+        .unwrap();
+        let (rules, _, notices) =
+            load_layered(&tmp.path().join("realm"), Some(&global), tmp.path()).unwrap();
+        assert_eq!(rules.allow.len(), 1);
+        assert_eq!(rules.allow[0].origin, RuleOrigin::Global);
+        assert_eq!(rules.deny.len(), 1);
+        assert_eq!(rules.deny[0].origin, RuleOrigin::Global);
+        assert!(notices.is_empty());
+        // A missing global file is not an error.
+        let (rules, _, _) = load_layered(
+            &tmp.path().join("realm"),
+            Some(&tmp.path().join("missing.toml")),
+            tmp.path(),
+        )
+        .unwrap();
+        assert_eq!(rules, RuleSet::default());
+    }
+
+    #[test]
+    fn legacy_global_rules_notice_only_when_old_file_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let new_path = tmp.path().join(".config/rkat-tui/tui.toml");
+        assert_eq!(
+            legacy_global_rules_notice(Some(tmp.path()), Some(&new_path)),
+            None
+        );
+        let old = tmp.path().join(".rkat").join(RULES_FILE_NAME);
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, "").unwrap();
+        let notice = legacy_global_rules_notice(Some(tmp.path()), Some(&new_path)).unwrap();
+        assert_eq!(
+            notice,
+            Notice::LegacyGlobalRulesIgnored {
+                path: old.clone(),
+                new_path: new_path.clone()
+            }
+        );
+        assert_eq!(
+            notice.to_string(),
+            format!(
+                "{} is no longer read; move it to {}",
+                old.display(),
+                new_path.display()
+            )
+        );
+        assert_eq!(legacy_global_rules_notice(None, Some(&new_path)), None);
+        assert_eq!(legacy_global_rules_notice(Some(tmp.path()), None), None);
     }
 
     #[test]

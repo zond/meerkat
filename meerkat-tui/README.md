@@ -40,8 +40,11 @@ Sub-agents spawned by the agent inherit the same hooks, so they are gated too.
 
 ## Rules
 
-Rules live in TOML, layered: `<realm>/tui.toml` (written by the UI), then
-`~/.rkat/tui.toml`, then `<project>/.rkat/tui.toml`. The project file may only
+Rules live in TOML, layered (later settings win): the user-global
+`~/.config/rkat-tui/tui.toml` (see below), then `<realm>/tui.toml` (written by
+the UI), then `<project>/.rkat/tui.toml`. The old global location
+`~/.rkat/tui.toml` is no longer read; rkat-tui shows a notice if it still exists.
+The project file may only
 add deny rules and `[auto]` settings; broad allow rules (blanket shell,
 interpreters, package-manager run commands) are dropped when auto mode starts.
 
@@ -63,11 +66,59 @@ arg = "git push*"
 ## Keys and commands
 
 Enter sends; Alt+Enter / Ctrl+J insert a newline; Ctrl-C interrupts a running
-turn (twice to quit when idle); Ctrl-D quits; Ctrl-R toggles the last reasoning
-block; PgUp/PgDn and Shift+↑/↓ scroll.
+turn (twice to quit when idle); Ctrl-D quits; Ctrl-O toggles the last reasoning
+block; Ctrl-R searches prompt history (workspace, then global; Ctrl-R again for
+older matches, Enter/arrows accept into the editor, Esc cancels); Ctrl-X Ctrl-S
+interrupts the running turn and sends the input; PgUp/PgDn and Shift+↑/↓ scroll.
 
 `/help`, `/quit`, `/clear`, `/resume [ref]`, `/rules [list|add allow|deny <tool> [pattern]|rm <n>]`,
-`/auto [on|off|resume]`, `/model <id>`.
+`/auto [on|off|resume]`, `/model <id>`, `/remember <text>`, `/compact`.
+
+A single-line prompt starting with `#` (`# use cargo nextest`) is the same as
+`/remember`; `##…`, multi-line input and `\#…` are sent as prompts.
+
+The status bar shows a context gauge, `ctx 42% (84k/200k)`, yellow from 70%
+and red from 90% (`~` marks an estimate, e.g. right after `/resume` or
+`/compact`).
+
+## Instructions and memory
+
+The system prompt is built from, in order:
+
+1. the base prompt: the user-global `SYSTEM.md` replaces Meerkat's default
+   when it is non-empty and the realm config sets no `system_prompt` /
+   `system_prompt_file` of its own;
+2. the workspace `AGENTS.md` (or `.rkat/AGENTS.md`), loaded by Meerkat;
+3. the coding persona, then the user-global `AGENTS.md`, every `AGENTS.md`
+   from the git root down to the workspace's parent directory, and the
+   workspace `AGENTS.local.md` (or `.rkat/AGENTS.local.md`, meant to stay
+   uncommitted), each under `# Instructions (from <path>)`. Each file is
+   capped at the Meerkat `AGENTS.md` limit and all of them together at 96 KiB;
+4. the memory-notes index (below), when there are notes.
+
+Instruction files and notes are re-read whenever a session is built, so
+`/clear`, `/resume` and `/compact` pick up edits.
+
+**`/remember <text>`** (or `#text`) appends `- <text>` to the workspace
+`AGENTS.md` (created if missing) and adds it to the live session's system
+prompt between turns, so it applies at once and to every later session.
+
+**Memory notes** are small Markdown files the agent keeps across sessions with
+`memory_save`, `memory_read`, `memory_list` and `memory_forget`. Workspace
+notes (facts about this project) live in `<workspace>/.rkat/tui/notes/`, user
+notes (personal preferences that follow you into every project) in
+`<config-dir>/notes/`; each directory has a generated `MEMORY.md` index. The
+system prompt carries only a capped index (name and first line of each note);
+the agent reads full notes on demand. Reads are always allowed and workspace
+writes are treated like in-project edits; user-note writes go to the
+classifier, since they reach every project's prompt.
+
+**`/compact`** summarizes the conversation with the session's model, keeps the
+last two turns verbatim, and continues the same session (same id) from the
+summary. The messages the summary replaced are indexed into the realm's
+semantic memory, so the agent can still find them with `memory_search` in this
+and later sessions. The semantic index is single-writer: a second `rkat-tui`
+on the same workspace runs without `memory_search` and says so at start-up.
 
 ## Where things live
 
@@ -83,8 +134,17 @@ current directory that already has `.rkat/tui/`, else the current directory.
 `--realm`, `--isolated` and `--state-root` opt into the shared realm model that
 `rkat` uses (`$XDG_DATA_HOME/meerkat/realms/<realm>/`) instead.
 
-Project conventions are read from `<project>/AGENTS.md`, `.rkat/mcp.toml`
-(MCP servers), `.rkat/config.toml` (hooks), and `.rkat/tui.toml` (deny rules).
+User-global files live in one config directory: `--config-dir <dir>`, else
+`$XDG_CONFIG_HOME/rkat-tui`, else `~/.config/rkat-tui` (on Windows the platform
+config dir, `%APPDATA%\rkat-tui`). With `--user-config-root <root>` and no
+`--config-dir` it is `<root>/.config/rkat-tui`. It holds `tui.toml` (global
+rules), `AGENTS.md`, `SYSTEM.md`, `notes/` and `history`.
+
+Project conventions are read from `<project>/AGENTS.md` and `AGENTS.local.md`
+(plus ancestor `AGENTS.md` files up to the git root), `.rkat/mcp.toml` (MCP
+servers), `.rkat/config.toml` (hooks), and `.rkat/tui.toml` (deny rules).
+Workspace memory notes live in `.rkat/tui/notes/` and the semantic index
+behind `memory_search` in the realm's `memory/` directory.
 
 ## Testing
 

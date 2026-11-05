@@ -140,6 +140,7 @@ mod tests {
             context_root,
             // A separate empty dir so the real `~/.rkat/mcp.toml` is not read.
             user_config_root: Some(dir.join("user")),
+            global: None,
             realm_id: "test".to_string(),
             state_root: dir.join("state"),
             backend_hint: None,
