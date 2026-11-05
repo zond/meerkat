@@ -71,6 +71,8 @@ feature-depth = 1
 # output a note when they are encountered.
 ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 is a transitive dep of hnsw_rs; unmaintained but considered complete by authors" },
+    { id = "RUSTSEC-2026-0189", reason = "DNS rebinding affects only rmcp's Streamable HTTP server transport; meerkat-mcp uses rmcp as a client, and meerkat-mcp-server enables the server feature but never instantiates the HTTP server (it serves stdio). Fix requires rmcp >=1.4 (outside the 0.14 requirement)" },
+    { id = "RUSTSEC-2025-0068", reason = "serde_yml 0.0.12 has no patched release; meerkat-skills uses it only to parse/re-serialize small SKILL.md frontmatter blocks. TODO: migrate to a maintained YAML crate" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.

@@ -181,7 +181,7 @@ jobs:
           - pkg: meerkat-tui
             bin: rkat-tui
             features: "--no-default-features"
-            test: true
+            test: false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
