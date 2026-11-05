@@ -87,6 +87,8 @@ test-feature-matrix-surface:
 	cargo check -p meerkat-rest --no-default-features --features comms
 	cargo check -p meerkat-mcp-server --no-default-features
 	cargo check -p meerkat-mcp-server --no-default-features --features comms
+	cargo check -p meerkat-tui --no-default-features
+	cargo check -p meerkat-tui --no-default-features --features mcp,sub-agents
 	cargo check -p rkat --no-default-features --features session-store
 	cargo check -p rkat --no-default-features --features session-store,mcp
 	cargo nextest run -p rkat --no-default-features --features session-store,mcp --no-capture
@@ -129,6 +131,7 @@ lint-feature-matrix:
 	cargo clippy -p meerkat --features all-providers,comms,mcp,sub-agents
 	cargo clippy -p rkat --no-default-features --features session-store,mcp
 	cargo clippy -p meerkat-rpc --no-default-features
+	cargo clippy -p meerkat-tui --no-default-features
 
 # Check formatting
 fmt-check:

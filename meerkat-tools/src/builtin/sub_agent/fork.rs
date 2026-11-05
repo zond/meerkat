@@ -354,6 +354,7 @@ impl AgentForkTool {
             host_mode: false, // Forked agents don't run in host mode
             scoped_event_tx,
             parent_scope_path,
+            hook_engine: self.state.hook_engine.clone(),
         };
         #[cfg(not(feature = "comms"))]
         let spec = DynSubAgentSpec {
@@ -368,6 +369,7 @@ impl AgentForkTool {
             host_mode: false,    // Forked agents don't run in host mode
             scoped_event_tx,
             parent_scope_path,
+            hook_engine: self.state.hook_engine.clone(),
         };
 
         // Spawn the forked agent

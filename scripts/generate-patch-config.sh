@@ -30,6 +30,7 @@ ENTRIES=(
   "meerkat-rest=${ROOT}/meerkat-rest"
   "meerkat-contracts=${ROOT}/meerkat-contracts"
   "meerkat=${ROOT}/meerkat"
+  "meerkat-tui=${ROOT}/meerkat-tui"
   "meerkat-mob=${ROOT}/meerkat-mob"
   "meerkat-mob-mcp=${ROOT}/meerkat-mob-mcp"
   "rkat=${ROOT}/meerkat-cli"

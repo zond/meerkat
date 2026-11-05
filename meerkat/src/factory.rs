@@ -985,6 +985,7 @@ impl AgentFactory {
             skill_engine,
             None,
             None,
+            None,
             #[cfg(all(feature = "sub-agents", feature = "comms"))]
             None,
             // Public API defaults to true (all tools visible).
@@ -1012,6 +1013,8 @@ impl AgentFactory {
         sub_agent_scoped_event_tx: Option<mpsc::Sender<ScopedAgentEvent>>,
         #[cfg_attr(not(feature = "sub-agents"), allow(unused_variables))]
         sub_agent_scope_path: Option<Vec<StreamScopeFrame>>,
+        #[cfg_attr(not(feature = "sub-agents"), allow(unused_variables))]
+        sub_agent_hook_engine: Option<Arc<dyn meerkat_core::HookEngine>>,
         #[cfg(all(feature = "sub-agents", feature = "comms"))] sub_agent_comms: Option<
             SubAgentCommsWiring,
         >,
@@ -1134,6 +1137,7 @@ impl AgentFactory {
             );
 
             let parent_session = Arc::new(RwLock::new(Session::new()));
+            #[cfg_attr(not(feature = "comms"), allow(unused_mut))]
             let mut sub_agent_config = SubAgentConfig::default();
             #[cfg(all(feature = "sub-agents", feature = "comms"))]
             if let Some(ref comms) = sub_agent_comms {
@@ -1143,7 +1147,7 @@ impl AgentFactory {
             }
 
             #[cfg(all(feature = "sub-agents", feature = "comms"))]
-            let state = Arc::new(match sub_agent_comms {
+            let state = match sub_agent_comms {
                 Some(comms) => SubAgentToolState::with_comms(
                     manager,
                     client_factory,
@@ -1165,10 +1169,10 @@ impl AgentFactory {
                     sub_agent_config,
                     0,
                 ),
-            });
+            };
 
             #[cfg(not(all(feature = "sub-agents", feature = "comms")))]
-            let state = Arc::new(SubAgentToolState::new(
+            let state = SubAgentToolState::new(
                 manager,
                 client_factory,
                 sub_agent_tools,
@@ -1176,7 +1180,13 @@ impl AgentFactory {
                 parent_session,
                 sub_agent_config,
                 0,
-            ));
+            );
+            // Propagate the parent's hook engine so guardrail hooks
+            // (e.g. PreToolExecution) also fire inside sub-agents.
+            let state = Arc::new(match sub_agent_hook_engine {
+                Some(engine) => state.with_hook_engine(engine),
+                None => state,
+            });
             state
                 .set_scoped_stream(
                     sub_agent_scoped_event_tx.clone(),
@@ -1417,6 +1427,33 @@ impl AgentFactory {
             None
         };
 
+        // 6c. Resolve hooks (override > filesystem layered config). Done before
+        // tool wiring so sub-agent tools inherit the parent's hook engine.
+        #[allow(
+            clippy::manual_map,
+            clippy::unnecessary_literal_unwrap,
+            clippy::needless_match
+        )]
+        let hook_engine = match build_config.hook_engine_override.take() {
+            Some(engine) => Some(engine),
+            None => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let layered_hooks = resolve_layered_hooks_config(
+                        _conventions_context_root,
+                        _conventions_user_root,
+                        config,
+                    )
+                    .await;
+                    create_default_hook_engine(layered_hooks)
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    None
+                }
+            }
+        };
+
         // Resolve model profile for capability gating (e.g., hiding view_image
         // when the model cannot process image blocks in tool results).
         let image_tool_results = meerkat_models::profile::profile_for(provider.as_str(), &model)
@@ -1442,6 +1479,7 @@ impl AgentFactory {
                         skill_engine.clone(),
                         build_config.scoped_event_tx.clone(),
                         build_config.scoped_event_path.clone(),
+                        hook_engine.clone(),
                         #[cfg(all(feature = "sub-agents", feature = "comms"))]
                         sub_agent_comms,
                         build_config.shell_env.take(),
@@ -1618,32 +1656,6 @@ impl AgentFactory {
             tools = composed.0;
             tool_usage_instructions = composed.1;
         }
-
-        // 10. Resolve hooks (override > filesystem layered config)
-        #[allow(
-            clippy::manual_map,
-            clippy::unnecessary_literal_unwrap,
-            clippy::needless_match
-        )]
-        let hook_engine = match build_config.hook_engine_override.take() {
-            Some(engine) => Some(engine),
-            None => {
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    let layered_hooks = resolve_layered_hooks_config(
-                        _conventions_context_root,
-                        _conventions_user_root,
-                        config,
-                    )
-                    .await;
-                    create_default_hook_engine(layered_hooks)
-                }
-                #[cfg(target_arch = "wasm32")]
-                {
-                    None
-                }
-            }
-        };
 
         // 11. Generate skill inventory section using the engine created in step 6a
         #[cfg(feature = "skills")]
@@ -2006,6 +2018,7 @@ impl AgentFactory {
         skill_engine: Option<Arc<meerkat_core::skills::SkillRuntime>>,
         sub_agent_scoped_event_tx: Option<mpsc::Sender<ScopedAgentEvent>>,
         sub_agent_scope_path: Option<Vec<StreamScopeFrame>>,
+        sub_agent_hook_engine: Option<Arc<dyn meerkat_core::HookEngine>>,
         #[cfg(all(feature = "sub-agents", feature = "comms"))] sub_agent_comms: Option<
             SubAgentCommsWiring,
         >,
@@ -2074,6 +2087,7 @@ impl AgentFactory {
                 skill_engine,
                 sub_agent_scoped_event_tx,
                 sub_agent_scope_path,
+                sub_agent_hook_engine,
                 #[cfg(all(feature = "sub-agents", feature = "comms"))]
                 sub_agent_comms,
                 image_tool_results,

@@ -43,12 +43,20 @@ enum ApplyPatchError {
     },
 }
 
+/// Why a patch body does not follow the `apply_patch` grammar.
 #[derive(Debug, Error, PartialEq, Clone)]
-enum ParseError {
+pub enum ParseError {
+    /// The patch as a whole is malformed (missing markers, no hunks).
     #[error("invalid patch: {0}")]
     InvalidPatch(String),
+    /// One hunk is malformed.
     #[error("invalid hunk at line {line_number}, {message}")]
-    InvalidHunk { message: String, line_number: usize },
+    InvalidHunk {
+        /// What is wrong.
+        message: String,
+        /// 1-based line number of the hunk.
+        line_number: usize,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -151,6 +159,34 @@ fn apply_patch(project_root: &Path, patch: &str) -> Result<AffectedPaths, ApplyP
         })?;
     let hunks = parse_patch(patch)?;
     apply_hunks_to_files(&canonical_root, &hunks)
+}
+
+/// Every path an `apply_patch` body would add, delete, update or move to, in
+/// patch order, as written in the patch (relative paths are relative to the
+/// project root).
+///
+/// Uses the same parser as the tool itself, so callers that gate the tool
+/// (approval policies) see exactly the targets the tool would touch.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] when the patch does not parse; the tool would refuse
+/// such a patch too.
+pub fn affected_paths(patch: &str) -> Result<Vec<PathBuf>, ParseError> {
+    let hunks = parse_patch(patch)?;
+    let mut paths = Vec::with_capacity(hunks.len());
+    for hunk in hunks {
+        match hunk {
+            Hunk::Add { path, .. } | Hunk::Delete { path } => paths.push(path),
+            Hunk::Update {
+                path, move_path, ..
+            } => {
+                paths.push(path);
+                paths.extend(move_path);
+            }
+        }
+    }
+    Ok(paths)
 }
 
 fn parse_patch(patch: &str) -> Result<Vec<Hunk>, ParseError> {
@@ -680,6 +716,24 @@ mod tests {
 
     fn wrap_patch(body: &str) -> String {
         format!("*** Begin Patch\n{body}\n*** End Patch")
+    }
+
+    #[test]
+    fn affected_paths_cover_every_target() {
+        let patch = wrap_patch(
+            "*** Add File: a.txt\n+x\n  *** Add File: .git/config\n+y\n*** Delete File: old.rs\n*** Update File: src/b.rs\n*** Move to: src/c.rs\n@@\n-x\n+y",
+        );
+        assert_eq!(
+            affected_paths(&patch).unwrap(),
+            [
+                PathBuf::from("a.txt"),
+                PathBuf::from(".git/config"),
+                PathBuf::from("old.rs"),
+                PathBuf::from("src/b.rs"),
+                PathBuf::from("src/c.rs"),
+            ]
+        );
+        assert!(affected_paths("garbage").is_err());
     }
 
     #[test]

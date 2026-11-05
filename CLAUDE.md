@@ -65,6 +65,9 @@ meerkat-mcp       → MCP protocol client, McpRouter for tool routing
 meerkat-mcp-server → Expose Meerkat as MCP tools (meerkat_run, meerkat_resume, meerkat_config, meerkat_capabilities)
 meerkat-rpc       → JSON-RPC stdio server (stateful SessionRuntime, IDE/desktop integration)
 meerkat-rest      → Optional REST API server
+meerkat-tui       → Interactive terminal coding harness (produces `rkat-tui`); in-process agent,
+                     auto-mode tool approval (tiered policy + reasoning-blind classifier),
+                     workspace-local state in `<workspace>/.rkat/tui/` (`rkat-tui -c` continues)
 meerkat-comms     → Inter-agent communication (Ed25519-signed messaging, transports, trust model)
 meerkat-contracts → Wire types, capability registry, error codes (canonical over all surfaces)
 meerkat-skills    → Skill loading, resolution, rendering (filesystem, git, HTTP, embedded sources)
@@ -218,7 +221,7 @@ make audit       # Security audit via cargo-deny
 | Job | Trigger | What it does |
 |-----|---------|-------------|
 | `release_validate` | Always | `make release-preflight-smoke` + tag-version check (tags only) |
-| `build_binaries` | Always | Matrix build for 5 targets, packages 4 binaries each (`rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp`) |
+| `build_binaries` | Always | Matrix build for 5 targets, packages 5 binaries each (`rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp`, `rkat-tui`) |
 | `publish_github_release` | Tags only | Downloads artifacts, generates `checksums.sha256` + `index.json`, publishes GitHub Release |
 | `publish_registries` | Tags or manual `publish_release_packages=true` | Publishes 18 Rust crates → crates.io, Python SDK → PyPI, TypeScript SDK → npm |
 
@@ -344,7 +347,7 @@ Required GitHub Actions secrets for full release:
 ### Crate Publish Order
 
 The crates are published in dependency order:
-`meerkat-models` → `meerkat-core` → `meerkat-contracts` → `meerkat-client` → `meerkat-store` → `meerkat-tools` → `meerkat-session` → `meerkat-memory` → `meerkat-mcp` → `meerkat-mcp-server` → `meerkat-hooks` → `meerkat-skills` → `meerkat-comms` → `meerkat-rpc` → `meerkat-rest` → `meerkat` → `meerkat-mob` → `meerkat-mob-mcp` → `meerkat-mob-pack` → `rkat`
+`meerkat-models` → `meerkat-core` → `meerkat-contracts` → `meerkat-client` → `meerkat-store` → `meerkat-tools` → `meerkat-session` → `meerkat-memory` → `meerkat-mcp` → `meerkat-mcp-server` → `meerkat-hooks` → `meerkat-skills` → `meerkat-comms` → `meerkat-rpc` → `meerkat-rest` → `meerkat` → `meerkat-tui` → `meerkat-mob` → `meerkat-mob-mcp` → `meerkat-mob-pack` → `rkat`
 
 ### Key Rules for AI Agents
 

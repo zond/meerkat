@@ -36,6 +36,7 @@ PACKAGES=(
   meerkat-rpc
   meerkat-rest
   meerkat
+  meerkat-tui
   meerkat-mob
   meerkat-mob-mcp
   rkat

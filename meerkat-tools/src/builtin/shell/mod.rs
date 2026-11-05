@@ -36,6 +36,6 @@ pub use job_manager::JobManager;
 pub use job_status_tool::ShellJobStatusTool;
 pub use jobs_list_tool::ShellJobsListTool;
 pub use security::{CommandInvocation, SecurityEngine, SecurityMode};
-pub use tool::{ShellOutput, ShellTool};
+pub use tool::{ShellInput, ShellOutput, ShellTool};
 pub use tool_set::ShellToolSet;
 pub use types::{BackgroundJob, JobId, JobStatus, JobSummary};
