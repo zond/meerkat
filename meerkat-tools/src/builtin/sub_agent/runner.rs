@@ -18,7 +18,7 @@ use meerkat_core::session::Session;
 use meerkat_core::sub_agent::SubAgentManager;
 use meerkat_core::types::{Message, SystemMessage, UserMessage};
 use meerkat_core::{
-    AgentBuilder, AgentEvent, AgentSessionStore, AgentToolDispatcher, BudgetLimits,
+    AgentBuilder, AgentEvent, AgentSessionStore, AgentToolDispatcher, BudgetLimits, HookEngine,
     ScopedAgentEvent, StreamScopeFrame,
 };
 #[cfg(feature = "comms")]
@@ -274,6 +274,9 @@ pub struct DynSubAgentSpec {
     pub scoped_event_tx: Option<tokio::sync::mpsc::Sender<ScopedAgentEvent>>,
     /// Parent scope path used as the base for child attribution.
     pub parent_scope_path: Vec<StreamScopeFrame>,
+    /// Hook engine inherited from the parent so guardrail hooks (e.g.
+    /// `PreToolExecution`) also apply inside the sub-agent.
+    pub hook_engine: Option<Arc<dyn HookEngine>>,
 }
 
 /// Spawn and run a sub-agent in a background task (trait object version)
@@ -293,6 +296,7 @@ pub async fn spawn_sub_agent_dyn(
     spec: DynSubAgentSpec,
     manager: Arc<SubAgentManager>,
 ) -> Result<(), SubAgentRunnerError> {
+    #[cfg(feature = "comms")]
     use meerkat_core::sub_agent::SubAgentCommsInfo;
 
     let started_at = Instant::now();
@@ -315,6 +319,10 @@ pub async fn spawn_sub_agent_dyn(
 
     if let Some(budget) = spec.budget {
         builder = builder.budget(budget);
+    }
+
+    if let Some(engine) = spec.hook_engine {
+        builder = builder.with_hook_engine(engine);
     }
 
     // Set up comms for the sub-agent if configured
@@ -663,5 +671,202 @@ mod tests {
 
         let err = SubAgentRunnerError::ExecutionError("runtime error".to_string());
         assert!(err.to_string().contains("execution error"));
+    }
+
+    mod hook_propagation {
+        use super::*;
+        use async_trait::async_trait;
+        use meerkat_client::{LlmDoneOutcome, LlmError, LlmEvent, LlmRequest};
+        use meerkat_core::error::{AgentError, ToolError};
+        use meerkat_core::hooks::{
+            HookDecision, HookEngineError, HookExecutionReport, HookId, HookInvocation, HookPoint,
+            HookReasonCode,
+        };
+        use meerkat_core::ops::{ConcurrencyLimits, SubAgentState};
+        use meerkat_core::{StopReason, ToolCallView, ToolDef, ToolResult};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        const TOOL_NAME: &str = "guarded_tool";
+
+        /// First call emits one tool call; subsequent calls end the turn.
+        struct ToolCallingClient {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl LlmClient for ToolCallingClient {
+            fn stream<'a>(
+                &'a self,
+                _request: &'a LlmRequest,
+            ) -> meerkat_client::types::LlmStream<'a> {
+                let events = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    vec![
+                        Ok(LlmEvent::ToolCallComplete {
+                            id: "tc_1".to_string(),
+                            name: TOOL_NAME.to_string(),
+                            args: serde_json::json!({}),
+                            meta: None,
+                        }),
+                        Ok(LlmEvent::Done {
+                            outcome: LlmDoneOutcome::Success {
+                                stop_reason: StopReason::ToolUse,
+                            },
+                        }),
+                    ]
+                } else {
+                    vec![
+                        Ok(LlmEvent::TextDelta {
+                            delta: "done".to_string(),
+                            meta: None,
+                        }),
+                        Ok(LlmEvent::Done {
+                            outcome: LlmDoneOutcome::Success {
+                                stop_reason: StopReason::EndTurn,
+                            },
+                        }),
+                    ]
+                };
+                Box::pin(futures::stream::iter(events))
+            }
+
+            fn provider(&self) -> &'static str {
+                "mock"
+            }
+
+            async fn health_check(&self) -> Result<(), LlmError> {
+                Ok(())
+            }
+        }
+
+        struct CountingDispatcher {
+            dispatched: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl AgentToolDispatcher for CountingDispatcher {
+            fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+                Arc::from([Arc::new(ToolDef {
+                    name: TOOL_NAME.to_string(),
+                    description: "guarded".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                })])
+            }
+
+            async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolResult, ToolError> {
+                self.dispatched.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolResult::new(
+                    call.id.to_string(),
+                    "ok".to_string(),
+                    false,
+                ))
+            }
+        }
+
+        struct NoopStore;
+
+        #[async_trait]
+        impl AgentSessionStore for NoopStore {
+            async fn save(&self, _session: &Session) -> Result<(), AgentError> {
+                Ok(())
+            }
+
+            async fn load(&self, _id: &str) -> Result<Option<Session>, AgentError> {
+                Ok(None)
+            }
+        }
+
+        /// Denies every `PreToolExecution` and counts how often it was asked.
+        struct DenyAllHooks {
+            pre_tool_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl HookEngine for DenyAllHooks {
+            async fn execute(
+                &self,
+                invocation: HookInvocation,
+                _overrides: Option<&meerkat_core::config::HookRunOverrides>,
+            ) -> Result<HookExecutionReport, HookEngineError> {
+                if invocation.point != HookPoint::PreToolExecution {
+                    return Ok(HookExecutionReport::empty());
+                }
+                self.pre_tool_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(HookExecutionReport {
+                    decision: Some(HookDecision::deny(
+                        HookId::new("deny-all"),
+                        HookReasonCode::PolicyViolation,
+                        "denied in test",
+                        None,
+                    )),
+                    ..HookExecutionReport::default()
+                })
+            }
+        }
+
+        /// Spawn a sub-agent that makes one tool call; returns how often the
+        /// tool was actually dispatched.
+        async fn run_sub_agent(hook_engine: Option<Arc<dyn HookEngine>>) -> usize {
+            let dispatched = Arc::new(AtomicUsize::new(0));
+            let manager = Arc::new(SubAgentManager::new(ConcurrencyLimits::default(), 0));
+            let spec = DynSubAgentSpec {
+                client: Arc::new(ToolCallingClient {
+                    calls: AtomicUsize::new(0),
+                }),
+                model: "mock-model".to_string(),
+                tools: Arc::new(CountingDispatcher {
+                    dispatched: Arc::clone(&dispatched),
+                }),
+                store: Arc::new(NoopStore),
+                session: create_spawn_session("use the tool", None),
+                budget: None,
+                depth: 1,
+                system_prompt: None,
+                #[cfg(feature = "comms")]
+                comms_config: None,
+                #[cfg(feature = "comms")]
+                parent_trusted_peers: None,
+                #[cfg(feature = "comms")]
+                parent_classification_peers: None,
+                host_mode: false,
+                scoped_event_tx: None,
+                parent_scope_path: Vec::new(),
+                hook_engine,
+            };
+            let id = OperationId::new();
+            spawn_sub_agent_dyn(id.clone(), "child".to_string(), spec, Arc::clone(&manager))
+                .await
+                .expect("spawn sub-agent");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while matches!(
+                    manager.get_state(&id).await,
+                    Some(SubAgentState::Running) | None
+                ) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("sub-agent finished in time");
+            assert_eq!(manager.get_state(&id).await, Some(SubAgentState::Completed));
+            dispatched.load(Ordering::SeqCst)
+        }
+
+        #[tokio::test]
+        async fn sub_agent_pre_tool_hook_denies_tool_call() {
+            let pre_tool_calls = Arc::new(AtomicUsize::new(0));
+            let engine: Arc<dyn HookEngine> = Arc::new(DenyAllHooks {
+                pre_tool_calls: Arc::clone(&pre_tool_calls),
+            });
+
+            let dispatched = run_sub_agent(Some(engine)).await;
+
+            assert_eq!(pre_tool_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(dispatched, 0, "denied tool must not be dispatched");
+        }
+
+        #[tokio::test]
+        async fn sub_agent_without_hook_engine_dispatches_tool_call() {
+            assert_eq!(run_sub_agent(None).await, 1);
+        }
     }
 }

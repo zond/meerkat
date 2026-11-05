@@ -444,6 +444,7 @@ impl AgentSpawnTool {
             host_mode: params.host_mode,
             scoped_event_tx,
             parent_scope_path,
+            hook_engine: self.state.hook_engine.clone(),
         };
 
         #[cfg(not(feature = "comms"))]
@@ -459,6 +460,7 @@ impl AgentSpawnTool {
             host_mode: params.host_mode,
             scoped_event_tx,
             parent_scope_path,
+            hook_engine: self.state.hook_engine.clone(),
         };
 
         // Spawn the sub-agent (this registers it and starts execution in a background task)
@@ -555,9 +557,8 @@ impl BuiltinTool for AgentSpawnTool {
 
         #[cfg(not(feature = "comms"))]
         let params: SpawnParams = {
-            let params: SpawnParamsNoComms = serde_json::from_value(args).map_err(|e| {
-                BuiltinToolError::invalid_args(format!("Invalid parameters: {}", e))
-            })?;
+            let params: SpawnParamsNoComms = serde_json::from_value(args)
+                .map_err(|e| BuiltinToolError::invalid_args(format!("Invalid parameters: {e}")))?;
             params.into()
         };
 

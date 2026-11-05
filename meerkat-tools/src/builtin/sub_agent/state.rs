@@ -8,7 +8,9 @@ use meerkat_comms::TrustedPeers;
 use meerkat_comms::runtime::ParentCommsContext;
 use meerkat_core::session::Session;
 use meerkat_core::sub_agent::SubAgentManager;
-use meerkat_core::{AgentSessionStore, AgentToolDispatcher, ScopedAgentEvent, StreamScopeFrame};
+use meerkat_core::{
+    AgentSessionStore, AgentToolDispatcher, HookEngine, ScopedAgentEvent, StreamScopeFrame,
+};
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 
@@ -61,6 +63,10 @@ pub struct SubAgentToolState {
 
     /// Parent scope path used as base for child scope attribution.
     pub scoped_event_path: RwLock<Vec<StreamScopeFrame>>,
+
+    /// Parent's hook engine, propagated to spawned/forked sub-agents so
+    /// guardrail hooks (e.g. `PreToolExecution`) also fire inside them.
+    pub hook_engine: Option<Arc<dyn HookEngine>>,
 }
 
 impl SubAgentToolState {
@@ -91,7 +97,15 @@ impl SubAgentToolState {
             tool_usage_instructions: RwLock::new(None),
             scoped_event_tx: RwLock::new(None),
             scoped_event_path: RwLock::new(Vec::new()),
+            hook_engine: None,
         }
+    }
+
+    /// Attach the parent's hook engine so sub-agents inherit its hooks.
+    #[must_use]
+    pub fn with_hook_engine(mut self, engine: Arc<dyn HookEngine>) -> Self {
+        self.hook_engine = Some(engine);
+        self
     }
 
     /// Set tool usage instructions (for inheriting system prompt)
@@ -149,6 +163,7 @@ impl SubAgentToolState {
             tool_usage_instructions: RwLock::new(None),
             scoped_event_tx: RwLock::new(None),
             scoped_event_path: RwLock::new(Vec::new()),
+            hook_engine: None,
         }
     }
 
@@ -201,6 +216,14 @@ impl std::fmt::Debug for SubAgentToolState {
         f.debug_struct("SubAgentToolState")
             .field("current_depth", &self.current_depth)
             .field("config", &self.config)
+            .field(
+                "hook_engine",
+                &if self.hook_engine.is_some() {
+                    "present"
+                } else {
+                    "absent"
+                },
+            )
             .finish_non_exhaustive()
     }
 }
@@ -762,5 +785,34 @@ mod tests {
             "State should see the child added earlier"
         );
         assert_eq!(peers.len(), 1);
+    }
+
+    struct NoopHooks;
+
+    #[async_trait]
+    impl HookEngine for NoopHooks {
+        async fn execute(
+            &self,
+            _invocation: meerkat_core::HookInvocation,
+            _overrides: Option<&meerkat_core::config::HookRunOverrides>,
+        ) -> Result<meerkat_core::HookExecutionReport, meerkat_core::HookEngineError> {
+            Ok(meerkat_core::HookExecutionReport::empty())
+        }
+    }
+
+    #[test]
+    fn test_hook_engine_defaults_to_none() {
+        let state = create_test_state();
+        assert!(state.hook_engine.is_none());
+        assert!(format!("{state:?}").contains("hook_engine: \"absent\""));
+    }
+
+    #[test]
+    fn test_with_hook_engine_stores_engine() {
+        let engine: Arc<dyn HookEngine> = Arc::new(NoopHooks);
+        let state = create_test_state().with_hook_engine(Arc::clone(&engine));
+        let stored = state.hook_engine.as_ref().expect("hook engine stored");
+        assert!(Arc::ptr_eq(stored, &engine));
+        assert!(format!("{state:?}").contains("hook_engine: \"present\""));
     }
 }
