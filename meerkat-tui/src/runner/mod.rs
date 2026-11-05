@@ -6,6 +6,9 @@
 //! [`Msg`]s. Nothing here touches the terminal directly.
 
 mod lifecycle;
+mod quit;
+#[doc(hidden)]
+pub mod testing;
 
 use crate::approval::classifier::{
     ActionClassifier, Environment, LlmClassifier, UnavailableClassifier, classifier_default_model,
@@ -76,32 +79,33 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
     // Approval engine, built before the agent so its hooks are in the engine.
     let realm_dir = scope.realm_root();
     let global_rules = scope.global.as_ref().map(bootstrap::GlobalDirs::rules_file);
-    let (mut rule_set, mut settings, mut notices) = rules::load_layered(
+    // The realm rules file lives inside the workspace. If it is (or may be)
+    // tracked by git it arrived with the repository, so only its deny rules apply.
+    let realm_rules = realm_dir.join(RULES_FILE);
+    let mut tracking_notice = None;
+    let realm_trust = match rules_file_is_tracked(&scope.context_root, &realm_rules).await {
+        Ok(false) => rules::RealmTrust::Owned,
+        Ok(true) => rules::RealmTrust::Tracked,
+        Err(reason) => {
+            tracking_notice = Some(rules::Notice::RealmTrackingUnknown {
+                path: realm_rules.clone(),
+                reason,
+            });
+            rules::RealmTrust::Tracked
+        }
+    };
+    let (rule_set, mut settings, mut notices) = rules::load_layered(
         &realm_dir,
         global_rules.as_deref(),
         &scope.context_root.join(".rkat"),
+        realm_trust,
     )?;
+    notices.extend(tracking_notice);
     if let Some(notice) = rules::legacy_global_rules_notice(
         scope.user_config_root.as_deref(),
         global_rules.as_deref(),
     ) {
         notices.push(notice);
-    }
-    // The realm rules file lives inside the workspace. If it is tracked by git it
-    // arrived with the repository, so its allow rules are not the user's.
-    let realm_rules = realm_dir.join(RULES_FILE);
-    if rules_file_is_tracked(&scope.context_root, &realm_rules).await {
-        let dropped = rule_set.allow.len();
-        rule_set
-            .allow
-            .retain(|rule| rule.origin != RuleOrigin::Realm);
-        let dropped = dropped - rule_set.allow.len();
-        if dropped > 0 {
-            notices.push(rules::Notice::TrackedRealmAllowIgnored {
-                path: realm_rules,
-                count: dropped,
-            });
-        }
     }
     if args.no_auto {
         settings.enabled = false;
@@ -121,7 +125,7 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         classifier,
         broker: Some(broker),
         environment,
-        posix_shell: cfg!(unix),
+        posix_shell: bootstrap::shell_is_posix(),
         events: approval_tx,
         rules_path: Some(realm_dir.join(RULES_FILE)),
     });
@@ -182,6 +186,7 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         scoped_tx: scoped_tx.clone(),
     };
     let session = SessionHandle::create(&runtime, template.options(resumed, None)).await?;
+    engine.set_primary_session(session.id());
     let current_model = session.model().to_string();
 
     // UI state and channels.
@@ -226,10 +231,13 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
             text,
         });
     }
-    let _ = ui_tx.send(Msg::Status(StatusUpdate::ContextWindow(context_window(
-        provider,
-        &current_model,
-    ))));
+    let _ = ui_tx.send(Msg::Status(window_status(provider, &current_model)));
+    if let Some(text) = quit::unsent_notice(&runtime.scope.realm_root()) {
+        let _ = ui_tx.send(Msg::Notice {
+            level: NoticeLevel::Warn,
+            text,
+        });
+    }
     if let Some(used) = resumed_context {
         let _ = ui_tx.send(Msg::Status(StatusUpdate::Context {
             used: Some(used),
@@ -243,7 +251,7 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         let _ = effect_tx.send(Effect::StartTurn(prompt));
     }
 
-    let integrator = Integrator {
+    let integrator = Integrator::new(IntegratorParts {
         runtime,
         engine,
         session,
@@ -254,13 +262,8 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         escalation_rx,
         approval_rx,
         diff_rx,
-        pending: HashMap::new(),
-        next_escalation: 0,
-        turn: None,
-        inflight: Vec::new(),
-        current_model,
         last_context: resumed_context,
-    };
+    });
     let integrator_task = tokio::spawn(integrator.run());
 
     let ui_result = run_ui(
@@ -275,8 +278,28 @@ pub async fn run(args: Args) -> Result<(), TuiError> {
         histories,
     )
     .await;
-    integrator_task.abort();
+    // The UI has gone (and closed the effect channel): the integrator stops
+    // the turn, persists the session and saves unsent messages, then exits.
+    match tokio::time::timeout(quit::SHUTDOWN_TIMEOUT, integrator_task).await {
+        Ok(Ok(Some(saved))) => eprintln!(
+            "rkat-tui: {} unsent message(s) saved in {}",
+            saved.count,
+            saved.path.display()
+        ),
+        Ok(Ok(None)) => {}
+        Ok(Err(err)) => tracing::warn!(error = %err, "integrator task failed"),
+        Err(_) => tracing::warn!("integrator did not shut down in time"),
+    }
     ui_result.map_err(TuiError::from)
+}
+
+/// Status update for the context window of `model`.
+fn window_status(provider: Provider, model: &str) -> StatusUpdate {
+    match context_window(provider, model) {
+        Some(window) if window.approx => StatusUpdate::ApproxContextWindow(window.tokens),
+        Some(window) => StatusUpdate::ContextWindow(Some(window.tokens)),
+        None => StatusUpdate::ContextWindow(None),
+    }
 }
 
 /// Directory of the workspace's memory notes.
@@ -326,21 +349,46 @@ async fn compose_external_tools(
 }
 
 /// Whether `path` is tracked by the git repository at `workspace`.
-/// Best effort: no git, no repository, or an untracked file all yield `false`.
-async fn rules_file_is_tracked(workspace: &std::path::Path, path: &std::path::Path) -> bool {
+///
+/// `Ok(false)` only when that is known: the file does not exist, lies outside
+/// the workspace, the workspace is not a git repository, or git reports it as
+/// untracked (exit code 1). Anything else (git missing, other failures) is an
+/// `Err` with the reason, which callers treat as tracked (fail closed).
+async fn rules_file_is_tracked(
+    workspace: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<bool, String> {
     if !path.is_file() {
-        return false;
+        return Ok(false);
     }
-    tokio::process::Command::new("git")
+    let (Ok(workspace), Ok(path)) = (workspace.canonicalize(), path.canonicalize()) else {
+        return Err("cannot resolve the rules file or workspace path".to_string());
+    };
+    if !path.starts_with(&workspace) {
+        return Ok(false);
+    }
+    let output = tokio::process::Command::new("git")
         .arg("-C")
-        .arg(workspace)
+        .arg(&workspace)
         .args(["ls-files", "--error-unmatch", "--"])
-        .arg(path)
+        .arg(&path)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .stderr(std::process::Stdio::piped())
+        .output()
         .await
-        .is_ok_and(|status| status.success())
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ if stderr.contains("not a git repository") => Ok(false),
+        code => Err(format!(
+            "git ls-files exited with {}: {}",
+            code.map_or_else(|| "a signal".to_string(), |c| c.to_string()),
+            stderr.trim()
+        )),
+    }
 }
 
 /// Route tracing to a log file inside the realm so nothing writes to the
@@ -470,27 +518,12 @@ fn restored_tool_block(name: &str, args: serde_json::Value) -> Block {
     }
 }
 
-/// Escape glob metacharacters so a literal string matches only itself.
-fn glob_escape(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for ch in raw.chars() {
-        match ch {
-            '*' | '?' | '[' | ']' | '{' | '}' => {
-                out.push('[');
-                out.push(ch);
-                out.push(']');
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
-
 /// An escalation the UI has not answered yet.
 struct PendingEscalation {
     respond: oneshot::Sender<HumanDecision>,
     tool: String,
-    args_preview: String,
+    /// Canonical rule subject "allow + add rule" turns into a literal rule.
+    subject: Option<String>,
 }
 
 /// What every session build shares: where instructions and notes come from,
@@ -521,6 +554,21 @@ impl SessionTemplate {
     }
 }
 
+/// The already-built pieces an [`Integrator`] drives.
+struct IntegratorParts {
+    runtime: Runtime,
+    engine: Arc<ApprovalEngine>,
+    session: SessionHandle,
+    template: SessionTemplate,
+    agent_tx: mpsc::Sender<EventEnvelope<AgentEvent>>,
+    ui_tx: mpsc::UnboundedSender<Msg>,
+    effect_rx: mpsc::UnboundedReceiver<Effect>,
+    escalation_rx: mpsc::Receiver<EscalationRequest>,
+    approval_rx: mpsc::UnboundedReceiver<ApprovalEvent>,
+    diff_rx: mpsc::UnboundedReceiver<FileDiff>,
+    last_context: Option<u64>,
+}
+
 struct Integrator {
     runtime: Runtime,
     engine: Arc<ApprovalEngine>,
@@ -544,6 +592,11 @@ struct Integrator {
     /// Estimated context of the current session after its last turn, for
     /// `CompactionStarted`.
     last_context: Option<u64>,
+    /// No live session: a `/compact` rebuild and the restore both failed.
+    /// Turns are refused until `/resume` or `/clear` opens one.
+    dead: bool,
+    /// Messages the UI still held when the user quit ([`Effect::SaveUnsent`]).
+    held_unsent: Vec<(Option<PendingId>, String)>,
 }
 
 /// A turn in flight and the session it runs on (which stays the one to
@@ -554,16 +607,54 @@ struct RunningTurn {
 }
 
 impl Integrator {
-    async fn run(mut self) {
+    fn new(parts: IntegratorParts) -> Self {
+        let IntegratorParts {
+            runtime,
+            engine,
+            session,
+            template,
+            agent_tx,
+            ui_tx,
+            effect_rx,
+            escalation_rx,
+            approval_rx,
+            diff_rx,
+            last_context,
+        } = parts;
+        let current_model = session.model().to_string();
+        Self {
+            runtime,
+            engine,
+            session,
+            template,
+            agent_tx,
+            ui_tx,
+            effect_rx,
+            escalation_rx,
+            approval_rx,
+            diff_rx,
+            pending: HashMap::new(),
+            next_escalation: 0,
+            turn: None,
+            inflight: Vec::new(),
+            current_model,
+            last_context,
+            dead: false,
+            held_unsent: Vec::new(),
+        }
+    }
+
+    /// Serve effects until the UI quits (or drops the effect channel), then
+    /// shut down: see [`Integrator::shutdown`]. Returns where unsent messages
+    /// were saved, if any.
+    async fn run(mut self) -> Option<quit::SavedUnsent> {
         loop {
             tokio::select! {
                 effect = self.effect_rx.recv() => {
-                    let Some(effect) = effect else { break };
-                    if matches!(effect, Effect::Quit) {
-                        self.stop_pending();
-                        break;
+                    match effect {
+                        None | Some(Effect::Quit) => break,
+                        Some(effect) => self.handle_effect(effect).await,
                     }
-                    self.handle_effect(effect).await;
                 }
                 Some(request) = self.escalation_rx.recv() => self.on_escalation(request),
                 Some(event) = self.approval_rx.recv() => self.on_approval_event(event),
@@ -579,6 +670,7 @@ impl Integrator {
                 }
             }
         }
+        self.shutdown().await
     }
 
     /// Branch order: persist on error, reconcile injected messages, report.
@@ -626,7 +718,21 @@ impl Integrator {
     /// Answer [`Effect::RecallPending`].
     async fn recall_pending(&mut self) {
         let recalled = match &self.turn {
-            Some(turn) => recall(&turn.session, &mut self.inflight).await,
+            Some(turn) => {
+                let before = self.inflight.clone();
+                let recalled = recall(&turn.session, &mut self.inflight).await;
+                // A recalled message never reached the model, so it must not
+                // count as the user's intent for the approval classifier either.
+                for (id, framed) in &before {
+                    if recalled.contains(id) {
+                        let text = framed
+                            .strip_prefix(crate::delivery::FRAME)
+                            .unwrap_or(framed);
+                        self.engine.forget_prompt(turn.session.id(), text);
+                    }
+                }
+                recalled
+            }
             None => Vec::new(),
         };
         self.send(Msg::Recalled(recalled));
@@ -685,6 +791,7 @@ impl Integrator {
                 }
             }
             Effect::Quit => {}
+            Effect::SaveUnsent(held) => self.held_unsent.extend(held),
             Effect::NewSession => self.new_session().await,
             Effect::ResumeSession(reference) => self.resume_session(&reference).await,
             Effect::RequestResumePicker => self.show_resume_picker().await,
@@ -719,6 +826,14 @@ impl Integrator {
                 self.push_auto_status();
                 self.notice(NoticeLevel::Info, "auto mode resumed");
             }
+            // `set_model` waits for the session task, which serves commands
+            // only between turns: never await it while a turn runs.
+            Effect::SetModel(_) if self.turn.is_some() || !self.inflight.is_empty() => {
+                self.notice(
+                    NoticeLevel::Warn,
+                    "/model is not available while a turn is running",
+                );
+            }
             Effect::SetModel(model) => self.set_model(model).await,
             Effect::Remember(text) => self.remember(&text),
             Effect::Compact => self.compact().await,
@@ -728,6 +843,14 @@ impl Integrator {
     fn start_turn(&mut self, prompt: String) {
         if self.turn.is_some() {
             self.notice(NoticeLevel::Warn, "a turn is already running");
+            return;
+        }
+        if self.dead {
+            // The UI is waiting for this turn: finish it right away.
+            self.send(Msg::TurnFinished(TurnOutcome {
+                result: Err("no live session; use /resume last".to_string()),
+                delivery: crate::delivery::DeliveryReport::default(),
+            }));
             return;
         }
         self.turn = Some(RunningTurn {
@@ -759,7 +882,7 @@ impl Integrator {
             PendingEscalation {
                 respond: request.respond,
                 tool: request.tool,
-                args_preview: request.args_preview,
+                subject: request.subjects.into_iter().next(),
             },
         );
         self.send(Msg::Escalation(prompt, EscalationId(id)));
@@ -774,13 +897,16 @@ impl Integrator {
             EscalationAnswer::Deny => HumanDecision::Deny,
             EscalationAnswer::Stop => HumanDecision::Stop,
             EscalationAnswer::AllowAndAddRule => {
-                let pattern = glob_escape(&pending.args_preview);
-                match Rule::new(
-                    RuleKind::Allow,
-                    &pending.tool,
-                    Some(&pattern),
-                    RuleOrigin::Realm,
-                ) {
+                // A literal rule over the canonical subject: matches exactly
+                // this command / path, no glob semantics to escape.
+                let rule = match pending.subject {
+                    Some(subject) => {
+                        Rule::literal(RuleKind::Allow, &pending.tool, subject, RuleOrigin::Realm)
+                            .map_err(|e| e.to_string())
+                    }
+                    None => Err("the action has no rule subject".to_string()),
+                };
+                match rule {
                     Ok(rule) => HumanDecision::AllowAndAddRule(Box::new(rule)),
                     Err(err) => {
                         self.notice(NoticeLevel::Warn, format!("rule not added: {err}"));
@@ -1002,13 +1128,6 @@ fn describe_rule(rule: &Rule) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn glob_escape_neutralizes_metacharacters() {
-        assert_eq!(glob_escape("cargo test *"), "cargo test [*]");
-        assert_eq!(glob_escape("a?b[c]{d}"), "a[?]b[[]c[]][{]d[}]");
-        assert_eq!(glob_escape("plain"), "plain");
-    }
 
     #[test]
     fn nth_rule_id_spans_allow_then_deny() {

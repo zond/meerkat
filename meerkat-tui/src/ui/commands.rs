@@ -91,8 +91,8 @@ const AUTO_USAGE: &str = "/auto [on | off | resume]";
 pub const HELP_TEXT: &str = "\
 Commands:
   /help, /?                      show this help
-  /quit, /exit, /q               leave rkat-tui
-  /clear, /new                   clear the transcript and start a new session
+  /quit, /exit, /q               leave rkat-tui (asks again while a turn runs or messages are queued)
+  /clear, /new                   clear the transcript and start a new session (idle only)
   /resume [ref]                  resume a session (last, ~N, or id prefix); no ref opens a picker
   /rules [list]                  list approval rules
   /rules add allow|deny <tool> [pattern]
@@ -100,15 +100,19 @@ Commands:
   /rules rm <n>                  remove rule n
   /auto                          show auto-mode state and denial counters
   /auto on|off|resume            enable, disable, or resume auto mode after a pause
-  /model [id]                    show or switch the model
+  /model [id]                    show the model, or switch it (idle only)
   /remember <text>, #<text>      add a line to the workspace AGENTS.md (\\# sends a literal #)
   /compact                       summarise the conversation to free context (idle only)
 Keys:
-  Enter                          send (queues while a turn is running)
+  Enter                          send; while the agent is working, queues the message
+                                 and delivers it at the next step
   Alt+Enter, Shift+Enter, Ctrl+J insert a newline
   Ctrl-C                         interrupt the turn · clear the input · press twice to quit
-  Esc                            interrupt the running turn
-  Ctrl-D                         quit (on empty input)
+  Esc                            recall queued messages (interrupts when nothing is queued)
+  Up (empty input)               edit the newest queued message
+  Ctrl-D                         quit (on empty input; press again within 3 s while a turn
+                                 runs or messages are queued: the turn is interrupted and
+                                 undelivered messages are saved)
   Ctrl-O                         toggle the last reasoning block
   Ctrl-R                         search history (Ctrl-R again: older · Enter accept · Esc cancel)
   Ctrl-X Ctrl-S                  interrupt and send the input (sends normally when idle)
@@ -353,6 +357,11 @@ mod tests {
             "a allow",
             "n/Esc deny",
             "s stop",
+            "recall queued messages",
+            "newest queued message",
+            "delivers it at the next step",
+            "press again",
+            "switch it (idle only)",
         ] {
             assert!(HELP_TEXT.contains(needle), "help is missing {needle}");
         }

@@ -196,6 +196,10 @@ REASON: one sentence explaining the verdict, addressed to the agent";
 
 /// Maximum script payload size in bytes.
 pub const MAX_SCRIPT_BYTES: usize = 8 * 1024;
+/// Maximum size of the build configuration attached to build commands.
+pub const MAX_BUILD_CONTEXT_BYTES: usize = 12 * 1024;
+/// Maximum size of the whole `<script>` section (script plus build context).
+pub const MAX_PAYLOAD_BYTES: usize = MAX_SCRIPT_BYTES + MAX_BUILD_CONTEXT_BYTES + 1024;
 
 fn render_rules(out: &mut String) {
     out.push_str("<block_rules>\n");
@@ -252,7 +256,7 @@ fn render_user(input: &ClassifierInput<'_>, tail: &str) -> String {
     let _ = writeln!(out, "{} {}", input.tool, escape(&render_args(input.args)));
     out.push_str("</action>\n");
     if let Some(script) = input.script_payload {
-        let mut cut = script.len().min(MAX_SCRIPT_BYTES);
+        let mut cut = script.len().min(MAX_PAYLOAD_BYTES);
         while !script.is_char_boundary(cut) {
             cut -= 1;
         }

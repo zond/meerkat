@@ -69,6 +69,8 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect, now: Instant) {
     let title = if app.quit_armed(now) {
         " press Ctrl-C again to quit "
+    } else if app.quit_confirm_armed(now) {
+        " press Ctrl-D (or /quit) again to quit anyway "
     } else if app.chord_pending(now) {
         " C-x- "
     } else if app.search().is_some() {
@@ -245,7 +247,11 @@ pub const CONTEXT_CRITICAL_PERCENT: u64 = 90;
 /// `ctx 84k` when the window is unknown, `None` when usage is unknown.
 pub fn context_segment(status: &StatusInfo) -> Option<Span<'static>> {
     let used = status.context_used?;
-    let approx = if status.context_approx { "~" } else { "" };
+    let approx = if status.context_approx || status.window_approx {
+        "~"
+    } else {
+        ""
+    };
     let Some(window) = status.context_window.filter(|w| *w > 0) else {
         return Some(Span::raw(format!("ctx {approx}{}", fmt_ctx_tokens(used))));
     };
@@ -633,6 +639,9 @@ mod tests {
         assert_eq!(status_line(&s, now), " ↑1.5k ↓20 │ ctx 42% (84k/200k)");
         let bar = status_bar(&s, now);
         assert_eq!(seg_style(&bar, "ctx"), Style::default());
+        s.window_approx = true;
+        assert_eq!(status_line(&s, now), " ↑1.5k ↓20 │ ctx ~42% (84k/200k)");
+        s.window_approx = false;
         s.context_approx = true;
         assert_eq!(status_line(&s, now), " ↑1.5k ↓20 │ ctx ~42% (84k/200k)");
         s.context_used = Some(139_000);

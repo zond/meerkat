@@ -134,6 +134,23 @@ pub struct UiChannels {
     pub ui_rx: mpsc::UnboundedReceiver<Msg>,
 }
 
+/// `msg` (from the integrator) preceded by every agent and scoped event
+/// already buffered. The integrator sends `TurnFinished`, `InjectAck` and
+/// `Recalled` after the events that led to them, but on a different channel;
+/// applying the buffered events first keeps a turn's text from landing after
+/// its summary (or in the next turn).
+pub fn after_buffered_events(msg: Msg, channels: &mut UiChannels) -> Vec<Msg> {
+    let mut batch = Vec::new();
+    while let Ok(env) = channels.agent_rx.try_recv() {
+        batch.push(Msg::Agent(env));
+    }
+    while let Ok(ev) = channels.scoped_rx.try_recv() {
+        batch.push(Msg::Scoped(ev));
+    }
+    batch.push(msg);
+    batch
+}
+
 fn translate(event: Event, mouse: bool) -> Option<Msg> {
     match event {
         // Windows reports Press and Release; enhanced terminals also report Repeat.
@@ -174,10 +191,16 @@ pub async fn run_ui(
         if app.take_dirty() {
             terminal.draw(|frame| draw(frame, &mut app))?;
         }
-        let msg = tokio::select! {
+        // Agent events first: integrator messages refer to events sent
+        // before them (see `after_buffered_events`).
+        let batch = tokio::select! {
+            biased;
+            Some(env) = channels.agent_rx.recv() => vec![Msg::Agent(env)],
+            Some(ev) = channels.scoped_rx.recv() => vec![Msg::Scoped(ev)],
+            Some(msg) = channels.ui_rx.recv() => after_buffered_events(msg, &mut channels),
             maybe = events.next() => match maybe {
                 Some(Ok(event)) => match translate(event, mouse) {
-                    Some(msg) => msg,
+                    Some(msg) => vec![msg],
                     None => continue,
                 },
                 Some(Err(err)) => return Err(UiError::Io(err)),
@@ -187,40 +210,110 @@ pub async fn run_ui(
                     return Ok(());
                 }
             },
-            Some(env) = channels.agent_rx.recv() => Msg::Agent(env),
-            Some(ev) = channels.scoped_rx.recv() => Msg::Scoped(ev),
-            Some(msg) = channels.ui_rx.recv() => msg,
-            _ = tick.tick() => Msg::Tick,
+            _ = tick.tick() => vec![Msg::Tick],
         };
-        let effects_now = app.update(msg);
-        for entry in app.take_submitted() {
-            for history in &mut histories {
-                if let Err(err) = history.append(&entry) {
-                    tracing::warn!(
-                        error = %err,
-                        path = %history.path().display(),
-                        "could not append to input history"
-                    );
-                }
-            }
-        }
-        for effect in effects_now {
-            let quit = effect == Effect::Quit;
-            if effects.send(effect).is_err() && !quit {
-                return Err(UiError::EffectChannelClosed);
-            }
-            if quit {
+        for msg in batch {
+            if apply(&mut app, msg, &effects, &mut histories)? {
                 return Ok(());
             }
         }
     }
 }
 
+/// Apply one message, record submitted lines and forward the effects.
+/// Returns whether the user quit.
+fn apply(
+    app: &mut App,
+    msg: Msg,
+    effects: &mpsc::UnboundedSender<Effect>,
+    histories: &mut [History],
+) -> Result<bool, UiError> {
+    let effects_now = app.update(msg);
+    for entry in app.take_submitted() {
+        for history in histories.iter_mut() {
+            if let Err(err) = history.append(&entry) {
+                tracing::warn!(
+                    error = %err,
+                    path = %history.path().display(),
+                    "could not append to input history"
+                );
+            }
+        }
+    }
+    for effect in effects_now {
+        let quit = effect == Effect::Quit;
+        if effects.send(effect).is_err() && !quit {
+            return Err(UiError::EffectChannelClosed);
+        }
+        if quit {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::ui::{Block, StatusInfo, TurnOutcome, TurnSummary};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventState, KeyModifiers};
+
+    #[tokio::test]
+    async fn turn_finished_waits_for_buffered_agent_events() {
+        let (agent_tx, agent_rx) = mpsc::channel(16);
+        let (_scoped_tx, scoped_rx) = mpsc::channel(16);
+        let (ui_tx, ui_rx) = mpsc::unbounded_channel();
+        let mut channels = UiChannels {
+            agent_rx,
+            scoped_rx,
+            ui_rx,
+        };
+        let mut app = App::new(StatusInfo::default());
+        for c in "hi".chars() {
+            app.update(Msg::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )));
+        }
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        // The turn's text is still buffered when its result arrives.
+        for (seq, delta) in [(1, "Hel"), (2, "lo")] {
+            agent_tx
+                .send(EventEnvelope::new(
+                    "s",
+                    seq,
+                    None,
+                    AgentEvent::TextDelta {
+                        delta: delta.into(),
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        ui_tx
+            .send(Msg::TurnFinished(TurnOutcome::plain(Ok(TurnSummary {
+                text: "Hello".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+            }))))
+            .unwrap();
+        let msg = channels.ui_rx.recv().await.unwrap();
+        let batch = after_buffered_events(msg, &mut channels);
+        assert_eq!(batch.len(), 3);
+        assert!(matches!(batch.last(), Some(Msg::TurnFinished(_))));
+        for msg in batch {
+            app.update(msg);
+        }
+        let assistant: Vec<&Block> = app
+            .transcript
+            .blocks()
+            .iter()
+            .filter(|b| matches!(b, Block::Assistant { .. }))
+            .collect();
+        assert_eq!(assistant, vec![&Block::Assistant { md: "Hello".into() }]);
+        assert!(!app.is_running());
+    }
 
     #[test]
     fn translate_filters_release_events() {

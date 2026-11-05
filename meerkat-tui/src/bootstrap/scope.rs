@@ -77,15 +77,19 @@ impl From<RealmBackendArg> for RealmBackend {
 /// Resolve the workspace, conventions roots and realm from the arguments.
 ///
 /// The workspace is `--workspace`, else the nearest ancestor of the working
-/// directory that already contains `.rkat/tui/`, else the working directory.
+/// directory that already contains `.rkat/tui/` (searching no higher than the
+/// git top-level, and never the home directory or above it), else the working
+/// directory. The home directory itself (or an ancestor of it) is used only
+/// when passed explicitly with `--workspace`.
 /// State lives in `<workspace>/.rkat/tui/` unless `--realm`, `--isolated` or
 /// `--state-root` select the shared realm model.
 ///
 /// # Errors
 ///
 /// Returns [`TuiError::Realm`] for conflicting/invalid realm flags,
-/// [`TuiError::ProjectRoot`] when the root cannot be canonicalized, and
-/// [`TuiError::Io`] when the state directory cannot be created.
+/// [`TuiError::ProjectRoot`] when the root cannot be canonicalized or the
+/// working directory is the home directory, and [`TuiError::Io`] when the
+/// state directory cannot be created.
 pub fn resolve_scope(args: &Args) -> Result<RuntimeScope, TuiError> {
     let context_root = match &args.context_root {
         Some(root) => root.clone(),
@@ -94,7 +98,7 @@ pub fn resolve_scope(args: &Args) -> Result<RuntimeScope, TuiError> {
                 path: PathBuf::from("."),
                 source,
             })?;
-            find_workspace_above(&cwd).unwrap_or(cwd)
+            default_workspace(&cwd, dirs::home_dir().as_deref())?
         }
     };
     let project_root = project_root_from(&context_root)?;
@@ -153,11 +157,46 @@ pub fn resolve_scope(args: &Args) -> Result<RuntimeScope, TuiError> {
     })
 }
 
+/// Message for a working directory that must not become the workspace.
+const HOME_WORKSPACE_REFUSED: &str =
+    "refusing to use your home directory as the workspace; pass --workspace or cd into a project";
+
+/// The workspace when `--workspace` is not given: a workspace found above
+/// `cwd`, else `cwd` itself unless it is `home` (or an ancestor of it).
+fn default_workspace(cwd: &Path, home: Option<&Path>) -> Result<PathBuf, TuiError> {
+    let home = home.map(canonical_or_self);
+    if let Some(found) = find_workspace_above(cwd, home.as_deref()) {
+        return Ok(found);
+    }
+    if home
+        .as_deref()
+        .is_some_and(|home| home.starts_with(canonical_or_self(cwd)))
+    {
+        return Err(TuiError::ProjectRoot {
+            path: cwd.to_path_buf(),
+            source: std::io::Error::other(HOME_WORKSPACE_REFUSED),
+        });
+    }
+    Ok(cwd.to_path_buf())
+}
+
+fn canonical_or_self(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// The nearest ancestor of `start` (inclusive) that already holds a
 /// workspace-local state directory, if any.
-fn find_workspace_above(start: &Path) -> Option<PathBuf> {
-    let mut current = start.to_path_buf();
+///
+/// The search stops at the git top-level (a directory containing `.git` is
+/// the last one checked) and never yields `home` or an ancestor of it: a
+/// stray `~/.rkat/tui/` must not turn the whole home directory into the
+/// workspace. `home` is expected canonical.
+fn find_workspace_above(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let mut current = canonical_or_self(start);
     loop {
+        if home.is_some_and(|home| home.starts_with(&current)) {
+            return None;
+        }
         if current
             .join(WORKSPACE_STATE_DIR)
             .join(WORKSPACE_REALM_ID)
@@ -165,7 +204,7 @@ fn find_workspace_above(start: &Path) -> Option<PathBuf> {
         {
             return Some(current);
         }
-        if !current.pop() {
+        if current.join(".git").exists() || !current.pop() {
             return None;
         }
     }
@@ -255,12 +294,62 @@ mod tests {
     #[test]
     fn workspace_is_found_from_a_subdirectory() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".rkat/tui")).unwrap();
-        let sub = dir.path().join("src/deep");
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join(".rkat/tui")).unwrap();
+        let sub = root.join("src/deep");
         std::fs::create_dir_all(&sub).unwrap();
-        assert_eq!(find_workspace_above(&sub).as_deref(), Some(dir.path()));
+        assert_eq!(find_workspace_above(&sub, None).as_deref(), Some(&*root));
         let other = tempfile::tempdir().unwrap();
-        assert!(find_workspace_above(other.path()).is_none());
+        assert!(find_workspace_above(other.path(), None).is_none());
+    }
+
+    #[test]
+    fn discovery_stops_at_the_git_top_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = std::fs::canonicalize(dir.path()).unwrap();
+        // A workspace above the repository must not be picked up.
+        std::fs::create_dir_all(outer.join(".rkat/tui")).unwrap();
+        let repo = outer.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let sub = repo.join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(find_workspace_above(&sub, None).is_none());
+        assert_eq!(default_workspace(&sub, None).unwrap(), sub);
+        // A workspace at the repository root is still found.
+        std::fs::create_dir_all(repo.join(".rkat/tui")).unwrap();
+        assert_eq!(find_workspace_above(&sub, None), Some(repo));
+    }
+
+    #[test]
+    fn discovery_never_returns_home_or_above() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        // Stray state in the home directory and above it.
+        std::fs::create_dir_all(home.join(".rkat/tui")).unwrap();
+        std::fs::create_dir_all(root.join(".rkat/tui")).unwrap();
+        assert!(find_workspace_above(&project, Some(&home)).is_none());
+        assert_eq!(default_workspace(&project, Some(&home)).unwrap(), project);
+    }
+
+    #[test]
+    fn home_directory_is_refused_without_an_explicit_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        let err = default_workspace(&home, Some(&home)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("refusing to use your home directory"),
+            "{err}"
+        );
+        // Above the home directory as well.
+        let parent = home.parent().unwrap();
+        assert!(default_workspace(parent, Some(&home)).is_err());
+        // An explicit --workspace is honoured.
+        let scope = resolve_scope(&args(&["-w", home.to_str().unwrap()])).unwrap();
+        assert_eq!(scope.context_root, home);
     }
 
     #[test]

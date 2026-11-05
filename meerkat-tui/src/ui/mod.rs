@@ -36,6 +36,10 @@ pub use transcript::{Block, BlockId, DiffView, NoticeLevel, QueuedLabel, ToolSta
 /// Window in which a second Ctrl-C on an idle, empty prompt quits.
 pub const DOUBLE_CTRL_C_WINDOW: Duration = Duration::from_millis(1500);
 
+/// Window in which a second Ctrl-D / `/quit` confirms quitting while a turn
+/// is running or messages are queued.
+pub const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
+
 /// Window after Ctrl-X in which the second key of a chord is accepted.
 pub const CHORD_WINDOW: Duration = Duration::from_millis(1500);
 
@@ -131,6 +135,9 @@ pub enum StatusUpdate {
     },
     /// The model's context window in tokens, `None` when unknown.
     ContextWindow(Option<u64>),
+    /// An estimated context window (the model is not in the catalog; the
+    /// window is a family or provider default). The gauge shows `~`.
+    ApproxContextWindow(u64),
 }
 
 /// Input to [`App::update`].
@@ -219,8 +226,13 @@ pub enum Effect {
     /// Pull every not-yet-consumed injected message back; answered with
     /// [`Msg::Recalled`].
     RecallPending,
-    /// Leave the application.
+    /// Leave the application. The integrator interrupts a running turn,
+    /// persists the session and saves undelivered messages before exiting.
     Quit,
+    /// Sent right before [`Effect::Quit`]: every message the UI still holds
+    /// (queued, deferred, or the Ctrl-X Ctrl-S prompt as `None`). The
+    /// integrator saves those the model never received.
+    SaveUnsent(Vec<(Option<PendingId>, String)>),
     /// Start a fresh session.
     NewSession,
     /// Resume a session by reference (`last`, `~N`, id prefix).
@@ -284,6 +296,8 @@ pub struct StatusInfo {
     pub context_window: Option<u64>,
     /// Whether `context_used` is an estimate.
     pub context_approx: bool,
+    /// Whether `context_window` is an estimate (model not in the catalog).
+    pub window_approx: bool,
 }
 
 /// Number of session-id characters shown in the status bar.
@@ -336,9 +350,29 @@ impl StatusInfo {
                 self.context_used = used;
                 self.context_approx = approx;
             }
-            StatusUpdate::ContextWindow(window) => self.context_window = window,
+            StatusUpdate::ContextWindow(window) => {
+                self.context_window = window;
+                self.window_approx = false;
+            }
+            StatusUpdate::ApproxContextWindow(window) => {
+                self.context_window = Some(window);
+                self.window_approx = true;
+            }
         }
     }
+}
+
+/// Longest quoted excerpt of a message in a notice, in characters.
+const QUOTE_MAX_CHARS: usize = 40;
+
+/// `“text”`, shortened to its first line and [`QUOTE_MAX_CHARS`] characters.
+fn quote_short(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    let mut out: String = line.chars().take(QUOTE_MAX_CHARS).collect();
+    if out.len() < line.len() || text.trim().lines().count() > 1 {
+        out.push('…');
+    }
+    format!("“{out}”")
 }
 
 /// Tokens in the context after a model call: everything sent plus the reply.
@@ -453,6 +487,20 @@ pub struct App {
     /// Whether `/compact` is running ([`Effect::Compact`] sent, no
     /// [`Msg::CompactFinished`] yet). Prompts are deferred meanwhile.
     pub compacting: bool,
+    /// When a Ctrl-D / `/quit` was refused because work is in flight; a
+    /// second one within [`QUIT_CONFIRM_WINDOW`] quits anyway.
+    pub quit_confirm: Option<Instant>,
+    /// Whether assistant text streamed during the current turn (the turn
+    /// summary is shown only when nothing did).
+    streamed_text: bool,
+    /// Highest pending id allocated when the last continuation turn started;
+    /// an unanswered message above it was typed during the continuation.
+    continuation_watermark: Option<PendingId>,
+    /// A mid-turn message was recorded but not answered and no continuation
+    /// is left: Enter on an empty editor asks the model to answer it.
+    answer_hint: bool,
+    /// Texts of the messages the last report listed as unanswered.
+    unanswered_texts: Vec<(PendingId, String)>,
     /// Global (cross-workspace) prompt history, oldest first; searched after the
     /// workspace history.
     global_history: Vec<String>,
@@ -485,6 +533,11 @@ impl App {
             mode: InputMode::Normal,
             chord: None,
             compacting: false,
+            quit_confirm: None,
+            streamed_text: false,
+            continuation_watermark: None,
+            answer_hint: false,
+            unanswered_texts: Vec::new(),
             global_history: Vec::new(),
             search_corpus: Vec::new(),
             pending_escalations: VecDeque::new(),
@@ -553,6 +606,13 @@ impl App {
             .is_some_and(|t| now.saturating_duration_since(t) < DOUBLE_CTRL_C_WINDOW)
     }
 
+    /// Whether a second Ctrl-D / `/quit` at `now` would quit despite a running
+    /// turn or queued messages (used for the input hint).
+    pub fn quit_confirm_armed(&self, now: Instant) -> bool {
+        self.quit_confirm
+            .is_some_and(|t| now.saturating_duration_since(t) < QUIT_CONFIRM_WINDOW)
+    }
+
     /// Record the transcript viewport height (set by the renderer).
     pub fn set_viewport_height(&mut self, height: usize) {
         self.viewport_height = height.max(1);
@@ -602,6 +662,12 @@ impl App {
                 self.last_seq = env.seq;
                 match &env.payload {
                     AgentEvent::TurnStarted { .. } => self.mark_seen(env.seq),
+                    AgentEvent::TextDelta { delta } if !delta.is_empty() => {
+                        self.streamed_text = true;
+                    }
+                    AgentEvent::TextComplete { content } if !content.is_empty() => {
+                        self.streamed_text = true;
+                    }
                     AgentEvent::TurnCompleted { usage, .. } => {
                         self.status.context_used = Some(context_tokens(usage));
                         self.status.context_approx = false;
@@ -654,7 +720,13 @@ impl App {
             Msg::Notice { level, text } => {
                 self.transcript.push_notice(level, text);
             }
-            Msg::Status(update) => self.status.apply(update),
+            Msg::Status(update) => {
+                // Envelope sequence numbers restart with every session task.
+                if matches!(update, StatusUpdate::Session(_)) {
+                    self.last_seq = 0;
+                }
+                self.status.apply(update);
+            }
             Msg::ShowResumePicker(items) => {
                 if self.modal.is_none() {
                     self.modal = Some(Modal::Resume(ResumePicker { items, selected: 0 }));
@@ -662,6 +734,7 @@ impl App {
             }
             Msg::ResetTranscript(blocks) => {
                 self.transcript.reset(blocks);
+                self.last_seq = 0;
                 self.pending.clear_settled();
                 // Keep placeholders for messages still in flight.
                 for item in self.pending.iter_mut() {
@@ -679,9 +752,13 @@ impl App {
                 dirty = self.status.running_since.is_some()
                     || self.status.classifying
                     || self.last_ctrl_c.is_some()
+                    || self.quit_confirm.is_some()
                     || self.chord.is_some();
                 if self.last_ctrl_c.is_some() && !self.quit_armed(now) {
                     self.last_ctrl_c = None;
+                }
+                if self.quit_confirm.is_some() && !self.quit_confirm_armed(now) {
+                    self.quit_confirm = None;
                 }
                 if self.chord.is_some() && !self.chord_pending(now) {
                     self.chord = None;
@@ -733,7 +810,7 @@ impl App {
             Action::CtrlC => self.ctrl_c(now, fx),
             Action::CtrlD => {
                 if self.input.is_empty() {
-                    fx.push(Effect::Quit);
+                    self.request_quit(now, fx);
                 } else {
                     self.input.delete();
                 }
@@ -855,19 +932,26 @@ impl App {
 
     fn submit(&mut self, now: Instant, fx: &mut Vec<Effect>) {
         if self.input.text().trim().is_empty() {
+            if self.answer_hint && !self.running && !self.compacting {
+                // Ask the model to answer the recorded-but-unanswered message.
+                self.input.clear();
+                self.continuations_left = 0;
+                self.continuation_watermark = Some(self.pending.last_id());
+                self.begin_turn(CONTINUATION_PROMPT.to_string(), false, now, fx);
+            }
             return;
         }
         let raw = self.input.take();
         self.submitted.push(raw.clone());
         match commands::parse(&raw) {
-            Some(Ok(cmd)) => self.run_command(cmd, fx),
+            Some(Ok(cmd)) => self.run_command(cmd, now, fx),
             Some(Err(err)) => {
                 self.transcript
                     .push_notice(NoticeLevel::Warn, err.to_string());
             }
             None => {
                 if let Some(text) = commands::parse_remember(&raw) {
-                    self.run_command(Command::Remember(text), fx);
+                    self.run_command(Command::Remember(text), now, fx);
                     return;
                 }
                 let prompt = match raw.trim_start().strip_prefix("//") {
@@ -889,11 +973,14 @@ impl App {
     /// shows `prompt` as a user block.
     fn start_turn(&mut self, prompt: String, now: Instant, fx: &mut Vec<Effect>) {
         self.continuations_left = 1;
+        self.continuation_watermark = None;
         self.begin_turn(prompt, true, now, fx);
     }
 
     fn begin_turn(&mut self, prompt: String, user_block: bool, now: Instant, fx: &mut Vec<Effect>) {
         self.run_first_block = self.transcript.len();
+        self.streamed_text = false;
+        self.answer_hint = false;
         if user_block {
             self.transcript.push(Block::User {
                 text: prompt.clone(),
@@ -1073,6 +1160,7 @@ impl App {
                         .replace_block(item.block, Block::User { text: item.text });
                 }
                 self.continuations_left = 1;
+                self.continuation_watermark = None;
                 self.begin_turn(text, false, now, fx);
             }
             Err(cause) => {
@@ -1187,13 +1275,7 @@ impl App {
         let succeeded = result.is_ok();
         match result {
             Ok(summary) => {
-                let has_text = self
-                    .transcript
-                    .blocks()
-                    .iter()
-                    .skip(self.run_first_block)
-                    .any(|b| matches!(b, Block::Assistant { .. }));
-                if !has_text && !summary.text.is_empty() {
+                if !self.streamed_text && !summary.text.is_empty() {
                     self.transcript.push(Block::Assistant { md: summary.text });
                 }
             }
@@ -1202,9 +1284,39 @@ impl App {
                     .push_notice(NoticeLevel::Error, format!("turn failed: {err}"));
             }
         }
+        self.streamed_text = false;
         self.deferred_notified.clear();
+        // Texts of unanswered messages, kept across continuation turns (the
+        // queue forgets settled items once the report is applied).
+        let unanswered: Vec<(PendingId, String)> = delivery
+            .unanswered
+            .iter()
+            .filter_map(|id| {
+                let text = self.pending.text_of(*id).map(str::to_string).or_else(|| {
+                    self.unanswered_texts
+                        .iter()
+                        .find(|(known, _)| known == id)
+                        .map(|(_, text)| text.clone())
+                })?;
+                Some((*id, text))
+            })
+            .collect();
         let unsent = self.apply_report(&delivery);
         self.next_after_turn(unsent, &delivery, interrupted, succeeded, now, fx);
+        if !self.running && succeeded && !delivery.unanswered.is_empty() {
+            self.answer_hint = true;
+            let quoted: Vec<String> = unanswered.iter().map(|(_, t)| quote_short(t)).collect();
+            let what = if quoted.is_empty() {
+                "your message".to_string()
+            } else {
+                format!("your message {}", quoted.join(", "))
+            };
+            self.transcript.push_notice(
+                NoticeLevel::Warn,
+                format!("{what} was recorded but not answered; send it again or press Enter"),
+            );
+        }
+        self.unanswered_texts = unanswered;
     }
 
     /// Apply a delivery report: delivered messages become user blocks; returns
@@ -1260,11 +1372,21 @@ impl App {
             self.prepend_to_editor(unsent.into_iter().map(|p| p.text).collect());
         } else if !unsent.is_empty() {
             self.send_unsent(unsent, now, fx);
-        } else if !report.unanswered.is_empty() && succeeded && self.continuations_left > 0 {
-            self.continuations_left -= 1;
-            self.transcript
-                .push_notice(NoticeLevel::Info, "continuing: answering your message");
-            self.begin_turn(CONTINUATION_PROMPT.to_string(), false, now, fx);
+        } else if !report.unanswered.is_empty() && succeeded {
+            // A message typed during the continuation turn earns its own.
+            if self
+                .continuation_watermark
+                .is_some_and(|mark| report.unanswered.iter().any(|id| *id > mark))
+            {
+                self.continuations_left = 1;
+            }
+            if self.continuations_left > 0 {
+                self.continuations_left -= 1;
+                self.continuation_watermark = Some(self.pending.last_id());
+                self.transcript
+                    .push_notice(NoticeLevel::Info, "continuing: answering your message");
+                self.begin_turn(CONTINUATION_PROMPT.to_string(), false, now, fx);
+            }
         }
     }
 
@@ -1273,6 +1395,7 @@ impl App {
     fn send_unsent(&mut self, unsent: Vec<Pending>, now: Instant, fx: &mut Vec<Effect>) {
         let texts = self.unsent_as_user(unsent);
         self.continuations_left = 1;
+        self.continuation_watermark = None;
         self.begin_turn(texts.join("\n\n"), false, now, fx);
     }
 
@@ -1313,7 +1436,51 @@ impl App {
         fx.push(Effect::Interrupt);
     }
 
-    fn run_command(&mut self, cmd: Command, fx: &mut Vec<Effect>) {
+    /// Ctrl-D on an empty editor or `/quit`: quit right away when idle;
+    /// otherwise warn and quit only on a second request within
+    /// [`QUIT_CONFIRM_WINDOW`]. Quitting hands every held message to the
+    /// integrator ([`Effect::SaveUnsent`]) so undelivered ones are saved.
+    fn request_quit(&mut self, now: Instant, fx: &mut Vec<Effect>) {
+        let queued = self.pending.len() + usize::from(self.send_next.is_some());
+        let busy = self.running || queued > 0;
+        if busy && !self.quit_confirm_armed(now) {
+            self.quit_confirm = Some(now);
+            let mut what = Vec::new();
+            if self.running {
+                what.push("a turn is running".to_string());
+            }
+            if queued > 0 {
+                what.push(format!(
+                    "{queued} message{} queued",
+                    if queued == 1 { "" } else { "s" }
+                ));
+            }
+            self.transcript.push_notice(
+                NoticeLevel::Warn,
+                format!(
+                    "{}; press again to quit anyway (the turn is interrupted, undelivered messages are saved)",
+                    what.join(" / ")
+                ),
+            );
+            self.scroll.bottom();
+            return;
+        }
+        self.quit_confirm = None;
+        let mut held: Vec<(Option<PendingId>, String)> = self
+            .pending
+            .all()
+            .map(|p| (Some(p.id), p.text.clone()))
+            .collect();
+        if let Some(next) = &self.send_next {
+            held.push((None, next.clone()));
+        }
+        if !held.is_empty() {
+            fx.push(Effect::SaveUnsent(held));
+        }
+        fx.push(Effect::Quit);
+    }
+
+    fn run_command(&mut self, cmd: Command, now: Instant, fx: &mut Vec<Effect>) {
         let busy = |app: &mut Self| {
             app.transcript.push_notice(
                 NoticeLevel::Warn,
@@ -1327,7 +1494,7 @@ impl App {
             );
         };
         match cmd {
-            Command::Quit => fx.push(Effect::Quit),
+            Command::Quit => self.request_quit(now, fx),
             Command::Help => {
                 self.transcript
                     .push_notice(NoticeLevel::Info, commands::HELP_TEXT);
@@ -1343,11 +1510,8 @@ impl App {
                         "messages are still queued; wait for them or recall them (Esc)",
                     );
                 } else {
-                    self.transcript.clear();
-                    self.scroll.bottom();
-                    self.status.set_tokens(0, 0);
-                    self.status.context_used = None;
-                    self.status.context_approx = false;
+                    // The integrator resets the transcript and counters once
+                    // the new session is live (and keeps them on failure).
                     fx.push(Effect::NewSession);
                 }
             }
@@ -1356,6 +1520,11 @@ impl App {
                     busy(self);
                 } else if self.compacting {
                     compacting(self);
+                } else if !self.pending.is_empty() {
+                    self.transcript.push_notice(
+                        NoticeLevel::Warn,
+                        "messages are still queued; wait for them or recall them (Esc)",
+                    );
                 } else {
                     fx.push(reference.map_or(Effect::RequestResumePicker, Effect::ResumeSession));
                 }
@@ -1381,7 +1550,18 @@ impl App {
                     fx.push(Effect::Compact);
                 }
             }
-            Command::Model(Some(model)) => fx.push(Effect::SetModel(model)),
+            Command::Model(Some(model)) => {
+                if self.running || !self.pending.is_empty() {
+                    self.transcript.push_notice(
+                        NoticeLevel::Warn,
+                        "/model is only available while idle; wait for the turn or interrupt it (Ctrl-C)",
+                    );
+                } else if self.compacting {
+                    compacting(self);
+                } else {
+                    fx.push(Effect::SetModel(model));
+                }
+            }
             Command::Model(None) => {
                 let text = format!("model: {}/{}", self.status.provider, self.status.model);
                 self.transcript.push_notice(NoticeLevel::Info, text);
@@ -1922,15 +2102,33 @@ mod tests {
                 .iter()
                 .any(|b| matches!(b, Block::User { text } if text == CONTINUATION_PROMPT))
         );
-        // …but not a second one.
+        // A message typed during the continuation earns another one…
         submit(&mut app, "five");
         app.update(ack(4, Ok(())));
         let report = DeliveryReport {
             unanswered: vec![PendingId(4)],
             ..DeliveryReport::default()
         };
+        let fx = app.update(finished(Ok(summary()), report));
+        assert_eq!(fx, vec![Effect::StartTurn(CONTINUATION_PROMPT.into())]);
+        // …but the same message left unanswered again does not: the user is
+        // told, and Enter on an empty editor asks for the answer.
+        let report = DeliveryReport {
+            unanswered: vec![PendingId(4)],
+            ..DeliveryReport::default()
+        };
         assert!(app.update(finished(Ok(summary()), report)).is_empty());
         assert!(!app.is_running());
+        assert!(matches!(
+            last_notice(&app),
+            Some((NoticeLevel::Warn, text))
+                if text.contains("recorded but not answered") && text.contains("“five”")
+        ));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            vec![Effect::StartTurn(CONTINUATION_PROMPT.into())]
+        );
+        app.update(finished(Ok(summary()), DeliveryReport::default()));
         // A failed run never continues.
         submit(&mut app, "six");
         submit(&mut app, "seven");
@@ -2235,7 +2433,11 @@ mod tests {
             vec![Effect::ResumeSession("last".into())]
         );
         assert_eq!(run(&mut app, "/rules rm 2"), vec![Effect::RemoveRule(2)]);
+        // The transcript is reset only once the integrator confirms.
+        app.transcript.push_notice(NoticeLevel::Info, "old");
         assert_eq!(run(&mut app, "/clear"), vec![Effect::NewSession]);
+        assert!(!app.transcript.is_empty());
+        app.update(Msg::ResetTranscript(Vec::new()));
         assert!(app.transcript.is_empty());
         assert!(run(&mut app, "/bogus").is_empty());
         assert!(matches!(
@@ -2246,9 +2448,113 @@ mod tests {
             run(&mut app, "//etc"),
             vec![Effect::StartTurn("/etc".into())]
         );
-        // While running, /clear is refused.
+        // While running, /clear and /model are refused, /quit asks again.
         assert!(run(&mut app, "/clear").is_empty());
+        assert!(run(&mut app, "/model gpt-5.2").is_empty());
+        assert!(matches!(
+            app.transcript.blocks().last(),
+            Some(Block::Notice { level: NoticeLevel::Warn, text }) if text.contains("idle")
+        ));
+        assert!(run(&mut app, "/quit").is_empty());
         assert_eq!(run(&mut app, "/quit"), vec![Effect::Quit]);
+    }
+
+    #[test]
+    fn model_is_refused_while_messages_are_pending() {
+        let mut app = running_app();
+        submit(&mut app, "two");
+        app.update(finished(Ok(summary()), DeliveryReport::default()));
+        assert!(!app.is_running());
+        assert_eq!(app.status.queued, 1);
+        assert!(submit(&mut app, "/model gpt-5.2").is_empty());
+        app.pending = PendingQueue::new();
+        assert_eq!(
+            submit(&mut app, "/model gpt-5.2"),
+            vec![Effect::SetModel("gpt-5.2".into())]
+        );
+    }
+
+    #[test]
+    fn quit_while_busy_needs_confirmation_and_hands_over_held_messages() {
+        let mut app = running_app();
+        let t0 = Instant::now();
+        submit(&mut app, "two");
+        app.update(ack(1, Err(InjectFailure::Full)));
+        // First Ctrl-D warns and arms.
+        assert!(app.update_at(ctrl('d'), t0).is_empty());
+        assert!(app.quit_confirm_armed(t0));
+        assert!(matches!(
+            last_notice(&app),
+            Some((NoticeLevel::Warn, text))
+                if text.contains("a turn is running") && text.contains("1 message queued")
+        ));
+        // The window expires on a tick; the next press only re-arms.
+        app.update_at(Msg::Tick, t0 + QUIT_CONFIRM_WINDOW);
+        assert!(app.quit_confirm.is_none());
+        assert!(
+            app.update_at(ctrl('d'), t0 + QUIT_CONFIRM_WINDOW)
+                .is_empty()
+        );
+        assert!(app.quit_confirm_armed(t0 + QUIT_CONFIRM_WINDOW));
+        // Ctrl-D then /quit (typing does not disarm) within the window quits,
+        // handing over the text.
+        let t1 = t0 + Duration::from_secs(10);
+        assert!(app.update_at(ctrl('d'), t1).is_empty());
+        for c in "/quit".chars() {
+            app.update_at(key(KeyCode::Char(c)), t1);
+        }
+        assert_eq!(
+            app.update_at(key(KeyCode::Enter), t1 + Duration::from_secs(1)),
+            vec![
+                Effect::SaveUnsent(vec![(Some(PendingId(1)), "two".into())]),
+                Effect::Quit
+            ]
+        );
+    }
+
+    #[test]
+    fn idle_quit_is_immediate() {
+        let mut app = App::new(StatusInfo::default());
+        assert_eq!(app.update(ctrl('d')), vec![Effect::Quit]);
+        let mut app = App::new(StatusInfo::default());
+        type_str(&mut app, "/quit");
+        assert_eq!(app.update(key(KeyCode::Enter)), vec![Effect::Quit]);
+    }
+
+    #[test]
+    fn last_seq_resets_with_the_session() {
+        let mut app = running_app();
+        app.update(agent_at(AgentEvent::TurnStarted { turn_number: 0 }, 41));
+        assert_eq!(app.last_seq, 41);
+        app.update(Msg::Status(StatusUpdate::Session("next".into())));
+        assert_eq!(app.last_seq, 0);
+        app.update(agent_at(AgentEvent::TurnStarted { turn_number: 0 }, 7));
+        app.update(Msg::ResetTranscript(Vec::new()));
+        assert_eq!(app.last_seq, 0);
+    }
+
+    #[test]
+    fn summary_text_is_not_repeated_after_streamed_text() {
+        let mut app = running_app();
+        app.update(agent(AgentEvent::TextDelta {
+            delta: "streamed".into(),
+        }));
+        // A notice after the text must not make the summary look new.
+        app.update(Msg::Notice {
+            level: NoticeLevel::Info,
+            text: "x".into(),
+        });
+        app.update(Msg::TurnFinished(TurnOutcome::plain(Ok(TurnSummary {
+            text: "streamed".into(),
+            ..summary()
+        }))));
+        let assistant = app
+            .transcript
+            .blocks()
+            .iter()
+            .filter(|b| matches!(b, Block::Assistant { .. }))
+            .count();
+        assert_eq!(assistant, 1);
     }
 
     #[test]
@@ -2602,7 +2908,18 @@ mod tests {
         assert_eq!(app.status.context_used, Some(3_100));
         assert!(!app.status.context_approx);
         assert_eq!(submit(&mut app, "/clear"), vec![Effect::NewSession]);
+        // What the integrator sends once the new session is live.
+        app.update(Msg::Status(StatusUpdate::Context {
+            used: None,
+            approx: false,
+        }));
+        app.update(Msg::Status(StatusUpdate::ContextWindow(Some(200_000))));
         assert_eq!(app.status.context_used, None);
         assert_eq!(app.status.context_window, Some(200_000));
+        app.update(Msg::Status(StatusUpdate::ApproxContextWindow(128_000)));
+        assert!(app.status.window_approx);
+        assert_eq!(app.status.context_window, Some(128_000));
+        app.update(Msg::Status(StatusUpdate::ContextWindow(Some(200_000))));
+        assert!(!app.status.window_approx);
     }
 }

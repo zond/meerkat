@@ -14,7 +14,11 @@
 //! actions are escalated to the human through the [`EscalationBroker`].
 //!
 //! A second, observe-only `RunStarted` hook (`tui-transcript`) records user
-//! prompts, so the classifier transcript never depends on the UI.
+//! prompts, so the classifier transcript never depends on the UI. Prompts of
+//! sub-agent runs were written by the parent model, so they are recorded as an
+//! `agent_spawn` action on top of the primary session's transcript, never as
+//! user words. Observe-only `RunCompleted`/`RunFailed` hooks (`tui-run-ended`)
+//! drop the per-session state of finished sub-agents.
 
 pub mod classifier;
 pub mod counters;
@@ -51,12 +55,28 @@ use crate::paths::ProjectRoot;
 
 /// Hook id and in-process handler name of the transcript hook.
 pub const TRANSCRIPT_HOOK_ID: &str = "tui-transcript";
+/// In-process handler name of the run-ended hooks (also the `RunCompleted` hook id).
+pub const RUN_ENDED_HOOK_ID: &str = "tui-run-ended";
+/// Hook id of the `RunFailed` registration of the run-ended handler.
+pub const RUN_FAILED_HOOK_ID: &str = "tui-run-failed";
 /// Hook id and in-process handler name of the guardrail hook.
 pub const AUTO_MODE_HOOK_ID: &str = "tui-auto-mode";
 /// Guardrail timeout: long enough for a human to answer an escalation.
 pub const AUTO_MODE_HOOK_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 /// Longest argument preview shown in escalation dialogs.
 const ARGS_PREVIEW_BYTES: usize = 2048;
+/// Per-file cap for build configuration attached to build commands.
+const BUILD_FILE_BYTES: usize = 4 * 1024;
+/// Commands whose execution is defined by project files.
+const BUILD_RUNNERS: &[&str] = &["cargo", "make", "npm", "pnpm", "yarn", "npx"];
+/// Project files that decide what a Rust build executes.
+const CARGO_BUILD_FILES: &[&str] = &[
+    "build.rs",
+    ".cargo/config.toml",
+    ".cargo/config",
+    "rust-toolchain.toml",
+    "rust-toolchain",
+];
 
 /// Final decision for one tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,11 +198,26 @@ impl fmt::Display for DenyReason {
     }
 }
 
+/// Serializes as the constant `"auto-mode"`: the `policy` tag of [`DenyPayload`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutoModePolicy;
+
+impl AutoModePolicy {
+    /// The serialized tag.
+    pub const TAG: &'static str = "auto-mode";
+}
+
+impl Serialize for AutoModePolicy {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(Self::TAG)
+    }
+}
+
 /// Typed payload attached to hook denials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DenyPayload {
-    /// Always `"auto-mode"`.
-    pub policy: &'static str,
+    /// Always serialized as `"auto-mode"`.
+    pub policy: AutoModePolicy,
     /// Tool-use id of the denied call (lets a UI match the denial to its tool block).
     pub tool_use_id: String,
     /// Tool name.
@@ -272,6 +307,8 @@ pub struct ApprovalEngine {
     rules: RwLock<RuleSet>,
     settings: RwLock<AutoSettings>,
     transcripts: RwLock<HashMap<SessionId, ApprovalTranscript>>,
+    /// The session the human talks to; other sessions are sub-agents.
+    primary: RwLock<Option<SessionId>>,
     auto: Mutex<AutoMode>,
     allow_cache: Mutex<HashMap<SessionId, HashSet<CacheKey>>>,
     stopped: Mutex<HashSet<SessionId>>,
@@ -318,6 +355,7 @@ impl ApprovalEngine {
             rules: RwLock::new(rules),
             settings: RwLock::new(settings),
             transcripts: RwLock::new(HashMap::new()),
+            primary: RwLock::new(None),
             auto: Mutex::new(auto),
             allow_cache: Mutex::new(HashMap::new()),
             stopped: Mutex::new(HashSet::new()),
@@ -368,15 +406,81 @@ impl ApprovalEngine {
             .insert(session_id.clone(), transcript);
     }
 
-    /// Record a user prompt (what the `tui-transcript` hook does) and clear a
-    /// previous stop for the session.
+    /// Mark `session_id` as the session the human talks to. Runs of any other
+    /// session are treated as sub-agent runs. Until this is called, every
+    /// session is treated as primary.
+    pub fn set_primary_session(&self, session_id: &SessionId) {
+        *self.primary.write() = Some(session_id.clone());
+    }
+
+    /// Whether `session_id` is the primary session (or none is set).
+    pub fn is_primary(&self, session_id: &SessionId) -> bool {
+        self.primary
+            .read()
+            .as_ref()
+            .is_none_or(|primary| primary == session_id)
+    }
+
+    /// Record words the human typed into a session (a mid-turn injection).
+    ///
+    /// Does not clear a previous Stop: only a new primary run does that.
     pub fn record_prompt(&self, session_id: &SessionId, prompt: &str) {
-        self.stopped.lock().remove(session_id);
         self.transcripts
             .write()
             .entry(session_id.clone())
             .or_default()
             .push_user(prompt);
+    }
+
+    /// Remove the most recent user entry equal to `prompt` (the human recalled
+    /// a queued message before the model saw it). Returns whether one was found.
+    pub fn forget_prompt(&self, session_id: &SessionId, prompt: &str) -> bool {
+        self.transcripts
+            .write()
+            .get_mut(session_id)
+            .is_some_and(|t| t.forget_user(prompt))
+    }
+
+    /// What the `tui-transcript` (`RunStarted`) hook does.
+    ///
+    /// A primary run is a genuine new user prompt: it clears a previous Stop.
+    /// A sub-agent run's prompt was written by the parent model, so it is
+    /// recorded as an `agent_spawn` action on top of a copy of the primary
+    /// transcript; the classifier then judges the sub-agent's actions against
+    /// the human's intent.
+    pub fn on_run_started(&self, session_id: &SessionId, prompt: &str) {
+        if self.is_primary(session_id) {
+            self.stopped.lock().remove(session_id);
+            self.record_prompt(session_id, prompt);
+            return;
+        }
+        let primary = self.primary.read().clone();
+        let mut transcripts = self.transcripts.write();
+        if !transcripts.contains_key(session_id) {
+            let seed = primary
+                .and_then(|p| transcripts.get(&p).cloned())
+                .unwrap_or_default();
+            transcripts.insert(session_id.clone(), seed);
+        }
+        if let Some(transcript) = transcripts.get_mut(session_id) {
+            transcript.push_tool_call(
+                String::new(),
+                "agent_spawn",
+                serde_json::json!({ "prompt": prompt }),
+                None,
+            );
+        }
+    }
+
+    /// What the `tui-run-ended` hooks do: sub-agent sessions are one-shot, so
+    /// their transcript, allow cache and stop flag are dropped.
+    pub fn on_run_ended(&self, session_id: &SessionId) {
+        if self.is_primary(session_id) {
+            return;
+        }
+        self.transcripts.write().remove(session_id);
+        self.allow_cache.lock().remove(session_id);
+        self.stopped.lock().remove(session_id);
     }
 
     /// Add a rule, persisting it to the realm rules file when configured.
@@ -629,6 +733,7 @@ impl ApprovalEngine {
             session_id: session_id.clone(),
             tool: action.name.to_string(),
             args_preview: args_preview(action),
+            subjects: action.subjects(&self.root),
             classifier_hint: hint,
         };
         let decision = broker.ask_locked(&guard, prompt).await;
@@ -664,6 +769,8 @@ impl ApprovalEngine {
         }
     }
 
+    /// Extra content for the classifier: the script a shell command runs and,
+    /// for build commands, the project files that decide what the build runs.
     async fn script_payload(&self, action: &Action<'_>) -> Option<String> {
         let ActionKind::Shell {
             command,
@@ -673,6 +780,17 @@ impl ApprovalEngine {
         else {
             return None;
         };
+        let script = self.script_content(command, working_dir.as_deref()).await;
+        let build = self.build_context(command).await;
+        match (script, build) {
+            (None, None) => None,
+            (Some(script), None) => Some(script),
+            (None, Some(build)) => Some(build),
+            (Some(script), Some(build)) => Some(format!("{script}\n{build}")),
+        }
+    }
+
+    async fn script_content(&self, command: &str, working_dir: Option<&str>) -> Option<String> {
         let script = shell::script_path(command)?;
         let joined = match working_dir {
             Some(dir) if !script.starts_with('/') => format!("{dir}/{script}"),
@@ -688,6 +806,54 @@ impl ApprovalEngine {
         Some(String::from_utf8_lossy(slice).into_owned())
     }
 
+    /// Labelled contents of the build configuration files a build command
+    /// would execute, each capped at [`BUILD_FILE_BYTES`], in total at
+    /// [`prompts::MAX_BUILD_CONTEXT_BYTES`].
+    async fn build_context(&self, command: &str) -> Option<String> {
+        let runners = build_runners(command);
+        if runners.is_empty() {
+            return None;
+        }
+        let mut files: Vec<&str> = CARGO_BUILD_FILES.to_vec();
+        if runners.contains(&"make") {
+            files.extend(["Makefile", "makefile", "GNUmakefile"]);
+        }
+        if runners
+            .iter()
+            .any(|r| matches!(*r, "npm" | "pnpm" | "yarn" | "npx"))
+        {
+            files.push("package.json");
+        }
+        let mut out = String::new();
+        for file in files {
+            let Ok(resolved) = self.root.resolve(file) else {
+                continue;
+            };
+            if !resolved.inside() {
+                continue;
+            }
+            let Ok(bytes) = tokio::fs::read(&resolved.abs).await else {
+                continue;
+            };
+            let budget = prompts::MAX_BUILD_CONTEXT_BYTES.saturating_sub(out.len());
+            if budget < 64 {
+                break;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            let header = format!("--- {file} ---\n");
+            let room = budget
+                .saturating_sub(header.len() + 16)
+                .min(BUILD_FILE_BYTES);
+            out.push_str(&header);
+            out.push_str(truncate_at(&text, room));
+            if text.len() > room {
+                out.push_str("\n[truncated]");
+            }
+            out.push('\n');
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
     /// Hook decision for a verdict on the call `tool_use_id` of tool `tool`.
     pub fn hook_decision(&self, verdict: &Verdict, tool_use_id: &str, tool: &str) -> HookDecision {
         match verdict {
@@ -695,7 +861,7 @@ impl ApprovalEngine {
             Verdict::Deny { tier, reason } => {
                 let counters = self.auto.lock().counters;
                 let payload = DenyPayload {
-                    policy: "auto-mode",
+                    policy: AutoModePolicy,
                     tool_use_id: tool_use_id.to_string(),
                     tool: tool.to_string(),
                     tier: *tier,
@@ -703,25 +869,48 @@ impl ApprovalEngine {
                     consecutive: counters.consecutive,
                     total: counters.total,
                 };
+                let payload = serde_json::to_value(&payload).unwrap_or_else(|err| {
+                    tracing::error!(error = %err, "failed to serialize the auto-mode deny payload");
+                    serde_json::json!({
+                        "policy": AutoModePolicy::TAG,
+                        "tool_use_id": payload.tool_use_id,
+                        "tool": payload.tool,
+                    })
+                });
                 HookDecision::deny(
                     HookId::new(AUTO_MODE_HOOK_ID),
                     reason.reason_code(),
                     deny_message(reason),
-                    serde_json::to_value(payload).ok(),
+                    Some(payload),
                 )
             }
         }
     }
 
-    /// The `(RunStarted, PreToolExecution)` in-process hook handlers.
-    pub fn into_hook_handlers(self: &Arc<Self>) -> (InProcessHookHandler, InProcessHookHandler) {
+    /// The `(RunStarted, PreToolExecution, RunCompleted/RunFailed)` in-process
+    /// hook handlers.
+    pub fn into_hook_handlers(
+        self: &Arc<Self>,
+    ) -> (
+        InProcessHookHandler,
+        InProcessHookHandler,
+        InProcessHookHandler,
+    ) {
         let engine = Arc::clone(self);
         let run_started: InProcessHookHandler = Arc::new(move |invocation: HookInvocation| {
             let engine = Arc::clone(&engine);
             Box::pin(async move {
                 if let Some(prompt) = invocation.prompt.as_deref() {
-                    engine.record_prompt(&invocation.session_id, prompt);
+                    engine.on_run_started(&invocation.session_id, prompt);
                 }
+                Ok(RuntimeHookResponse::default())
+            })
+        });
+        let engine = Arc::clone(self);
+        let run_ended: InProcessHookHandler = Arc::new(move |invocation: HookInvocation| {
+            let engine = Arc::clone(&engine);
+            Box::pin(async move {
+                engine.on_run_ended(&invocation.session_id);
                 Ok(RuntimeHookResponse::default())
             })
         });
@@ -746,10 +935,11 @@ impl ApprovalEngine {
                 })
             })
         });
-        (run_started, pre_tool)
+        (run_started, pre_tool, run_ended)
     }
 
-    /// The two hook registrations.
+    /// The hook registrations: transcript, guardrail, and the two run-ended
+    /// observers.
     ///
     /// # Errors
     ///
@@ -781,10 +971,32 @@ impl ApprovalEngine {
                 timeout_ms: Some(AUTO_MODE_HOOK_TIMEOUT_MS),
                 runtime: runtime(AUTO_MODE_HOOK_ID)?,
             },
+            HookEntryConfig {
+                id: HookId::new(RUN_ENDED_HOOK_ID),
+                enabled: true,
+                point: HookPoint::RunCompleted,
+                mode: HookExecutionMode::Foreground,
+                capability: HookCapability::Observe,
+                priority: i32::MIN,
+                failure_policy: Some(HookFailurePolicy::FailOpen),
+                timeout_ms: None,
+                runtime: runtime(RUN_ENDED_HOOK_ID)?,
+            },
+            HookEntryConfig {
+                id: HookId::new(RUN_FAILED_HOOK_ID),
+                enabled: true,
+                point: HookPoint::RunFailed,
+                mode: HookExecutionMode::Foreground,
+                capability: HookCapability::Observe,
+                priority: i32::MIN,
+                failure_policy: Some(HookFailurePolicy::FailOpen),
+                timeout_ms: None,
+                runtime: runtime(RUN_ENDED_HOOK_ID)?,
+            },
         ])
     }
 
-    /// Build a hook engine from `base` (layered user hooks) plus our two entries.
+    /// Build a hook engine from `base` (layered user hooks) plus our entries.
     ///
     /// # Errors
     ///
@@ -793,8 +1005,13 @@ impl ApprovalEngine {
         self: &Arc<Self>,
         mut base: HooksConfig,
     ) -> Result<Arc<dyn HookEngine>, ApprovalError> {
-        base.entries
-            .retain(|e| e.id.0 != TRANSCRIPT_HOOK_ID && e.id.0 != AUTO_MODE_HOOK_ID);
+        let ours = [
+            TRANSCRIPT_HOOK_ID,
+            AUTO_MODE_HOOK_ID,
+            RUN_ENDED_HOOK_ID,
+            RUN_FAILED_HOOK_ID,
+        ];
+        base.entries.retain(|e| !ours.contains(&e.id.0.as_str()));
         let rewriters: Vec<String> = base
             .entries
             .iter()
@@ -812,10 +1029,11 @@ impl ApprovalEngine {
             );
         }
         base.entries.extend(Self::hook_entries()?);
-        let (run_started, pre_tool) = self.into_hook_handlers();
+        let (run_started, pre_tool, run_ended) = self.into_hook_handlers();
         let engine = DefaultHookEngine::new(base)
             .with_in_process_handler(TRANSCRIPT_HOOK_ID, run_started)
-            .with_in_process_handler(AUTO_MODE_HOOK_ID, pre_tool);
+            .with_in_process_handler(AUTO_MODE_HOOK_ID, pre_tool)
+            .with_in_process_handler(RUN_ENDED_HOOK_ID, run_ended);
         Ok(Arc::new(engine))
     }
 }
@@ -844,17 +1062,43 @@ fn describe_rule(rule: &Rule) -> String {
 
 fn args_preview(action: &Action<'_>) -> String {
     let text = match &action.kind {
-        ActionKind::Shell { command, .. } => (*command).to_string(),
+        ActionKind::Shell { command, .. } => command.clone(),
         _ => serde_json::to_string_pretty(action.args).unwrap_or_default(),
     };
-    if text.len() <= ARGS_PREVIEW_BYTES {
+    let cut = truncate_at(&text, ARGS_PREVIEW_BYTES);
+    if cut.len() == text.len() {
         return text;
     }
-    let mut cut = ARGS_PREVIEW_BYTES;
+    format!("{cut}…")
+}
+
+/// The longest prefix of `text` of at most `max` bytes ending on a char boundary.
+fn truncate_at(text: &str, max: usize) -> &str {
+    let mut cut = max.min(text.len());
     while !text.is_char_boundary(cut) {
         cut -= 1;
     }
-    format!("{}…", &text[..cut])
+    &text[..cut]
+}
+
+/// Build runners ([`BUILD_RUNNERS`]) invoked anywhere in `command`. Best effort:
+/// splits on anything that separates commands and skips `VAR=value` prefixes.
+fn build_runners(command: &str) -> Vec<&'static str> {
+    let mut found = Vec::new();
+    for piece in command.split([';', '&', '|', '\n', '(', ')', '`', '{', '}']) {
+        let word = piece
+            .split_whitespace()
+            .find(|w| !w.contains('='))
+            .map(|w| w.trim_start_matches('\\'));
+        let Some(word) = word else { continue };
+        let base = word.rsplit('/').next().unwrap_or(word);
+        if let Some(runner) = BUILD_RUNNERS.iter().find(|r| **r == base)
+            && !found.contains(runner)
+        {
+            found.push(*runner);
+        }
+    }
+    found
 }
 
 /// Allow-cache key: tool name plus a hash of the key-sorted argument JSON.
@@ -931,7 +1175,7 @@ mod tests {
     #[test]
     fn payload_serializes_snake_case_tier() {
         let payload = DenyPayload {
-            policy: "auto-mode",
+            policy: AutoModePolicy,
             tool_use_id: "call_1".to_string(),
             tool: "shell".to_string(),
             tier: Tier::Classifier,
@@ -955,7 +1199,7 @@ mod tests {
     #[test]
     fn hook_entries_shape() {
         let entries = ApprovalEngine::hook_entries().unwrap();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 4);
         let guard = &entries[1];
         assert_eq!(guard.point, HookPoint::PreToolExecution);
         assert_eq!(guard.capability, HookCapability::Guardrail);
@@ -968,5 +1212,32 @@ mod tests {
         );
         assert_eq!(entries[0].point, HookPoint::RunStarted);
         assert_eq!(entries[0].capability, HookCapability::Observe);
+        assert_eq!(entries[2].point, HookPoint::RunCompleted);
+        assert_eq!(entries[3].point, HookPoint::RunFailed);
+        for e in &entries[2..] {
+            assert_eq!(e.capability, HookCapability::Observe);
+            assert_eq!(
+                e.runtime.config_value().unwrap(),
+                json!({"name": RUN_ENDED_HOOK_ID})
+            );
+        }
+    }
+
+    #[test]
+    fn build_runners_found_in_chains() {
+        assert_eq!(build_runners("cargo test"), ["cargo"]);
+        assert_eq!(
+            build_runners("cd x && RUSTFLAGS=1 cargo build; make lint | tee y"),
+            ["cargo", "make"]
+        );
+        assert_eq!(build_runners("\\npx prettier"), ["npx"]);
+        assert!(build_runners("ls -la").is_empty());
+        assert!(build_runners("echo cargo").is_empty());
+    }
+
+    #[test]
+    fn truncate_respects_char_boundaries() {
+        assert_eq!(truncate_at("héllo", 2), "h");
+        assert_eq!(truncate_at("abc", 10), "abc");
     }
 }

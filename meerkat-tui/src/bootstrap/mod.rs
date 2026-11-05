@@ -211,11 +211,86 @@ fn force_inproc_comms(config: &mut Config) {
     config.comms.auto_enable_for_subagents = false;
 }
 
+/// Shell basenames whose `-c` syntax the Tier-1 lexer models.
+const POSIX_SHELLS: &[&str] = &["sh", "dash", "bash", "zsh"];
+
+/// The program the engine's shell tool will run commands with.
+///
+/// The factory builds its `ShellConfig` from `ShellConfig::with_project_root`
+/// and ignores `config.shell`, so the program cannot be pinned from here. This
+/// mirrors the tool's resolution instead: the default program (`nu`) when it is
+/// on `PATH`, otherwise `$SHELL`, `bash`, `zsh`, `sh` in that order.
+#[must_use]
+pub fn resolved_shell_program() -> Option<PathBuf> {
+    use meerkat_tools::builtin::shell::ShellConfig;
+
+    let default = ShellConfig::default();
+    if let Ok(path) = default.resolve_shell_path() {
+        return Some(path);
+    }
+    if default.shell != "nu" {
+        return None;
+    }
+    let shell_env = std::env::var("SHELL").ok();
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(env) = shell_env.as_deref().map(str::trim)
+        && !env.is_empty()
+        && env != default.shell
+    {
+        candidates.push(env.to_string());
+    }
+    for name in ["bash", "zsh", "sh"] {
+        if !candidates.iter().any(|c| c == name) {
+            candidates.push(name.to_string());
+        }
+    }
+    candidates.into_iter().find_map(|shell| {
+        ShellConfig {
+            shell,
+            ..ShellConfig::default()
+        }
+        .resolve_shell_path()
+        .ok()
+    })
+}
+
+/// Whether `program` is a shell whose syntax the Tier-1 lexer understands.
+#[must_use]
+pub fn is_posix_shell(program: &std::path::Path) -> bool {
+    program
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| POSIX_SHELLS.contains(&n))
+}
+
+/// Whether the shell tool will run a POSIX shell. Unknown or non-POSIX
+/// programs (the engine default is `nu`) disable Tier-1 shell analysis.
+#[must_use]
+pub fn shell_is_posix() -> bool {
+    cfg!(unix) && resolved_shell_program().is_some_and(|p| is_posix_shell(&p))
+}
+
 /// Store path for the factory, matching `rkat`'s `realm_store_path`.
 fn realm_store_path(manifest: &RealmManifest, scope: &RuntimeScope) -> PathBuf {
     let paths = realm_paths_in(&scope.state_root, &scope.realm_id);
     match manifest.backend {
         RealmBackend::Jsonl => paths.sessions_jsonl_dir,
         RealmBackend::Sqlite | RealmBackend::Redb => paths.root,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn posix_shell_basenames() {
+        for p in ["/bin/sh", "/usr/bin/bash", "dash", "/bin/zsh"] {
+            assert!(is_posix_shell(Path::new(p)), "{p}");
+        }
+        for p in ["/usr/bin/nu", "fish", "/bin/pwsh", "/bin/shx", ""] {
+            assert!(!is_posix_shell(Path::new(p)), "{p}");
+        }
     }
 }

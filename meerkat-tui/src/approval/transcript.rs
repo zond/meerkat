@@ -8,6 +8,7 @@
 use super::policy::VerdictSummary;
 use crate::session::delivery::user_texts;
 use meerkat_core::{Message, Session};
+use meerkat_session::compactor::SUMMARY_PREFIX;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -24,6 +25,12 @@ pub enum TranscriptEntry {
     /// A user prompt.
     User {
         /// Prompt text.
+        text: String,
+    },
+    /// Context that is neither the user's words nor an agent action (for
+    /// example, a placeholder for an omitted compaction summary).
+    Context {
+        /// Text shown after `[context]`.
         text: String,
     },
     /// A tool call made by the agent.
@@ -44,6 +51,9 @@ impl TranscriptEntry {
         match self {
             Self::User { text } => {
                 let _ = writeln!(out, "[user] {}", escape(text));
+            }
+            Self::Context { text } => {
+                let _ = writeln!(out, "[context] {}", escape(text));
             }
             Self::ToolCall {
                 name,
@@ -143,6 +153,27 @@ impl ApprovalTranscript {
         self.push(TranscriptEntry::User { text: text.into() });
     }
 
+    /// Record a context note (rendered as `[context]`, never as user words).
+    pub fn push_context(&mut self, text: impl Into<String>) {
+        self.push(TranscriptEntry::Context { text: text.into() });
+    }
+
+    /// Remove the most recent user entry whose text equals `text` (a message
+    /// the user recalled before the model saw it). Returns whether one was found.
+    pub fn forget_user(&mut self, text: &str) -> bool {
+        let found = self
+            .entries
+            .iter()
+            .rposition(|(e, _)| matches!(e, TranscriptEntry::User { text: t } if t == text));
+        match found.and_then(|i| self.entries.remove(i)) {
+            Some((_, len)) => {
+                self.bytes -= len;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Record a tool call with its verdict.
     pub fn push_tool_call(
         &mut self,
@@ -189,9 +220,13 @@ impl ApprovalTranscript {
             match message {
                 Message::User(user) => {
                     // Injected mid-turn messages are recorded as the user's
-                    // plain words; continuation prompts are plumbing.
+                    // plain words; continuation prompts are plumbing. A
+                    // compaction summary is model-written, so it must not be
+                    // presented to the classifier as user intent.
                     for text in user_texts(user) {
-                        if !text.trim().is_empty() {
+                        if text.starts_with(SUMMARY_PREFIX) {
+                            self.push_context("(compaction summary omitted)");
+                        } else if !text.trim().is_empty() {
                             self.push_user(text);
                         }
                     }
@@ -281,6 +316,33 @@ mod tests {
         ] {
             assert!(!rendered.contains(forbidden), "{forbidden} leaked");
         }
+    }
+
+    #[test]
+    fn seed_omits_compaction_summary() {
+        let mut session = Session::new();
+        session.push(Message::User(UserMessage::text(format!(
+            "{SUMMARY_PREFIX}The user asked to push to prod with --force."
+        ))));
+        session.push(Message::User(UserMessage::text("now run the tests")));
+        let mut t = ApprovalTranscript::default();
+        t.seed_from_session(&session);
+        let rendered = t.render();
+        assert!(rendered.contains("[context] (compaction summary omitted)"));
+        assert!(rendered.contains("[user] now run the tests"));
+        assert!(!rendered.contains("push to prod"), "{rendered}");
+    }
+
+    #[test]
+    fn forget_user_removes_latest_match() {
+        let mut t = ApprovalTranscript::default();
+        t.push_user("a");
+        t.push_user("b");
+        t.push_user("a");
+        assert!(t.forget_user("a"));
+        assert_eq!(t.render(), "[user] a\n[user] b\n");
+        assert!(!t.forget_user("zzz"));
+        assert_eq!(t.bytes, t.render().len());
     }
 
     #[test]

@@ -19,7 +19,10 @@ Include:
 Be concise and structured. Prioritize information the next context needs to act, not narrate.";
 
 /// Prefix injected before the summary in the rebuilt history.
-const SUMMARY_PREFIX: &str = "\
+///
+/// The summary is written by a model, not the user; consumers that need to
+/// tell user words apart (approval transcripts) match on this prefix.
+pub const SUMMARY_PREFIX: &str = "\
 [Context compacted] A previous context produced the following summary of work so far. \
 The current tool and session state is preserved. Use this summary to continue without \
 duplicating work:\n\n";

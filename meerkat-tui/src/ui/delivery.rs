@@ -92,6 +92,23 @@ impl PendingQueue {
         PendingId(self.next_id)
     }
 
+    /// The most recently allocated id (`PendingId(0)` before the first).
+    #[must_use]
+    pub fn last_id(&self) -> PendingId {
+        PendingId(self.next_id)
+    }
+
+    /// Text of a queued or settled item.
+    #[must_use]
+    pub fn text_of(&self, id: PendingId) -> Option<&str> {
+        self.all().find(|p| p.id == id).map(|p| p.text.as_str())
+    }
+
+    /// Every item the queue holds, queued first then settled.
+    pub fn all(&self) -> impl Iterator<Item = &Pending> {
+        self.items.iter().chain(self.settled.iter())
+    }
+
     /// Append an item.
     pub fn push(&mut self, item: Pending) {
         self.items.push(item);

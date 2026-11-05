@@ -10,10 +10,17 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Root-relative glob patterns that are never writable without classifier review,
-/// even inside the project: agent configuration, VCS internals, and secrets.
+/// even inside the project: agent configuration and instruction files, VCS
+/// internals and attributes, build/toolchain configuration that runs code, editor
+/// task configuration, and secrets.
 pub const PROTECTED_PATTERNS: &[&str] = &[
     ".rkat/**",
     ".git/**",
+    "**/.git/**",
+    ".gitattributes",
+    ".gitmodules",
+    "**/.gitattributes",
+    "**/.gitmodules",
     ".claude/**",
     ".env",
     ".env.*",
@@ -22,20 +29,62 @@ pub const PROTECTED_PATTERNS: &[&str] = &[
     "**/.env.*",
     "**/.envrc",
     "tui.toml",
+    ".cargo/**",
+    "**/.cargo/**",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+    "**/rust-toolchain*",
+    "build.rs",
+    "**/build.rs",
+    ".vscode/**",
+    ".idea/**",
+    "AGENTS.md",
+    "AGENTS.local.md",
+    "**/AGENTS.md",
 ];
 
-fn protected_set() -> &'static GlobSet {
-    static SET: OnceLock<GlobSet> = OnceLock::new();
-    SET.get_or_init(|| {
+/// Compiled protected patterns. `All` is the fail-closed state used when any
+/// pattern fails to compile: every path counts as protected.
+#[derive(Debug)]
+enum ProtectedSet {
+    Globs(GlobSet),
+    All,
+}
+
+impl ProtectedSet {
+    fn build(patterns: &[&str]) -> Self {
         let mut builder = GlobSetBuilder::new();
-        for pattern in PROTECTED_PATTERNS {
-            // Patterns are static and known-good; a failure here is a programming error.
-            if let Ok(glob) = Glob::new(pattern) {
-                builder.add(glob);
+        for pattern in patterns {
+            match Glob::new(pattern) {
+                Ok(glob) => {
+                    builder.add(glob);
+                }
+                Err(err) => {
+                    tracing::error!(%pattern, %err, "invalid protected pattern; protecting every path");
+                    return Self::All;
+                }
             }
         }
-        builder.build().unwrap_or_else(|_| GlobSet::empty())
-    })
+        match builder.build() {
+            Ok(set) => Self::Globs(set),
+            Err(err) => {
+                tracing::error!(%err, "protected patterns failed to compile; protecting every path");
+                Self::All
+            }
+        }
+    }
+
+    fn is_match(&self, rel: &Path) -> bool {
+        match self {
+            Self::Globs(set) => set.is_match(rel),
+            Self::All => true,
+        }
+    }
+}
+
+fn protected_set() -> &'static ProtectedSet {
+    static SET: OnceLock<ProtectedSet> = OnceLock::new();
+    SET.get_or_init(|| ProtectedSet::build(PROTECTED_PATTERNS))
 }
 
 /// Errors from resolving a model-supplied path.
@@ -89,9 +138,11 @@ impl ProjectRoot {
     /// Resolve a model-supplied path against this root.
     ///
     /// Relative paths are joined onto the root (not the process working
-    /// directory). `.` and `..` are normalized lexically, then the deepest
-    /// existing ancestor is canonicalized so symlinked parents cannot escape the
-    /// root unnoticed. The final path does not need to exist.
+    /// directory). `..` is resolved physically, the way the kernel does: the
+    /// prefix before it is canonicalized first, so `link/../x` through a
+    /// symlinked directory lands next to the link's target. The deepest existing
+    /// ancestor of the result is canonicalized so symlinked parents cannot escape
+    /// the root unnoticed. The final path does not need to exist.
     ///
     /// # Errors
     ///
@@ -110,8 +161,7 @@ impl ProjectRoot {
         } else {
             self.0.join(expanded)
         };
-        let normalized = normalize_lexically(&joined);
-        let abs = canonicalize_existing_prefix(&normalized)?;
+        let abs = resolve_physically(&joined)?;
         let relative = abs.strip_prefix(&self.0).ok().map(Path::to_path_buf);
         let protected = relative
             .as_deref()
@@ -171,21 +221,23 @@ fn expand_tilde(raw: &str) -> Result<PathBuf, PathError> {
     Ok(PathBuf::from(raw))
 }
 
-/// Resolve `.` and `..` components without touching the filesystem.
-fn normalize_lexically(path: &Path) -> PathBuf {
+/// Resolve `.` and `..` the way path lookup does: each `..` applies to the
+/// canonicalized (symlink-resolved) prefix before it, then the deepest existing
+/// ancestor of the result is canonicalized.
+fn resolve_physically(path: &Path) -> Result<PathBuf, PathError> {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                if !out.pop() {
-                    out.push(component.as_os_str());
-                }
+                out = canonicalize_existing_prefix(&out)?;
+                // Popping the filesystem root is a no-op, matching `/..` == `/`.
+                out.pop();
             }
             other => out.push(other.as_os_str()),
         }
     }
-    out
+    canonicalize_existing_prefix(&out)
 }
 
 /// Canonicalize the deepest existing ancestor of `path` and re-append the rest.
@@ -296,6 +348,23 @@ mod tests {
             "svc/.env",
             ".envrc",
             "tui.toml",
+            ".cargo/config.toml",
+            "crates/x/.cargo/config.toml",
+            "rust-toolchain",
+            "rust-toolchain.toml",
+            "sub/rust-toolchain.toml",
+            "vendor/dep/.git/config",
+            ".gitattributes",
+            ".gitmodules",
+            "sub/.gitattributes",
+            "sub/.gitmodules",
+            ".vscode/tasks.json",
+            ".idea/workspace.xml",
+            "build.rs",
+            "crates/x/build.rs",
+            "AGENTS.md",
+            "AGENTS.local.md",
+            "docs/AGENTS.md",
         ] {
             let r = root.resolve(p).unwrap();
             assert!(r.inside(), "{p} should be inside");
@@ -307,6 +376,10 @@ mod tests {
             "environment.md",
             "gitignore",
             ".github/ci.yml",
+            "src/build.rs.bak",
+            "src/builder.rs",
+            "cargo/notes.md",
+            "AGENTS.txt",
         ] {
             let r = root.resolve(p).unwrap();
             assert!(!r.protected, "{p} should not be protected");
@@ -331,6 +404,43 @@ mod tests {
         assert!(!r.inside(), "symlink escape must resolve outside the root");
         let r2 = root.resolve("link/not-yet-created.txt").unwrap();
         assert!(!r2.inside());
+    }
+
+    #[test]
+    fn protected_set_fails_closed() {
+        let bad = ProtectedSet::build(&["src/**", "[unclosed"]);
+        assert!(matches!(bad, ProtectedSet::All));
+        assert!(bad.is_match(Path::new("anything.txt")));
+        let good = ProtectedSet::build(&["src/**"]);
+        assert!(good.is_match(Path::new("src/main.rs")));
+        assert!(!good.is_match(Path::new("README.md")));
+    }
+
+    #[test]
+    fn all_builtin_protected_patterns_compile() {
+        assert!(matches!(protected_set(), ProtectedSet::Globs(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dotdot_through_symlinked_directory_is_physical() {
+        let (dir, root) = root();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("inner")).unwrap();
+        std::fs::write(outside.path().join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("inner"), dir.path().join("lnk")).unwrap();
+        let r = root.resolve("lnk/../secret").unwrap();
+        assert!(!r.inside(), "`..` must apply to the symlink target");
+        assert_eq!(r.abs, outside.path().canonicalize().unwrap().join("secret"));
+        let r2 = root.resolve("lnk/../not-yet-created").unwrap();
+        assert!(!r2.inside());
+    }
+
+    #[test]
+    fn dotdot_through_missing_directory_is_lexical() {
+        let (_dir, root) = root();
+        let r = root.resolve("missing/../src/main.rs").unwrap();
+        assert_eq!(r.relative.as_deref(), Some(Path::new("src/main.rs")));
     }
 
     #[cfg(unix)]

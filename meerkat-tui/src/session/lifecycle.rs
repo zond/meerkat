@@ -90,13 +90,109 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
     u64::try_from(chars / 4).unwrap_or(u64::MAX)
 }
 
-/// The model's context window from the curated catalog, `None` for models
-/// the catalog does not know.
+/// A model's context window in tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextWindow {
+    /// Window size in tokens.
+    pub tokens: u64,
+    /// Whether the size is borrowed from a related model or the provider
+    /// default rather than the model's own catalog entry.
+    pub approx: bool,
+}
+
+/// Window assumed for an unknown Anthropic model.
+const ANTHROPIC_DEFAULT_WINDOW: u64 = 200_000;
+/// Window assumed for an unknown OpenAI model.
+const OPENAI_DEFAULT_WINDOW: u64 = 128_000;
+/// Window assumed for an unknown Gemini model.
+const GEMINI_DEFAULT_WINDOW: u64 = 1_000_000;
+
+/// The model's context window from the curated catalog.
+///
+/// Lookup order: the exact id; the id without a trailing `-YYYYMMDD` date;
+/// the catalog model of the same provider and family sharing the longest
+/// prefix (`claude-sonnet*` → a `claude-sonnet-*` entry, `gpt-5*` → a
+/// `gpt-5*` entry, `gemini-3*` → a `gemini-3*` entry); the provider's default
+/// window. The last two are marked approximate. `None` only for providers
+/// without a default.
 #[must_use]
-pub fn context_window(provider: Provider, model: &str) -> Option<u64> {
-    meerkat_models::catalog::entry_for(provider.as_str(), model)
-        .and_then(|entry| entry.context_window)
-        .map(u64::from)
+pub fn context_window(provider: Provider, model: &str) -> Option<ContextWindow> {
+    let provider_name = provider.as_str();
+    let exact = |id: &str| {
+        meerkat_models::catalog::entry_for(provider_name, id)
+            .and_then(|entry| entry.context_window)
+            .map(|tokens| ContextWindow {
+                tokens: u64::from(tokens),
+                approx: false,
+            })
+    };
+    if let Some(window) = exact(model) {
+        return Some(window);
+    }
+    let undated = strip_date_suffix(model);
+    if let Some(window) = exact(undated) {
+        return Some(window);
+    }
+    if let Some(tokens) = family_window(provider_name, undated) {
+        return Some(ContextWindow {
+            tokens,
+            approx: true,
+        });
+    }
+    let tokens = match provider {
+        Provider::Anthropic => ANTHROPIC_DEFAULT_WINDOW,
+        Provider::OpenAI => OPENAI_DEFAULT_WINDOW,
+        Provider::Gemini => GEMINI_DEFAULT_WINDOW,
+        Provider::Other => return None,
+    };
+    Some(ContextWindow {
+        tokens,
+        approx: true,
+    })
+}
+
+/// `model` without a trailing `-YYYYMMDD` date stamp.
+fn strip_date_suffix(model: &str) -> &str {
+    match model.rsplit_once('-') {
+        Some((base, date))
+            if date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) && !base.is_empty() =>
+        {
+            base
+        }
+        _ => model,
+    }
+}
+
+/// The family of a model id: its first two `-`/`.`-separated parts
+/// (`claude-sonnet`, `gpt-5`, `gemini-3`).
+fn family_prefix(model: &str) -> Option<&str> {
+    let mut separators = model
+        .char_indices()
+        .filter(|(_, c)| matches!(c, '-' | '.'))
+        .map(|(i, _)| i);
+    let first = separators.next()?;
+    let end = separators.next().unwrap_or(model.len());
+    (end > first + 1).then(|| &model[..end])
+}
+
+/// Window of the catalog model of `provider` in `model`'s family that
+/// shares the longest prefix with `model`.
+fn family_window(provider: &str, model: &str) -> Option<u64> {
+    let family = family_prefix(model)?;
+    meerkat_models::catalog::catalog()
+        .iter()
+        .filter(|entry| entry.provider == provider && entry.id.starts_with(family))
+        .filter_map(|entry| {
+            let shared = entry
+                .id
+                .bytes()
+                .zip(model.bytes())
+                .take_while(|(a, b)| a == b)
+                .count();
+            entry.context_window.map(|window| (shared, window))
+        })
+        .max_by_key(|(shared, _)| *shared)
+        .map(|(_, window)| u64::from(window))
 }
 
 /// Shut down the live session `id` (without archiving or persisting it) and
@@ -219,6 +315,9 @@ pub struct Compacted {
     pub discarded: Vec<Message>,
     /// Message count before compaction.
     pub messages_before: usize,
+    /// The session as it was before compaction, for restoring the live
+    /// session when the compacted one cannot be opened.
+    pub original: Session,
 }
 
 /// Summarize the history of the idle session `handle` with Meerkat's
@@ -241,6 +340,7 @@ pub async fn compact_session(
     event_tx: Option<mpsc::Sender<AgentEvent>>,
 ) -> Result<Compacted, CompactError> {
     let mut session = handle.export().await?;
+    let original = session.clone();
     let messages_before = session.messages().len();
     if messages_before < MIN_COMPACT_MESSAGES {
         return Err(CompactError::TooShort(messages_before));
@@ -278,6 +378,7 @@ pub async fn compact_session(
         session,
         discarded: outcome.discarded,
         messages_before,
+        original,
     })
 }
 
@@ -309,13 +410,52 @@ mod tests {
         assert_eq!(estimate_tokens(&[]), 0);
     }
 
+    fn window(tokens: u64, approx: bool) -> Option<ContextWindow> {
+        Some(ContextWindow { tokens, approx })
+    }
+
     #[test]
     fn catalog_window() {
         assert_eq!(
             context_window(Provider::Anthropic, "claude-sonnet-4-6"),
-            Some(200_000)
+            window(200_000, false)
         );
-        assert_eq!(context_window(Provider::Anthropic, "no-such-model"), None);
+        // A dated snapshot of a catalog model is the model itself.
+        assert_eq!(
+            context_window(Provider::Anthropic, "claude-sonnet-4-6-20260101"),
+            window(200_000, false)
+        );
+        assert_eq!(context_window(Provider::Other, "whatever"), None);
+    }
+
+    #[test]
+    fn unknown_models_fall_back_by_family_then_provider() {
+        assert_eq!(
+            context_window(Provider::Anthropic, "claude-sonnet-4-7-20270101"),
+            window(200_000, true)
+        );
+        assert_eq!(
+            context_window(Provider::OpenAI, "gpt-5.4"),
+            window(128_000, true)
+        );
+        assert_eq!(
+            context_window(Provider::Gemini, "gemini-3.1-pro-preview"),
+            window(1_000_000, true)
+        );
+        assert_eq!(
+            context_window(Provider::OpenAI, "o9-mini"),
+            window(OPENAI_DEFAULT_WINDOW, true)
+        );
+        assert_eq!(
+            context_window(Provider::Anthropic, "no-such-model"),
+            window(ANTHROPIC_DEFAULT_WINDOW, true)
+        );
+        assert_eq!(family_prefix("claude-sonnet-4-6"), Some("claude-sonnet"));
+        assert_eq!(family_prefix("gpt-5.4"), Some("gpt-5"));
+        assert_eq!(family_prefix("gemini-3-flash"), Some("gemini-3"));
+        assert_eq!(family_prefix("plain"), None);
+        assert_eq!(strip_date_suffix("claude-x-20250101"), "claude-x");
+        assert_eq!(strip_date_suffix("gpt-5.2"), "gpt-5.2");
     }
 
     #[tokio::test]

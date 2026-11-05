@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use clap::Parser;
-use futures::stream;
+use futures::{StreamExt, stream};
 use meerkat_client::{LlmClient, LlmDoneOutcome, LlmError, LlmEvent, LlmRequest};
 use meerkat_core::event::{AgentEvent, EventEnvelope};
 use meerkat_core::{Message, StopReason};
@@ -21,7 +21,7 @@ use meerkat_tui::session::{SessionHandle, SessionOptions};
 use parking_lot::Mutex;
 use serde_json::Value;
 use tempfile::TempDir;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 /// Upper bound on any await that could hang on a wiring bug.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
@@ -45,9 +45,19 @@ pub enum Step {
     },
     /// A non-retryable error.
     Fail,
+    /// The inner step, once the gate is notified.
+    Gated(Arc<Notify>, Box<Step>),
 }
 
 impl Step {
+    /// The gate to wait for, if any, and the events to emit.
+    fn gated_events(self) -> (Option<Arc<Notify>>, Vec<Result<LlmEvent, LlmError>>) {
+        match self {
+            Self::Gated(gate, inner) => (Some(gate), inner.gated_events().1),
+            other => (None, other.events()),
+        }
+    }
+
     fn events(self) -> Vec<Result<LlmEvent, LlmError>> {
         let done = |stop_reason| {
             Ok(LlmEvent::Done {
@@ -74,6 +84,7 @@ impl Step {
             Self::Fail => vec![Err(LlmError::InvalidRequest {
                 message: "scripted failure".to_string(),
             })],
+            Self::Gated(_, inner) => inner.events(),
         }
     }
 }
@@ -85,12 +96,42 @@ pub struct ScriptedLlmClient {
     script: Vec<Step>,
     next: AtomicUsize,
     requests: Mutex<Vec<LlmRequest>>,
+    /// Notified on every call.
+    pub called: Notify,
 }
 
 impl ScriptedLlmClient {
+    /// A client replaying `script` (then answering "script exhausted").
+    pub fn new(script: Vec<Step>) -> Arc<Self> {
+        Arc::new(Self {
+            script,
+            next: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+            called: Notify::new(),
+        })
+    }
+
     pub fn requests(&self) -> Vec<LlmRequest> {
         self.requests.lock().clone()
     }
+}
+
+/// Arguments for an isolated realm under `state` with `project` as the
+/// workspace and user-config root.
+pub fn isolated_args(project: &std::path::Path, state: &std::path::Path) -> Args {
+    Args::try_parse_from([
+        "rkat-tui",
+        "--isolated",
+        "--state-root",
+        state.to_str().unwrap(),
+        "--context-root",
+        project.to_str().unwrap(),
+        "--user-config-root",
+        project.to_str().unwrap(),
+        "--model",
+        "claude-sonnet-4-6",
+    ])
+    .unwrap()
 }
 
 #[async_trait]
@@ -103,7 +144,17 @@ impl LlmClient for ScriptedLlmClient {
             .get(index)
             .cloned()
             .unwrap_or(Step::Text("script exhausted"));
-        Box::pin(stream::iter(step.events()))
+        self.called.notify_one();
+        let (gate, events) = step.gated_events();
+        Box::pin(
+            stream::once(async move {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                stream::iter(events)
+            })
+            .flatten(),
+        )
     }
 
     fn provider(&self) -> &'static str {
@@ -129,24 +180,8 @@ impl Harness {
         let project_dir = tempfile::tempdir().unwrap();
         let state_dir = tempfile::tempdir().unwrap();
         let project = std::fs::canonicalize(project_dir.path()).unwrap();
-        let args = Args::try_parse_from([
-            "rkat-tui",
-            "--isolated",
-            "--state-root",
-            state_dir.path().to_str().unwrap(),
-            "--context-root",
-            project.to_str().unwrap(),
-            "--user-config-root",
-            project.to_str().unwrap(),
-            "--model",
-            "claude-sonnet-4-6",
-        ])
-        .unwrap();
-        let llm = Arc::new(ScriptedLlmClient {
-            script,
-            next: AtomicUsize::new(0),
-            requests: Mutex::new(Vec::new()),
-        });
+        let args = isolated_args(&project, state_dir.path());
+        let llm = ScriptedLlmClient::new(script);
         let runtime =
             bootstrap::bootstrap(&args, None, Some(Arc::clone(&llm) as Arc<dyn LlmClient>))
                 .await

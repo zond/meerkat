@@ -4,11 +4,15 @@
 
 use super::rules::{RuleId, RuleSet};
 use super::shell;
-use crate::memory::{MEMORY_FORGET, MEMORY_LIST, MEMORY_READ, MEMORY_SAVE, slug};
+use crate::memory::{MEMORY_FORGET, MEMORY_LIST, MEMORY_READ, MEMORY_SAVE, Scope, slug};
 use crate::paths::ProjectRoot;
+use meerkat_tools::builtin::shell::ShellInput;
+use meerkat_tools::builtin::utility::apply_patch::affected_paths;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::OnceLock;
 
 /// Policy tier, first match wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -94,23 +98,15 @@ pub const READ_ONLY_BUILTINS: &[&str] = &[
     "memory_search",
 ];
 
-/// `apply_patch` target markers (mirrors `meerkat-tools/src/builtin/utility/apply_patch.rs`).
-pub const PATCH_TARGET_MARKERS: &[&str] = &[
-    "*** Add File: ",
-    "*** Delete File: ",
-    "*** Update File: ",
-    "*** Move to: ",
-];
-
 /// What a tool call does, as far as the policy is concerned.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActionKind<'a> {
-    /// `shell`.
+    /// `shell`, parsed with the tool's own [`ShellInput`] type.
     Shell {
         /// Command string.
-        command: &'a str,
+        command: String,
         /// Optional working directory (relative to the project root).
-        working_dir: Option<&'a str>,
+        working_dir: Option<String>,
         /// Background execution requested.
         background: bool,
     },
@@ -129,7 +125,7 @@ pub enum ActionKind<'a> {
     /// `write_file` / `edit_file` / `apply_patch`.
     FileWrite {
         /// Every path the call may create, modify, delete or move to.
-        paths: Vec<&'a str>,
+        paths: Vec<String>,
     },
     /// A builtin from [`READ_ONLY_BUILTINS`].
     ReadOnlyBuiltin,
@@ -137,8 +133,8 @@ pub enum ActionKind<'a> {
     MemoryRead,
     /// `memory_save` / `memory_forget` with a valid scope.
     MemoryWrite {
-        /// `"user"` or `"workspace"`.
-        scope: &'a str,
+        /// Note scope.
+        scope: Scope,
         /// Note name as supplied (rule subjects use its slug when valid).
         name: &'a str,
     },
@@ -163,17 +159,11 @@ impl<'a> Action<'a> {
     pub fn parse(name: &'a str, args: &'a Value) -> Self {
         let str_arg = |key: &str| args.get(key).and_then(Value::as_str);
         let kind = match name {
-            "shell" => match str_arg("command") {
-                Some(command) => ActionKind::Shell {
-                    command,
-                    working_dir: str_arg("working_dir"),
-                    background: args
-                        .get("background")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                },
-                None => ActionKind::Other,
-            },
+            "shell" => parse_shell(args).map_or(ActionKind::Other, |input| ActionKind::Shell {
+                command: input.command,
+                working_dir: input.working_dir,
+                background: input.background,
+            }),
             "read_file" => {
                 str_arg("path").map_or(ActionKind::Other, |path| ActionKind::FileRead { path })
             }
@@ -185,20 +175,23 @@ impl<'a> Action<'a> {
                 path: str_arg("path"),
                 pattern: None,
             },
-            "write_file" | "edit_file" => str_arg("path").map_or(ActionKind::Other, |path| {
-                ActionKind::FileWrite { paths: vec![path] }
-            }),
+            "write_file" | "edit_file" => {
+                str_arg("path").map_or(ActionKind::Other, |path| ActionKind::FileWrite {
+                    paths: vec![path.to_string()],
+                })
+            }
             "apply_patch" => match str_arg("patch").map(patch_targets) {
-                Some(paths) if !paths.is_empty() => ActionKind::FileWrite { paths },
+                Some(Ok(paths)) if !paths.is_empty() => ActionKind::FileWrite { paths },
                 _ => ActionKind::Other,
             },
             MEMORY_LIST | MEMORY_READ => ActionKind::MemoryRead,
-            MEMORY_SAVE | MEMORY_FORGET => match (str_arg("scope"), str_arg("name")) {
-                (Some(scope @ ("user" | "workspace")), Some(name)) => {
-                    ActionKind::MemoryWrite { scope, name }
+            MEMORY_SAVE | MEMORY_FORGET => {
+                let scope = args.get("scope").map(Scope::deserialize);
+                match (scope, str_arg("name")) {
+                    (Some(Ok(scope)), Some(name)) => ActionKind::MemoryWrite { scope, name },
+                    _ => ActionKind::Other,
                 }
-                _ => ActionKind::Other,
-            },
+            }
             n if READ_ONLY_BUILTINS.contains(&n) => ActionKind::ReadOnlyBuiltin,
             _ => ActionKind::Other,
         };
@@ -213,7 +206,7 @@ impl<'a> Action<'a> {
             Err(_) => raw.to_string(),
         };
         match &self.kind {
-            ActionKind::Shell { command, .. } => vec![(*command).to_string()],
+            ActionKind::Shell { command, .. } => vec![command.clone()],
             ActionKind::FileRead { path } => vec![display(path)],
             ActionKind::Search { path, .. } => vec![path.map_or_else(|| ".".to_string(), display)],
             ActionKind::FileWrite { paths } => paths.iter().map(|p| display(p)).collect(),
@@ -228,18 +221,43 @@ impl<'a> Action<'a> {
     }
 }
 
-/// Target paths named by an `apply_patch` body.
-pub fn patch_targets(patch: &str) -> Vec<&str> {
-    patch
-        .lines()
-        .filter_map(|line| {
-            PATCH_TARGET_MARKERS
-                .iter()
-                .find_map(|marker| line.strip_prefix(marker))
-        })
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .collect()
+/// Target paths named by an `apply_patch` body, from the tool's own parser.
+///
+/// # Errors
+///
+/// Returns the parser's error when the patch is malformed (the action then
+/// needs classifier review).
+pub fn patch_targets(
+    patch: &str,
+) -> Result<Vec<String>, meerkat_tools::builtin::utility::apply_patch::ParseError> {
+    Ok(affected_paths(patch)?
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect())
+}
+
+/// Top-level argument names the shell tool declares (from its schema).
+fn shell_arg_names() -> &'static BTreeSet<String> {
+    static NAMES: OnceLock<BTreeSet<String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        meerkat_tools::schema_for::<ShellInput>()
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|props| props.keys().cloned().collect())
+            .unwrap_or_default()
+    })
+}
+
+/// Parse shell arguments with the tool's own type. Unknown argument names are
+/// rejected (they would be ignored by the tool, which makes their purpose
+/// unclear), as is anything the tool itself would refuse.
+fn parse_shell(args: &Value) -> Option<ShellInput> {
+    let object = args.as_object()?;
+    let known = shell_arg_names();
+    if known.is_empty() || object.keys().any(|k| !known.contains(k)) {
+        return None;
+    }
+    ShellInput::deserialize(args).ok()
 }
 
 /// Environment for tier classification.
@@ -312,7 +330,7 @@ fn builtin_tier(action: &Action<'_>, ctx: &PolicyContext<'_>) -> Result<TierDeci
         }
         ActionKind::MemoryRead => Ok(TierDecision::new(Tier::AlwaysAllow, "memory read")),
         ActionKind::MemoryWrite { scope, .. } => {
-            if *scope == "workspace" {
+            if *scope == Scope::Workspace {
                 Ok(TierDecision::new(
                     Tier::InProjectEdit,
                     "workspace memory note",
@@ -370,7 +388,7 @@ fn builtin_tier(action: &Action<'_>, ctx: &PolicyContext<'_>) -> Result<TierDeci
             if *background {
                 return Err("background shell command".to_string());
             }
-            shell::allowlisted_in(command, *working_dir, ctx).map_err(|e| e.0)?;
+            shell::allowlisted_in(command, working_dir.as_deref(), ctx).map_err(|e| e.0)?;
             Ok(TierDecision::new(
                 Tier::AlwaysAllow,
                 "read-only shell command",
@@ -426,10 +444,59 @@ mod tests {
     fn parse_patch_targets() {
         let patch = "*** Begin Patch\n*** Add File: a.txt\n+x\n*** Update File: src/b.rs\n*** Move to: src/c.rs\n@@\n-x\n+y\n*** Delete File: old.rs\n*** End Patch\n";
         assert_eq!(
-            patch_targets(patch),
+            patch_targets(patch).unwrap(),
             ["a.txt", "src/b.rs", "src/c.rs", "old.rs"]
         );
-        assert!(patch_targets("*** Begin Patch\n*** End Patch").is_empty());
+        assert!(
+            patch_targets("*** Begin Patch\n*** End Patch")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(patch_targets("garbage").is_err());
+    }
+
+    #[test]
+    fn indented_patch_header_is_a_target() {
+        let (_dir, root) = project();
+        let args = json!({
+            "patch": "*** Begin Patch\n*** Add File: src/ok.rs\n+x\n  *** Add File: .git/config\n+[core]\n*** End Patch"
+        });
+        let action = Action::parse("apply_patch", &args);
+        assert_eq!(
+            action.kind,
+            ActionKind::FileWrite {
+                paths: vec!["src/ok.rs".into(), ".git/config".into()]
+            }
+        );
+        assert_eq!(
+            tier(&root, &RuleSet::default(), false, "apply_patch", &args),
+            Tier::Classifier
+        );
+    }
+
+    #[test]
+    fn shell_args_use_the_tool_type() {
+        let args = json!({"command": "ls", "working_dir": "src", "timeout_secs": 5});
+        assert_eq!(
+            Action::parse("shell", &args).kind,
+            ActionKind::Shell {
+                command: "ls".into(),
+                working_dir: Some("src".into()),
+                background: false
+            }
+        );
+        for bad in [
+            json!({"command": "ls", "cwd": "/"}),
+            json!({"command": "ls", "background": "yes"}),
+            json!({"command": 1}),
+            json!("ls"),
+        ] {
+            assert_eq!(
+                Action::parse("shell", &bad).kind,
+                ActionKind::Other,
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -776,7 +843,7 @@ mod tests {
         assert_eq!(
             action.kind,
             ActionKind::MemoryWrite {
-                scope: "user",
+                scope: Scope::User,
                 name: "Prefers Rust!"
             }
         );

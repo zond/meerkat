@@ -490,6 +490,7 @@ impl Harness {
             &realm_dir,
             global_rules.as_deref(),
             &scope.context_root.join(".rkat"),
+            rules::RealmTrust::Owned,
         )
         .expect("load rules");
         for (tool, pattern) in setup.deny {

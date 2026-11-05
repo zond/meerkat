@@ -11,11 +11,11 @@ use meerkat_core::service::SessionError;
 use meerkat_core::{AgentEvent, EventEnvelope, Message, Session};
 use tokio::sync::mpsc;
 
-use super::{Integrator, blocks_from_session, provider_name};
+use super::{Integrator, blocks_from_session, provider_name, window_status};
 use crate::bootstrap::instructions::{append_remember_line, remember_target, remembered_context};
 use crate::error::TuiError;
 use crate::session::lifecycle::{
-    compact_session, context_window, estimate_tokens, index_discarded, retire_session,
+    compact_session, estimate_tokens, index_discarded, retire_session,
 };
 use crate::session::{SessionHandle, load_session, resolve_session_ref};
 use crate::ui::{Msg, NoticeLevel, StatusUpdate};
@@ -37,14 +37,25 @@ impl Integrator {
         false
     }
 
-    /// `/clear`: a fresh session on the current model.
+    /// `/clear`: a fresh session on the current model. The UI keeps its
+    /// transcript until the new session is live.
     pub(super) async fn new_session(&mut self) {
         if self.busy("/clear") {
             return;
         }
         let model = Some(self.current_model.clone());
-        if let Err(err) = self.replace_session(None, model).await {
-            self.notice(NoticeLevel::Error, format!("session: {err}"));
+        match self.replace_session(None, model).await {
+            Ok(()) => {
+                self.send(Msg::ResetTranscript(Vec::new()));
+                self.send(Msg::Status(StatusUpdate::Tokens {
+                    input: 0,
+                    output: 0,
+                }));
+            }
+            Err(err) => self.notice(
+                NoticeLevel::Error,
+                format!("new session not started: {err}"),
+            ),
         }
     }
 
@@ -67,9 +78,11 @@ impl Integrator {
         };
         let usage = session.total_usage();
         let blocks = blocks_from_session(&session);
-        self.engine.seed_transcript(session.id(), &session);
+        let id = session.id().clone();
+        let seed = session.clone();
         match self.replace_session(Some(session), None).await {
             Ok(()) => {
+                self.engine.seed_transcript(&id, &seed);
                 self.send(Msg::ResetTranscript(blocks));
                 self.send(Msg::Status(StatusUpdate::Tokens {
                     input: usage.input_tokens,
@@ -104,11 +117,22 @@ impl Integrator {
         match self.open_session(resume, model).await {
             Ok(()) => Ok(()),
             Err(err) => {
-                if let Some(previous) = previous {
-                    let model = Some(self.current_model.clone());
-                    if let Err(restore) = self.open_session(Some(previous), model).await {
-                        tracing::warn!(error = %restore, "could not restore the previous session");
+                let restored = match previous {
+                    Some(previous) => {
+                        let model = Some(self.current_model.clone());
+                        match self.open_session(Some(previous), model).await {
+                            Ok(()) => true,
+                            Err(restore) => {
+                                tracing::warn!(error = %restore, "could not restore the previous session");
+                                false
+                            }
+                        }
                     }
+                    None => false,
+                };
+                if !restored {
+                    self.dead = true;
+                    self.notice(NoticeLevel::Error, "no live session; use /resume last");
                 }
                 Err(err)
             }
@@ -138,8 +162,10 @@ impl Integrator {
         let context = resume.as_ref().map(|s| estimate_tokens(s.messages()));
         let handle =
             SessionHandle::create(&self.runtime, self.template.options(resume, model)).await?;
+        self.engine.set_primary_session(handle.id());
         self.current_model = handle.model().to_string();
         self.last_context = context;
+        self.dead = false;
         self.send(Msg::Status(StatusUpdate::Session(handle.id().to_string())));
         self.send(Msg::Status(StatusUpdate::Model {
             provider: provider_name(handle.provider()).to_string(),
@@ -156,10 +182,10 @@ impl Integrator {
 
     /// Context window of the current model, for the gauge.
     pub(super) fn push_context_window(&self) {
-        self.send(Msg::Status(StatusUpdate::ContextWindow(context_window(
+        self.send(Msg::Status(window_status(
             self.session.provider(),
             &self.current_model,
-        ))));
+        )));
     }
 
     /// `/compact`: summarize the history, index what the summary replaces
@@ -169,6 +195,12 @@ impl Integrator {
         if self.turn.is_some() || !self.inflight.is_empty() {
             self.send(Msg::CompactFinished(Err(
                 "cannot compact while a turn is running".to_string(),
+            )));
+            return;
+        }
+        if self.dead {
+            self.send(Msg::CompactFinished(Err(
+                "no live session; use /resume last".to_string(),
             )));
             return;
         }
@@ -237,7 +269,37 @@ impl Integrator {
                 self.send(Msg::CompactFinished(Ok(())));
             }
             Err(err) => {
-                let text = format!("compacted session saved; use /resume last ({err})");
+                self.restore_after_failed_compaction(compacted.original, &err)
+                    .await;
+            }
+        }
+    }
+
+    /// The compacted session could not be opened: bring the pre-compaction
+    /// session back so `self.session` never names a retired session. When
+    /// even that fails, mark the integrator dead until `/resume` or `/clear`.
+    async fn restore_after_failed_compaction(&mut self, original: Session, err: &TuiError) {
+        tracing::warn!(error = %err, "could not open the compacted session; restoring");
+        let id = original.id().clone();
+        let seed = original.clone();
+        let model = Some(self.current_model.clone());
+        match self.open_session(Some(original), model).await {
+            Ok(()) => {
+                self.engine.seed_transcript(&id, &seed);
+                // The store holds the compacted version; the restored
+                // session overwrites it after its next completed turn.
+                let text = format!(
+                    "compaction not applied to the live session ({err}); the compacted copy is saved, the session continues uncompacted"
+                );
+                self.notice(NoticeLevel::Warn, text.clone());
+                self.send(Msg::CompactFinished(Err(text)));
+            }
+            Err(restore) => {
+                tracing::warn!(error = %restore, "could not restore the session after compaction");
+                self.dead = true;
+                let text = format!(
+                    "no live session ({err}); the compacted session is saved: use /resume last"
+                );
                 self.notice(NoticeLevel::Error, text.clone());
                 self.send(Msg::CompactFinished(Err(text)));
             }
@@ -280,7 +342,7 @@ impl Integrator {
 }
 
 /// Whether `session` holds anything worth persisting.
-fn has_conversation(session: &Session) -> bool {
+pub(super) fn has_conversation(session: &Session) -> bool {
     session
         .messages()
         .iter()

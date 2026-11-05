@@ -60,6 +60,8 @@ pub struct Redirect {
     pub kind: RedirectKind,
     /// Target word after quote removal.
     pub target: String,
+    /// Whether the target contains an unquoted glob character.
+    pub target_glob: bool,
 }
 
 /// A word after quote removal.
@@ -334,6 +336,7 @@ fn attach_redirect_targets(raw: Vec<Raw>) -> Result<Vec<Tok>, Unsupported> {
                     fd,
                     kind,
                     target: target.text,
+                    target_glob: target.unquoted_glob,
                 })),
                 _ => return Err(Unsupported("redirect without a target")),
             },
@@ -388,13 +391,14 @@ const WRAPPERS: &[&str] = &[
 /// How positional words of a command are checked against the project root.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PathArgs {
-    /// Every non-flag word (and every `--flag=value` value) must resolve inside the project.
+    /// Options are checked against the per-command lists, and every positional
+    /// (and every path-valued option) must resolve inside the project.
     InsideProject,
-    /// Words are plain strings (e.g. `echo`), never touched as paths.
+    /// Words are plain strings (e.g. `echo`), never touched as paths or options.
     Ignore,
 }
 
-/// Command-specific checks beyond forbidden flags.
+/// Command-specific checks beyond option parsing.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Extra {
     None,
@@ -406,145 +410,631 @@ enum Extra {
     GitRemoteList,
     /// `cargo fmt` must carry `--check`.
     CargoFmtCheck,
-    /// Executes project code (build scripts, tests); requires `trust_project_builds`.
-    ProjectBuild,
+    /// `find`: a fixed set of read-only primaries.
+    Find,
+}
+
+/// What an option does with its argument.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Arg {
+    /// No argument. An `--opt=value` value is still path-checked.
+    Flag,
+    /// Required argument that is not a path (pattern, number, format).
+    Plain,
+    /// Optional argument, only ever attached (`--color=never`, `-uno`).
+    Optional,
+    /// Required argument naming a file; checked like a positional.
+    Path,
 }
 
 struct Allowed {
     name: &'static str,
     /// Subcommand that must directly follow the command name (`git status`).
     sub: Option<&'static str>,
-    /// Forbidden argument prefixes (`--pre` matches `--pre-glob`, `-exec` matches `-execdir`).
-    forbidden_prefixes: &'static [&'static str],
-    /// Characters forbidden inside single-dash short-flag clusters (`-o`, `-uo`).
+    /// Positive list of accepted long options. Anything else (including GNU
+    /// abbreviations such as `--outp`) is rejected.
+    longs: &'static [(&'static str, Arg)],
+    /// Short options that take an argument. Short options not listed here are
+    /// treated as plain flags.
+    short_args: &'static [(char, Arg)],
+    /// Short options that are never accepted, alone or in a cluster.
     forbidden_short: &'static [char],
     paths: PathArgs,
     extra: Extra,
+    /// Runs project code (build scripts, proc macros, `rustc-wrapper`, toolchain
+    /// overrides); requires `trust_project_builds`.
+    project_build: bool,
 }
 
-const fn simple(name: &'static str, paths: PathArgs) -> Allowed {
+const HELP: [(&str, Arg); 2] = [("--help", Arg::Flag), ("--version", Arg::Flag)];
+
+const fn ignore(name: &'static str) -> Allowed {
     Allowed {
         name,
         sub: None,
-        forbidden_prefixes: &[],
+        longs: &[],
+        short_args: &[],
         forbidden_short: &[],
-        paths,
+        paths: PathArgs::Ignore,
         extra: Extra::None,
+        project_build: false,
     }
 }
 
-const GIT_FORBIDDEN: &[&str] = &["--ext-diff", "--output", "-o", "--textconv"];
-const CARGO_FORBIDDEN: &[&str] = &["--fix", "--config", "-Z", "--allow-dirty"];
+const fn tool(
+    name: &'static str,
+    longs: &'static [(&'static str, Arg)],
+    short_args: &'static [(char, Arg)],
+    forbidden_short: &'static [char],
+) -> Allowed {
+    Allowed {
+        name,
+        sub: None,
+        longs,
+        short_args,
+        forbidden_short,
+        paths: PathArgs::InsideProject,
+        extra: Extra::None,
+        project_build: false,
+    }
+}
 
-const fn git(sub: &'static str, extra: Extra) -> Allowed {
+const fn with_extra(mut a: Allowed, extra: Extra) -> Allowed {
+    a.extra = extra;
+    a
+}
+
+const CAT_LONGS: &[(&str, Arg)] = &[
+    HELP[0],
+    HELP[1],
+    ("--number", Arg::Flag),
+    ("--number-nonblank", Arg::Flag),
+    ("--show-all", Arg::Flag),
+    ("--show-ends", Arg::Flag),
+    ("--show-tabs", Arg::Flag),
+    ("--show-nonprinting", Arg::Flag),
+    ("--squeeze-blank", Arg::Flag),
+];
+const HEAD_TAIL_LONGS: &[(&str, Arg)] = &[
+    HELP[0],
+    HELP[1],
+    ("--lines", Arg::Plain),
+    ("--bytes", Arg::Plain),
+    ("--quiet", Arg::Flag),
+    ("--silent", Arg::Flag),
+    ("--verbose", Arg::Flag),
+    ("--zero-terminated", Arg::Flag),
+];
+const HEAD_TAIL_SHORT: &[(char, Arg)] = &[('n', Arg::Plain), ('c', Arg::Plain)];
+const WC_LONGS: &[(&str, Arg)] = &[
+    HELP[0],
+    HELP[1],
+    ("--lines", Arg::Flag),
+    ("--words", Arg::Flag),
+    ("--bytes", Arg::Flag),
+    ("--chars", Arg::Flag),
+    ("--max-line-length", Arg::Flag),
+];
+const LS_LONGS: &[(&str, Arg)] = &[
+    HELP[0],
+    HELP[1],
+    ("--all", Arg::Flag),
+    ("--almost-all", Arg::Flag),
+    ("--classify", Arg::Flag),
+    ("--color", Arg::Optional),
+    ("--directory", Arg::Flag),
+    ("--group-directories-first", Arg::Flag),
+    ("--human-readable", Arg::Flag),
+    ("--inode", Arg::Flag),
+    ("--recursive", Arg::Flag),
+    ("--reverse", Arg::Flag),
+    ("--size", Arg::Flag),
+    ("--sort", Arg::Plain),
+    ("--time", Arg::Plain),
+    ("--full-time", Arg::Flag),
+];
+const LS_SHORT: &[(char, Arg)] = &[('I', Arg::Plain), ('w', Arg::Plain), ('T', Arg::Plain)];
+const FILE_LONGS: &[(&str, Arg)] = &[
+    HELP[0],
+    HELP[1],
+    ("--brief", Arg::Flag),
+    ("--mime", Arg::Flag),
+    ("--mime-type", Arg::Flag),
+    ("--mime-encoding", Arg::Flag),
+    ("--dereference", Arg::Flag),
+    ("--no-dereference", Arg::Flag),
+    ("--magic-file", Arg::Path),
+    ("--files-from", Arg::Path),
+    ("--separator", Arg::Plain),
+];
+const FILE_SHORT: &[(char, Arg)] = &[
+    ('m', Arg::Path),
+    ('f', Arg::Path),
+    ('F', Arg::Plain),
+    ('e', Arg::Plain),
+    ('P', Arg::Plain),
+];
+const STAT_LONGS: &[(&str, Arg)] = &[
+    HELP[0],
+    HELP[1],
+    ("--dereference", Arg::Flag),
+    ("--file-system", Arg::Flag),
+    ("--format", Arg::Plain),
+    ("--printf", Arg::Plain),
+    ("--terse", Arg::Flag),
+];
+const DU_LONGS: &[(&str, Arg)] = &[
+    HELP[0],
+    HELP[1],
+    ("--all", Arg::Flag),
+    ("--apparent-size", Arg::Flag),
+    ("--bytes", Arg::Flag),
+    ("--human-readable", Arg::Flag),
+    ("--max-depth", Arg::Plain),
+    ("--summarize", Arg::Flag),
+    ("--total", Arg::Flag),
+];
+const DU_SHORT: &[(char, Arg)] = &[('d', Arg::Plain), ('B', Arg::Plain), ('t', Arg::Plain)];
+const TREE_LONGS: &[(&str, Arg)] = &[
+    HELP[0],
+    HELP[1],
+    ("--dirsfirst", Arg::Flag),
+    ("--gitignore", Arg::Flag),
+    ("--noreport", Arg::Flag),
+    ("--prune", Arg::Flag),
+    ("--charset", Arg::Plain),
+    ("--filelimit", Arg::Plain),
+];
+const TREE_SHORT: &[(char, Arg)] = &[('L', Arg::Plain), ('I', Arg::Plain), ('P', Arg::Plain)];
+const DIFF_LONGS: &[(&str, Arg)] = &[
+    HELP[0],
+    HELP[1],
+    ("--brief", Arg::Flag),
+    ("--color", Arg::Optional),
+    ("--context", Arg::Optional),
+    ("--ignore-all-space", Arg::Flag),
+    ("--ignore-blank-lines", Arg::Flag),
+    ("--ignore-case", Arg::Flag),
+    ("--ignore-space-change", Arg::Flag),
+    ("--new-file", Arg::Flag),
+    ("--recursive", Arg::Flag),
+    ("--report-identical-files", Arg::Flag),
+    ("--side-by-side", Arg::Flag),
+    ("--unified", Arg::Optional),
+];
+const DIFF_SHORT: &[(char, Arg)] = &[
+    ('U', Arg::Plain),
+    ('C', Arg::Plain),
+    ('W', Arg::Plain),
+    ('x', Arg::Plain),
+    ('I', Arg::Plain),
+];
+const CMP_LONGS: &[(&str, Arg)] = &[
+    HELP[0],
+    HELP[1],
+    ("--bytes", Arg::Plain),
+    ("--ignore-initial", Arg::Plain),
+    ("--print-bytes", Arg::Flag),
+    ("--quiet", Arg::Flag),
+    ("--silent", Arg::Flag),
+    ("--verbose", Arg::Flag),
+];
+const CMP_SHORT: &[(char, Arg)] = &[('i', Arg::Plain), ('n', Arg::Plain)];
+const REALPATH_LONGS: &[(&str, Arg)] = &[
+    HELP[0],
+    HELP[1],
+    ("--canonicalize-existing", Arg::Flag),
+    ("--canonicalize-missing", Arg::Flag),
+    ("--no-symlinks", Arg::Flag),
+    ("--quiet", Arg::Flag),
+    ("--relative-to", Arg::Path),
+    ("--relative-base", Arg::Path),
+    ("--zero", Arg::Flag),
+];
+const SORT_LONGS: &[(&str, Arg)] = &[
+    HELP[0],
+    HELP[1],
+    ("--check", Arg::Flag),
+    ("--dictionary-order", Arg::Flag),
+    ("--field-separator", Arg::Plain),
+    ("--general-numeric-sort", Arg::Flag),
+    ("--human-numeric-sort", Arg::Flag),
+    ("--ignore-case", Arg::Flag),
+    ("--ignore-leading-blanks", Arg::Flag),
+    ("--key", Arg::Plain),
+    ("--merge", Arg::Flag),
+    ("--month-sort", Arg::Flag),
+    ("--numeric-sort", Arg::Flag),
+    ("--reverse", Arg::Flag),
+    ("--stable", Arg::Flag),
+    ("--unique", Arg::Flag),
+    ("--version-sort", Arg::Flag),
+    ("--zero-terminated", Arg::Flag),
+];
+const SORT_SHORT: &[(char, Arg)] = &[('k', Arg::Plain), ('t', Arg::Plain), ('S', Arg::Plain)];
+const UNIQ_LONGS: &[(&str, Arg)] = &[
+    HELP[0],
+    HELP[1],
+    ("--count", Arg::Flag),
+    ("--repeated", Arg::Flag),
+    ("--unique", Arg::Flag),
+    ("--ignore-case", Arg::Flag),
+    ("--skip-fields", Arg::Plain),
+    ("--skip-chars", Arg::Plain),
+    ("--check-chars", Arg::Plain),
+    ("--zero-terminated", Arg::Flag),
+];
+const UNIQ_SHORT: &[(char, Arg)] = &[('f', Arg::Plain), ('s', Arg::Plain), ('w', Arg::Plain)];
+const RG_LONGS: &[(&str, Arg)] = &[
+    HELP[0],
+    HELP[1],
+    ("--case-sensitive", Arg::Flag),
+    ("--color", Arg::Plain),
+    ("--column", Arg::Flag),
+    ("--context", Arg::Plain),
+    ("--after-context", Arg::Plain),
+    ("--before-context", Arg::Plain),
+    ("--count", Arg::Flag),
+    ("--count-matches", Arg::Flag),
+    ("--file", Arg::Path),
+    ("--files", Arg::Flag),
+    ("--files-with-matches", Arg::Flag),
+    ("--files-without-match", Arg::Flag),
+    ("--fixed-strings", Arg::Flag),
+    ("--glob", Arg::Plain),
+    ("--heading", Arg::Flag),
+    ("--hidden", Arg::Flag),
+    ("--iglob", Arg::Plain),
+    ("--ignore-case", Arg::Flag),
+    ("--invert-match", Arg::Flag),
+    ("--json", Arg::Flag),
+    ("--line-number", Arg::Flag),
+    ("--max-count", Arg::Plain),
+    ("--max-depth", Arg::Plain),
+    ("--multiline", Arg::Flag),
+    ("--no-filename", Arg::Flag),
+    ("--no-heading", Arg::Flag),
+    ("--no-ignore", Arg::Flag),
+    ("--null", Arg::Flag),
+    ("--only-matching", Arg::Flag),
+    ("--quiet", Arg::Flag),
+    ("--regexp", Arg::Plain),
+    ("--smart-case", Arg::Flag),
+    ("--sort", Arg::Plain),
+    ("--stats", Arg::Flag),
+    ("--trim", Arg::Flag),
+    ("--type", Arg::Plain),
+    ("--type-list", Arg::Flag),
+    ("--type-not", Arg::Plain),
+    ("--unrestricted", Arg::Flag),
+    ("--vimgrep", Arg::Flag),
+    ("--with-filename", Arg::Flag),
+    ("--word-regexp", Arg::Flag),
+];
+const RG_SHORT: &[(char, Arg)] = &[
+    ('e', Arg::Plain),
+    ('f', Arg::Path),
+    ('g', Arg::Plain),
+    ('t', Arg::Plain),
+    ('T', Arg::Plain),
+    ('A', Arg::Plain),
+    ('B', Arg::Plain),
+    ('C', Arg::Plain),
+    ('m', Arg::Plain),
+    ('d', Arg::Plain),
+    ('M', Arg::Plain),
+    ('j', Arg::Plain),
+    ('E', Arg::Plain),
+    ('r', Arg::Plain),
+];
+const GREP_LONGS: &[(&str, Arg)] = &[
+    HELP[0],
+    HELP[1],
+    ("--after-context", Arg::Plain),
+    ("--before-context", Arg::Plain),
+    ("--color", Arg::Optional),
+    ("--context", Arg::Optional),
+    ("--count", Arg::Flag),
+    ("--exclude", Arg::Plain),
+    ("--exclude-dir", Arg::Plain),
+    ("--extended-regexp", Arg::Flag),
+    ("--file", Arg::Path),
+    ("--files-with-matches", Arg::Flag),
+    ("--files-without-match", Arg::Flag),
+    ("--fixed-strings", Arg::Flag),
+    ("--ignore-case", Arg::Flag),
+    ("--include", Arg::Plain),
+    ("--invert-match", Arg::Flag),
+    ("--line-number", Arg::Flag),
+    ("--max-count", Arg::Plain),
+    ("--no-filename", Arg::Flag),
+    ("--no-messages", Arg::Flag),
+    ("--null", Arg::Flag),
+    ("--only-matching", Arg::Flag),
+    ("--perl-regexp", Arg::Flag),
+    ("--quiet", Arg::Flag),
+    ("--recursive", Arg::Flag),
+    ("--regexp", Arg::Plain),
+    ("--silent", Arg::Flag),
+    ("--text", Arg::Flag),
+    ("--with-filename", Arg::Flag),
+    ("--word-regexp", Arg::Flag),
+];
+const GREP_SHORT: &[(char, Arg)] = &[
+    ('e', Arg::Plain),
+    ('f', Arg::Path),
+    ('A', Arg::Plain),
+    ('B', Arg::Plain),
+    ('C', Arg::Plain),
+    ('m', Arg::Plain),
+];
+
+const GIT_FORBIDDEN_SHORT: &[char] = &['o'];
+const GIT_STATUS_LONGS: &[(&str, Arg)] = &[
+    ("--ahead-behind", Arg::Flag),
+    ("--branch", Arg::Flag),
+    ("--ignored", Arg::Optional),
+    ("--long", Arg::Flag),
+    ("--no-ahead-behind", Arg::Flag),
+    ("--porcelain", Arg::Optional),
+    ("--short", Arg::Flag),
+    ("--show-stash", Arg::Flag),
+    ("--untracked-files", Arg::Optional),
+    ("--verbose", Arg::Flag),
+];
+const GIT_STATUS_SHORT: &[(char, Arg)] = &[('u', Arg::Optional)];
+/// Shared by `git diff`, `git log` and `git show`.
+const GIT_LOG_LONGS: &[(&str, Arg)] = &[
+    ("--abbrev", Arg::Optional),
+    ("--abbrev-commit", Arg::Flag),
+    ("--after", Arg::Plain),
+    ("--all", Arg::Flag),
+    ("--author", Arg::Plain),
+    ("--before", Arg::Plain),
+    ("--cached", Arg::Flag),
+    ("--check", Arg::Flag),
+    ("--color", Arg::Optional),
+    ("--date", Arg::Plain),
+    ("--decorate", Arg::Optional),
+    ("--diff-filter", Arg::Optional),
+    ("--exit-code", Arg::Flag),
+    ("--find-renames", Arg::Optional),
+    ("--first-parent", Arg::Flag),
+    ("--follow", Arg::Flag),
+    ("--format", Arg::Optional),
+    ("--graph", Arg::Flag),
+    ("--grep", Arg::Plain),
+    ("--histogram", Arg::Flag),
+    ("--ignore-all-space", Arg::Flag),
+    ("--ignore-space-change", Arg::Flag),
+    ("--max-count", Arg::Plain),
+    ("--merge-base", Arg::Flag),
+    ("--merges", Arg::Flag),
+    ("--minimal", Arg::Flag),
+    ("--name-only", Arg::Flag),
+    ("--name-status", Arg::Flag),
+    ("--no-color", Arg::Flag),
+    ("--no-ext-diff", Arg::Flag),
+    ("--no-merges", Arg::Flag),
+    ("--no-patch", Arg::Flag),
+    ("--no-textconv", Arg::Flag),
+    ("--numstat", Arg::Flag),
+    ("--oneline", Arg::Flag),
+    ("--patch", Arg::Flag),
+    ("--patience", Arg::Flag),
+    ("--pretty", Arg::Optional),
+    ("--quiet", Arg::Flag),
+    ("--raw", Arg::Flag),
+    ("--reverse", Arg::Flag),
+    ("--shortstat", Arg::Flag),
+    ("--since", Arg::Plain),
+    ("--skip", Arg::Plain),
+    ("--staged", Arg::Flag),
+    ("--stat", Arg::Optional),
+    ("--summary", Arg::Flag),
+    ("--unified", Arg::Optional),
+    ("--until", Arg::Plain),
+    ("--word-diff", Arg::Optional),
+];
+const GIT_LOG_SHORT: &[(char, Arg)] = &[
+    ('n', Arg::Plain),
+    ('O', Arg::Path),
+    ('U', Arg::Optional),
+    ('S', Arg::Plain),
+    ('G', Arg::Plain),
+    ('M', Arg::Optional),
+    ('C', Arg::Optional),
+    ('B', Arg::Optional),
+    ('l', Arg::Optional),
+];
+const GIT_BRANCH_LONGS: &[(&str, Arg)] = &[
+    ("--all", Arg::Flag),
+    ("--color", Arg::Optional),
+    ("--contains", Arg::Plain),
+    ("--format", Arg::Plain),
+    ("--list", Arg::Flag),
+    ("--merged", Arg::Plain),
+    ("--no-color", Arg::Flag),
+    ("--no-contains", Arg::Plain),
+    ("--no-merged", Arg::Plain),
+    ("--points-at", Arg::Plain),
+    ("--remotes", Arg::Flag),
+    ("--show-current", Arg::Flag),
+    ("--sort", Arg::Plain),
+    ("--verbose", Arg::Flag),
+];
+const GIT_REV_PARSE_LONGS: &[(&str, Arg)] = &[
+    ("--abbrev-ref", Arg::Optional),
+    ("--git-dir", Arg::Flag),
+    ("--is-inside-work-tree", Arg::Flag),
+    ("--quiet", Arg::Flag),
+    ("--short", Arg::Optional),
+    ("--show-cdup", Arg::Flag),
+    ("--show-prefix", Arg::Flag),
+    ("--show-toplevel", Arg::Flag),
+    ("--symbolic-full-name", Arg::Flag),
+    ("--verify", Arg::Flag),
+];
+const GIT_LS_FILES_LONGS: &[(&str, Arg)] = &[
+    ("--cached", Arg::Flag),
+    ("--deleted", Arg::Flag),
+    ("--directory", Arg::Flag),
+    ("--error-unmatch", Arg::Flag),
+    ("--exclude-standard", Arg::Flag),
+    ("--full-name", Arg::Flag),
+    ("--ignored", Arg::Flag),
+    ("--modified", Arg::Flag),
+    ("--others", Arg::Flag),
+    ("--stage", Arg::Flag),
+];
+const GIT_BLAME_LONGS: &[(&str, Arg)] = &[
+    ("--date", Arg::Plain),
+    ("--line-porcelain", Arg::Flag),
+    ("--porcelain", Arg::Flag),
+    ("--root", Arg::Flag),
+    ("--show-email", Arg::Flag),
+    ("--show-name", Arg::Flag),
+    ("--show-number", Arg::Flag),
+];
+const GIT_BLAME_SHORT: &[(char, Arg)] = &[('L', Arg::Plain)];
+const GIT_REMOTE_LONGS: &[(&str, Arg)] = &[("--verbose", Arg::Flag)];
+
+const CARGO_LONGS: &[(&str, Arg)] = &[
+    ("--all", Arg::Flag),
+    ("--all-features", Arg::Flag),
+    ("--all-targets", Arg::Flag),
+    ("--bench", Arg::Plain),
+    ("--benches", Arg::Flag),
+    ("--bin", Arg::Plain),
+    ("--bins", Arg::Flag),
+    ("--check", Arg::Flag),
+    ("--color", Arg::Plain),
+    ("--depth", Arg::Plain),
+    ("--doc", Arg::Flag),
+    ("--duplicates", Arg::Flag),
+    ("--edges", Arg::Plain),
+    ("--example", Arg::Plain),
+    ("--examples", Arg::Flag),
+    ("--exclude", Arg::Plain),
+    ("--features", Arg::Plain),
+    ("--format-version", Arg::Plain),
+    ("--frozen", Arg::Flag),
+    ("--invert", Arg::Plain),
+    ("--jobs", Arg::Plain),
+    ("--lib", Arg::Flag),
+    ("--locked", Arg::Flag),
+    ("--message-format", Arg::Plain),
+    ("--no-capture", Arg::Flag),
+    ("--no-default-features", Arg::Flag),
+    ("--no-deps", Arg::Flag),
+    ("--no-fail-fast", Arg::Flag),
+    ("--no-run", Arg::Flag),
+    ("--offline", Arg::Flag),
+    ("--package", Arg::Plain),
+    ("--prefix", Arg::Plain),
+    ("--profile", Arg::Plain),
+    ("--quiet", Arg::Flag),
+    ("--release", Arg::Flag),
+    ("--target", Arg::Plain),
+    ("--test", Arg::Plain),
+    ("--tests", Arg::Flag),
+    ("--verbose", Arg::Flag),
+    ("--workspace", Arg::Flag),
+];
+const CARGO_SHORT: &[(char, Arg)] = &[
+    ('p', Arg::Plain),
+    ('j', Arg::Plain),
+    ('F', Arg::Plain),
+    ('e', Arg::Plain),
+    ('i', Arg::Plain),
+    ('E', Arg::Plain),
+];
+const CARGO_FORBIDDEN_SHORT: &[char] = &['Z', 'C'];
+
+const fn git(
+    sub: &'static str,
+    longs: &'static [(&'static str, Arg)],
+    short_args: &'static [(char, Arg)],
+    extra: Extra,
+) -> Allowed {
     Allowed {
         name: "git",
         sub: Some(sub),
-        forbidden_prefixes: GIT_FORBIDDEN,
-        forbidden_short: &[],
+        longs,
+        short_args,
+        forbidden_short: GIT_FORBIDDEN_SHORT,
         paths: PathArgs::InsideProject,
         extra,
+        project_build: false,
     }
 }
 
+/// Every `cargo` subcommand runs project-controlled code: `.cargo/config.toml`
+/// can set `rustc-wrapper`, and `rust-toolchain.toml` can point at any binary.
 const fn cargo(sub: &'static str, extra: Extra) -> Allowed {
     Allowed {
         name: "cargo",
         sub: Some(sub),
-        forbidden_prefixes: CARGO_FORBIDDEN,
-        forbidden_short: &[],
+        longs: CARGO_LONGS,
+        short_args: CARGO_SHORT,
+        forbidden_short: CARGO_FORBIDDEN_SHORT,
         paths: PathArgs::InsideProject,
         extra,
+        project_build: true,
     }
 }
 
 /// The Tier-1 allowlist.
 const ALLOWLIST: &[Allowed] = &[
-    simple("cat", PathArgs::InsideProject),
-    simple("head", PathArgs::InsideProject),
-    simple("tail", PathArgs::InsideProject),
-    simple("wc", PathArgs::InsideProject),
-    simple("ls", PathArgs::InsideProject),
-    simple("pwd", PathArgs::Ignore),
-    simple("echo", PathArgs::Ignore),
-    simple("which", PathArgs::Ignore),
-    Allowed {
-        name: "file",
-        sub: None,
-        forbidden_prefixes: &["--compile"],
-        forbidden_short: &['C'],
-        paths: PathArgs::InsideProject,
-        extra: Extra::None,
-    },
-    simple("stat", PathArgs::InsideProject),
-    simple("du", PathArgs::InsideProject),
-    Allowed {
-        name: "tree",
-        sub: None,
-        forbidden_prefixes: &["--output"],
-        forbidden_short: &['o'],
-        paths: PathArgs::InsideProject,
-        extra: Extra::None,
-    },
-    simple("diff", PathArgs::InsideProject),
-    simple("cmp", PathArgs::InsideProject),
-    simple("basename", PathArgs::Ignore),
-    simple("dirname", PathArgs::Ignore),
-    simple("realpath", PathArgs::InsideProject),
-    Allowed {
-        name: "sort",
-        sub: None,
-        forbidden_prefixes: &["--output", "--compress-program"],
-        forbidden_short: &['o'],
-        paths: PathArgs::InsideProject,
-        extra: Extra::None,
-    },
-    Allowed {
-        name: "uniq",
-        sub: None,
-        forbidden_prefixes: &[],
-        forbidden_short: &[],
-        paths: PathArgs::InsideProject,
-        extra: Extra::UniqSingleInput,
-    },
-    Allowed {
-        name: "rg",
-        sub: None,
-        forbidden_prefixes: &["--pre"],
-        forbidden_short: &[],
-        paths: PathArgs::InsideProject,
-        extra: Extra::None,
-    },
-    simple("grep", PathArgs::InsideProject),
-    Allowed {
-        name: "find",
-        sub: None,
-        forbidden_prefixes: &["-exec", "-ok", "-delete", "-fprint", "-fls"],
-        forbidden_short: &[],
-        paths: PathArgs::InsideProject,
-        extra: Extra::None,
-    },
-    git("status", Extra::None),
-    git("diff", Extra::None),
-    git("log", Extra::None),
-    git("show", Extra::None),
-    git("branch", Extra::GitBranchList),
-    git("rev-parse", Extra::None),
-    git("ls-files", Extra::None),
-    git("blame", Extra::None),
-    git("remote", Extra::GitRemoteList),
-    cargo("check", Extra::ProjectBuild),
-    cargo("clippy", Extra::ProjectBuild),
+    tool("cat", CAT_LONGS, &[], &[]),
+    tool("head", HEAD_TAIL_LONGS, HEAD_TAIL_SHORT, &[]),
+    tool("tail", HEAD_TAIL_LONGS, HEAD_TAIL_SHORT, &['f', 'F']),
+    tool("wc", WC_LONGS, &[], &[]),
+    tool("ls", LS_LONGS, LS_SHORT, &[]),
+    ignore("pwd"),
+    ignore("echo"),
+    ignore("which"),
+    ignore("basename"),
+    ignore("dirname"),
+    tool("file", FILE_LONGS, FILE_SHORT, &['C', 'z', 'Z']),
+    tool("stat", STAT_LONGS, &[('c', Arg::Plain)], &[]),
+    tool("du", DU_LONGS, DU_SHORT, &['X']),
+    tool("tree", TREE_LONGS, TREE_SHORT, &['o', 'H', 'R', 'T']),
+    tool("diff", DIFF_LONGS, DIFF_SHORT, &['X']),
+    tool("cmp", CMP_LONGS, CMP_SHORT, &[]),
+    tool("realpath", REALPATH_LONGS, &[], &[]),
+    tool("sort", SORT_LONGS, SORT_SHORT, &['o', 'T']),
+    with_extra(
+        tool("uniq", UNIQ_LONGS, UNIQ_SHORT, &[]),
+        Extra::UniqSingleInput,
+    ),
+    tool("rg", RG_LONGS, RG_SHORT, &['z', 'L']),
+    tool("grep", GREP_LONGS, GREP_SHORT, &[]),
+    with_extra(tool("find", &[], &[], &[]), Extra::Find),
+    git("status", GIT_STATUS_LONGS, GIT_STATUS_SHORT, Extra::None),
+    git("diff", GIT_LOG_LONGS, GIT_LOG_SHORT, Extra::None),
+    git("log", GIT_LOG_LONGS, GIT_LOG_SHORT, Extra::None),
+    git("show", GIT_LOG_LONGS, GIT_LOG_SHORT, Extra::None),
+    git("branch", GIT_BRANCH_LONGS, &[], Extra::GitBranchList),
+    git("rev-parse", GIT_REV_PARSE_LONGS, &[], Extra::None),
+    git("ls-files", GIT_LS_FILES_LONGS, &[], Extra::None),
+    git("blame", GIT_BLAME_LONGS, GIT_BLAME_SHORT, Extra::None),
+    git("remote", GIT_REMOTE_LONGS, &[], Extra::GitRemoteList),
+    cargo("check", Extra::None),
+    cargo("clippy", Extra::None),
     cargo("fmt", Extra::CargoFmtCheck),
     cargo("tree", Extra::None),
     cargo("metadata", Extra::None),
-    cargo("build", Extra::ProjectBuild),
-    cargo("test", Extra::ProjectBuild),
-    cargo("nextest", Extra::ProjectBuild),
+    cargo("build", Extra::None),
+    cargo("test", Extra::None),
+    cargo("nextest", Extra::None),
 ];
 
 /// Global options accepted between `git` and its subcommand.
 const GIT_GLOBAL_OK: &[&str] = &["--no-pager"];
+
+/// `cargo` invocations that only print and never read project configuration.
+const CARGO_INFO: &[&str] = &["--version", "-V", "--list"];
 
 /// Whether `command` passes the Tier-1 read-only allowlist, with relative paths
 /// resolved against the project root.
@@ -645,18 +1135,23 @@ fn check_segment(
             name.text
         )));
     }
+    if name.text == "cargo"
+        && let [only] = args
+        && CARGO_INFO.contains(&only.text.as_str())
+    {
+        return Ok(());
+    }
 
-    let args: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
-    let (entry, rest) = match_subcommand(&candidates, &name.text, &args)?;
-    check_entry(entry, &args, rest, base, ctx)
+    let (entry, rest) = match_subcommand(&candidates, &name.text, args)?;
+    check_entry(entry, rest, base, ctx)
 }
 
 /// Pick the allowlist entry for this invocation and return the args after the subcommand.
 fn match_subcommand<'e, 'a>(
     candidates: &[&'e Allowed],
     name: &str,
-    args: &'a [&'a str],
-) -> Result<(&'e Allowed, &'a [&'a str]), NotAllowlisted> {
+    args: &'a [Word],
+) -> Result<(&'e Allowed, &'a [Word]), NotAllowlisted> {
     let Some(first) = candidates.first() else {
         return Err(NotAllowlisted::new(format!("`{name}` is not allowlisted")));
     };
@@ -665,11 +1160,14 @@ fn match_subcommand<'e, 'a>(
     }
     let mut idx = 0;
     if name == "git" {
-        while args.get(idx).is_some_and(|a| GIT_GLOBAL_OK.contains(a)) {
+        while args
+            .get(idx)
+            .is_some_and(|a| GIT_GLOBAL_OK.contains(&a.text.as_str()))
+        {
             idx += 1;
         }
     }
-    let Some(sub) = args.get(idx) else {
+    let Some(sub) = args.get(idx).map(|w| w.text.as_str()) else {
         return Err(NotAllowlisted::new(format!(
             "`{name}` without a subcommand"
         )));
@@ -681,17 +1179,152 @@ fn match_subcommand<'e, 'a>(
     }
     let entry = candidates
         .iter()
-        .find(|c| c.sub == Some(*sub))
+        .find(|c| c.sub == Some(sub))
         .ok_or_else(|| {
             NotAllowlisted::new(format!("`{name} {sub}` is not on the read-only allowlist"))
         })?;
     Ok((entry, args.get(idx + 1..).unwrap_or(&[])))
 }
 
+/// A word (or the attached part of one) that must name a path inside the project.
+#[derive(Clone, Copy)]
+struct PathValue<'a> {
+    text: &'a str,
+    unquoted_glob: bool,
+}
+
+impl<'a> From<&'a Word> for PathValue<'a> {
+    fn from(w: &'a Word) -> Self {
+        Self {
+            text: &w.text,
+            unquoted_glob: w.unquoted_glob,
+        }
+    }
+}
+
+/// Arguments split by the command's option table.
+#[derive(Default)]
+struct Parsed<'a> {
+    positionals: Vec<&'a Word>,
+    path_values: Vec<PathValue<'a>>,
+}
+
+/// Walk `args` with the entry's option tables. Unknown long options, forbidden
+/// short options and unexpected characters in short clusters are rejected.
+fn parse_args<'a>(
+    entry: &Allowed,
+    label: &str,
+    args: &'a [Word],
+) -> Result<Parsed<'a>, NotAllowlisted> {
+    let mut out = Parsed::default();
+    let mut iter = args.iter();
+    let mut options_done = false;
+    while let Some(word) = iter.next() {
+        let text = word.text.as_str();
+        if options_done || text == "-" || !text.starts_with('-') {
+            out.positionals.push(word);
+            continue;
+        }
+        if text == "--" {
+            options_done = true;
+            continue;
+        }
+        let takes = if text.starts_with("--") {
+            parse_long(entry, label, word, &mut out)?
+        } else {
+            parse_short(entry, label, word, &mut out)?
+        };
+        match takes {
+            Some(Arg::Path) => {
+                let value = iter.next().ok_or_else(|| {
+                    NotAllowlisted::new(format!("`{label} {text}` without a value"))
+                })?;
+                out.path_values.push(value.into());
+            }
+            Some(Arg::Plain) => {
+                if iter.next().is_none() {
+                    return Err(NotAllowlisted::new(format!(
+                        "`{label} {text}` without a value"
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// Check one `--long[=value]` option. Returns the argument kind when the value
+/// is in the next word.
+fn parse_long<'a>(
+    entry: &Allowed,
+    label: &str,
+    word: &'a Word,
+    out: &mut Parsed<'a>,
+) -> Result<Option<Arg>, NotAllowlisted> {
+    let text = word.text.as_str();
+    let (name, value) = match text.split_once('=') {
+        Some((n, v)) => (n, Some(v)),
+        None => (text, None),
+    };
+    let Some(&(_, kind)) = entry.longs.iter().find(|(n, _)| *n == name) else {
+        return Err(NotAllowlisted::new(format!(
+            "`{label}` option `{name}` is not on the read-only allowlist"
+        )));
+    };
+    match (kind, value) {
+        (Arg::Plain | Arg::Optional, Some(_)) => Ok(None),
+        (Arg::Path | Arg::Flag, Some(v)) => {
+            out.path_values.push(PathValue {
+                text: v,
+                unquoted_glob: word.unquoted_glob,
+            });
+            Ok(None)
+        }
+        (Arg::Plain | Arg::Path, None) => Ok(Some(kind)),
+        (Arg::Flag | Arg::Optional, None) => Ok(None),
+    }
+}
+
+/// Check one `-abc` short-option cluster. Returns the argument kind when the
+/// last option's value is in the next word.
+fn parse_short<'a>(
+    entry: &Allowed,
+    label: &str,
+    word: &'a Word,
+    out: &mut Parsed<'a>,
+) -> Result<Option<Arg>, NotAllowlisted> {
+    let text = word.text.as_str();
+    let cluster = text.get(1..).unwrap_or_default();
+    for (idx, c) in cluster.char_indices() {
+        if entry.forbidden_short.contains(&c) {
+            return Err(NotAllowlisted::new(format!("`{label}` with `-{c}`")));
+        }
+        if let Some(&(_, kind)) = entry.short_args.iter().find(|(s, _)| *s == c) {
+            let attached = cluster.get(idx + c.len_utf8()..).unwrap_or_default();
+            if attached.is_empty() {
+                return Ok(matches!(kind, Arg::Plain | Arg::Path).then_some(kind));
+            }
+            if kind == Arg::Path {
+                out.path_values.push(PathValue {
+                    text: attached,
+                    unquoted_glob: word.unquoted_glob,
+                });
+            }
+            return Ok(None);
+        }
+        if !c.is_ascii_alphanumeric() {
+            return Err(NotAllowlisted::new(format!(
+                "`{label}` option `{text}` has an unexpected attached value"
+            )));
+        }
+    }
+    Ok(None)
+}
+
 fn check_entry(
     entry: &Allowed,
-    all_args: &[&str],
-    args: &[&str],
+    args: &[Word],
     base: &std::path::Path,
     ctx: &PolicyContext<'_>,
 ) -> Result<(), NotAllowlisted> {
@@ -699,72 +1332,112 @@ fn check_entry(
         Some(sub) => format!("{} {sub}", entry.name),
         None => entry.name.to_string(),
     };
-    for arg in all_args {
-        if let Some(prefix) = entry
-            .forbidden_prefixes
-            .iter()
-            .find(|p| arg.starts_with(**p))
-        {
-            return Err(NotAllowlisted::new(format!("`{label}` with `{prefix}`")));
-        }
-        if is_short_cluster(arg)
-            && let Some(c) = entry
-                .forbidden_short
-                .iter()
-                .find(|c| arg.chars().skip(1).any(|a| a == **c))
-        {
-            return Err(NotAllowlisted::new(format!("`{label}` with `-{c}`")));
-        }
+    if entry.project_build && !ctx.trust_project_builds {
+        return Err(NotAllowlisted::new(format!(
+            "`{label}` executes project code and trust_project_builds is off"
+        )));
+    }
+    if entry.paths == PathArgs::Ignore {
+        return Ok(());
+    }
+    if entry.extra == Extra::Find {
+        return check_find(args, base, ctx);
     }
 
+    let parsed = parse_args(entry, &label, args)?;
     match entry.extra {
-        Extra::None => {}
+        Extra::None | Extra::Find => {}
         Extra::UniqSingleInput => {
-            if positionals(args).count() > 1 {
+            if parsed.positionals.len() > 1 {
                 return Err(NotAllowlisted::new("`uniq` with an output file"));
             }
         }
         Extra::GitBranchList => check_git_branch(args)?,
         Extra::GitRemoteList => {
-            if args.iter().any(|a| !matches!(*a, "-v" | "--verbose")) {
+            if args
+                .iter()
+                .any(|a| !matches!(a.text.as_str(), "-v" | "--verbose"))
+            {
                 return Err(NotAllowlisted::new("`git remote` beyond listing"));
             }
         }
         Extra::CargoFmtCheck => {
-            if !args.contains(&"--check") {
+            if !args.iter().any(|a| a.text == "--check") {
                 return Err(NotAllowlisted::new("`cargo fmt` without `--check`"));
-            }
-        }
-        Extra::ProjectBuild => {
-            if !ctx.trust_project_builds {
-                return Err(NotAllowlisted::new(format!(
-                    "`{label}` executes project code and trust_project_builds is off"
-                )));
             }
         }
     }
 
-    if entry.paths == PathArgs::InsideProject {
-        for value in path_like_values(args) {
-            check_inside(value, base, ctx)?;
+    for value in parsed
+        .positionals
+        .iter()
+        .map(|w| PathValue::from(*w))
+        .chain(parsed.path_values.iter().copied())
+    {
+        check_path_value(value, base, ctx)?;
+    }
+    Ok(())
+}
+
+/// `find` primaries accepted in Tier 1, with whether they take an argument.
+const FIND_PRIMARIES: &[(&str, Arg)] = &[
+    ("-name", Arg::Plain),
+    ("-iname", Arg::Plain),
+    ("-path", Arg::Plain),
+    ("-type", Arg::Plain),
+    ("-maxdepth", Arg::Plain),
+    ("-mindepth", Arg::Plain),
+    ("-newer", Arg::Path),
+    ("-size", Arg::Plain),
+    ("-print", Arg::Flag),
+    ("-print0", Arg::Flag),
+    ("-prune", Arg::Flag),
+    ("-not", Arg::Flag),
+    ("!", Arg::Flag),
+    ("-o", Arg::Flag),
+    ("-a", Arg::Flag),
+    ("(", Arg::Flag),
+    (")", Arg::Flag),
+];
+
+/// `find PATH... EXPRESSION`: starting points must be inside the project and the
+/// expression may only use [`FIND_PRIMARIES`].
+fn check_find(
+    args: &[Word],
+    base: &std::path::Path,
+    ctx: &PolicyContext<'_>,
+) -> Result<(), NotAllowlisted> {
+    let mut iter = args.iter();
+    let mut in_expression = false;
+    while let Some(word) = iter.next() {
+        let text = word.text.as_str();
+        let is_primary = text.starts_with('-') || matches!(text, "!" | "(" | ")");
+        if !in_expression && !is_primary {
+            check_path_value(word.into(), base, ctx)?;
+            continue;
+        }
+        in_expression = true;
+        let Some(&(_, kind)) = FIND_PRIMARIES.iter().find(|(p, _)| *p == text) else {
+            return Err(NotAllowlisted::new(format!(
+                "`find` with `{text}` is not on the read-only allowlist"
+            )));
+        };
+        match kind {
+            Arg::Flag | Arg::Optional => {}
+            Arg::Plain | Arg::Path => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| NotAllowlisted::new(format!("`find {text}` without a value")))?;
+                if kind == Arg::Path {
+                    check_path_value(value.into(), base, ctx)?;
+                }
+            }
         }
     }
     Ok(())
 }
 
-fn check_git_branch(args: &[&str]) -> Result<(), NotAllowlisted> {
-    const MUTATING_LONG: &[&str] = &[
-        "--delete",
-        "--move",
-        "--copy",
-        "--force",
-        "--set-upstream",
-        "--unset-upstream",
-        "--edit-description",
-        "--track",
-        "--no-track",
-        "--create-reflog",
-    ];
+fn check_git_branch(args: &[Word]) -> Result<(), NotAllowlisted> {
     const MUTATING_SHORT: &[char] = &['d', 'D', 'm', 'M', 'c', 'C', 'f', 'u', 't'];
     const LISTING: &[&str] = &[
         "-l",
@@ -775,10 +1448,7 @@ fn check_git_branch(args: &[&str]) -> Result<(), NotAllowlisted> {
         "--no-merged",
         "--points-at",
     ];
-    for arg in args {
-        if MUTATING_LONG.iter().any(|m| arg.starts_with(m)) {
-            return Err(NotAllowlisted::new(format!("`git branch {arg}` mutates")));
-        }
+    for arg in args.iter().map(|w| w.text.as_str()) {
         if is_short_cluster(arg) && arg.chars().skip(1).any(|c| MUTATING_SHORT.contains(&c)) {
             return Err(NotAllowlisted::new(format!("`git branch {arg}` mutates")));
         }
@@ -786,9 +1456,12 @@ fn check_git_branch(args: &[&str]) -> Result<(), NotAllowlisted> {
     let listing = args.iter().any(|a| {
         LISTING
             .iter()
-            .any(|l| a == l || a.starts_with(&format!("{l}=")))
+            .any(|l| a.text == *l || a.text.starts_with(&format!("{l}=")))
     });
-    if positionals(args).next().is_some() && !listing {
+    let has_positional = args
+        .iter()
+        .any(|a| !(a.text.starts_with('-') && a.text.len() > 1));
+    if has_positional && !listing {
         return Err(NotAllowlisted::new("`git branch <name>` creates a branch"));
     }
     Ok(())
@@ -799,21 +1472,60 @@ fn is_short_cluster(arg: &str) -> bool {
     arg.len() > 1 && arg.starts_with('-') && !arg.starts_with("--")
 }
 
-fn positionals<'a>(args: &'a [&'a str]) -> impl Iterator<Item = &'a str> + 'a {
-    args.iter()
-        .copied()
-        .filter(|a| !(a.starts_with('-') && a.len() > 1))
+/// Whether an unquoted glob word has the narrow `[dir/][**/]*.<ext>` shape that
+/// can only match ordinary files below a literal directory.
+///
+/// Returns the literal directory prefix (possibly empty) on success.
+fn simple_glob_prefix(text: &str) -> Option<String> {
+    let mut parts: Vec<&str> = text.split('/').collect();
+    let last = parts.pop()?;
+    let ext = last.strip_prefix("*.")?;
+    if ext.is_empty() || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let mut prefix = Vec::new();
+    let mut seen_globstar = false;
+    for part in parts {
+        if part == "**" {
+            seen_globstar = true;
+            continue;
+        }
+        if seen_globstar
+            || part.is_empty()
+            || part == "."
+            || part == ".."
+            || part.contains(['*', '?', '['])
+        {
+            return None;
+        }
+        prefix.push(part);
+    }
+    Some(prefix.join("/"))
 }
 
-/// Non-flag words, plus the value part of `--flag=value`.
-fn path_like_values<'a>(args: &'a [&'a str]) -> impl Iterator<Item = &'a str> + 'a {
-    args.iter().filter_map(|a| {
-        if a.starts_with('-') && a.len() > 1 {
-            a.split_once('=').map(|(_, v)| v).filter(|v| !v.is_empty())
-        } else {
-            Some(*a)
-        }
-    })
+/// Check a path-position word: no `~user` forms, only narrow globs, and the
+/// resolved path must lie inside the project.
+fn check_path_value(
+    value: PathValue<'_>,
+    base: &std::path::Path,
+    ctx: &PolicyContext<'_>,
+) -> Result<(), NotAllowlisted> {
+    let text = value.text;
+    if text.starts_with('~') && text != "~" && !text.starts_with("~/") {
+        return Err(NotAllowlisted::new(format!(
+            "path `{text}` uses `~user` expansion"
+        )));
+    }
+    if value.unquoted_glob {
+        let Some(prefix) = simple_glob_prefix(text) else {
+            return Err(NotAllowlisted::new(format!(
+                "glob `{text}` is not of the form `*.ext` or `**/*.ext`"
+            )));
+        };
+        let dir = if prefix.is_empty() { "." } else { &prefix };
+        return check_inside(dir, base, ctx);
+    }
+    check_inside(text, base, ctx)
 }
 
 fn check_inside(
@@ -824,8 +1536,12 @@ fn check_inside(
     if value == "-" {
         return Ok(());
     }
-    let candidate: PathBuf = if value.starts_with('/') || value.starts_with('~') {
+    let candidate: PathBuf = if value.starts_with('/') || value == "~" || value.starts_with("~/") {
         PathBuf::from(value)
+    } else if value.starts_with('~') {
+        return Err(NotAllowlisted::new(format!(
+            "path `{value}` uses `~user` expansion"
+        )));
     } else {
         base.join(value)
     };
@@ -854,7 +1570,19 @@ fn check_redirect(
         (RedirectKind::DupOut, Some(2)) => redirect.target == "1",
         (RedirectKind::Out, None | Some(1 | 2)) => redirect.target == "/dev/null",
         (RedirectKind::In, None | Some(0)) => {
-            check_inside(&redirect.target, base, ctx)?;
+            if redirect.target_glob {
+                return Err(NotAllowlisted::new(format!(
+                    "glob in redirect target {redirect}"
+                )));
+            }
+            check_path_value(
+                PathValue {
+                    text: &redirect.target,
+                    unquoted_glob: false,
+                },
+                base,
+                ctx,
+            )?;
             true
         }
         _ => false,
@@ -1014,7 +1742,8 @@ mod tests {
             Redirect {
                 fd: Some(2),
                 kind: RedirectKind::DupOut,
-                target: "1".into()
+                target: "1".into(),
+                target_glob: false,
             }
         );
         assert_eq!(redirects[1].kind, RedirectKind::Out);
@@ -1208,6 +1937,78 @@ mod tests {
             ("cargo run", false),
             ("cargo install ripgrep", false),
             ("cargo build --target-dir /tmp/x", false),
+            ("cargo --version", true),
+            ("cargo --list", true),
+            ("cargo check 2>&1", true),
+            ("cargo test", true),
+            ("cargo test -- --nocapture", true),
+            ("cargo clippy --all-targets -- -D warnings", true),
+            ("cargo -Zunstable-options check", false),
+            ("cargo check -Zbuild-std", false),
+            ("cargo check --manifest-path /tmp/Cargo.toml", false),
+            // GNU long-option abbreviations and unknown long options
+            ("sort --compress-prog=./x.sh big", false),
+            ("sort --outp=src/main.rs big", false),
+            ("file --comp x", false),
+            ("rg --hostname-bin=./x .", false),
+            ("rg --hyperlink-format=x .", false),
+            ("rg --pr cat x", false),
+            ("cat --unknown src/main.rs", false),
+            ("git log --out=x", false),
+            ("git diff --ext", false),
+            ("wc --files0-from=list", false),
+            // Other writers
+            ("tree -H .", false),
+            ("tree -fH . src", false),
+            ("sort -T /tmp x", false),
+            ("sort -rT/tmp x", false),
+            ("tail -f input.txt", false),
+            ("find . -exec rm {} ;", false),
+            ("find . -name '*.rs' -newer src/main.rs", true),
+            ("find . -newer /etc/passwd", false),
+            ("find . -type f -name x -print0", true),
+            ("find . -fprintf out x", false),
+            ("find -L . -name x", false),
+            ("find . -maxdepth 2 -not -path './target/*'", true),
+            // Tilde and globs
+            ("cat ~root/.bashrc", false),
+            ("cat ~x/.aws/credentials", false),
+            ("cat .*/.*/etc/passwd", false),
+            ("cat *", false),
+            ("cat ?", false),
+            ("ls *.rs", true),
+            ("ls src/*.rs", true),
+            ("ls **/*.rs", true),
+            ("ls ../*.rs", false),
+            ("ls ./*.rs", false),
+            ("ls /etc/*.conf", false),
+            ("cat < *", false),
+            ("cat '*'", true),
+            // Attached option values
+            ("grep -f/etc/shadow -r .", false),
+            ("grep -rf/etc/shadow .", false),
+            ("grep --file=/etc/shadow -r .", false),
+            ("grep -f /etc/shadow -r .", false),
+            ("grep -e foo -r src", true),
+            ("grep -e/etc/x -r src", true),
+            ("git log -O/abs", false),
+            ("git log -O /abs", false),
+            ("git log -p -n5", true),
+            ("git log --format='%h %s' -n 3", true),
+            ("ls -x/etc", false),
+            ("head -n20 src/main.rs", true),
+            ("head -20 src/main.rs", true),
+            ("sort -t / -k2 input.txt", true),
+            ("rg -n foo src", true),
+            ("rg -g '*.rs' foo", true),
+            ("rg -n --glob '!target' foo src", true),
+            ("grep -rn x src", true),
+            ("ls -la", true),
+            ("head -n 20 Cargo.toml", true),
+            ("git log --oneline -5", true),
+            ("git status --porcelain=v2", true),
+            ("git status -uno", true),
+            ("uniq -f 1 input.txt", true),
         ];
         let c = ctx(&root, true);
         let mut failures = Vec::new();
@@ -1234,8 +2035,19 @@ mod tests {
         ] {
             assert!(allowlisted(cmd, &untrusted).is_err(), "{cmd}");
         }
-        assert!(allowlisted("cargo fmt --check", &untrusted).is_ok());
-        assert!(allowlisted("cargo tree", &untrusted).is_ok());
+        for cmd in [
+            "cargo fmt --check",
+            "cargo tree",
+            "cargo metadata",
+            "cargo metadata --format-version 1",
+            "cargo check 2>&1",
+        ] {
+            assert!(allowlisted(cmd, &untrusted).is_err(), "{cmd}");
+        }
+        assert!(allowlisted("cargo --version", &untrusted).is_ok());
+        assert!(allowlisted("cargo --list", &untrusted).is_ok());
+        assert!(allowlisted("cargo --version check", &untrusted).is_err());
+        assert!(allowlisted("cat src/main.rs", &untrusted).is_ok());
     }
 
     #[test]
@@ -1267,6 +2079,19 @@ mod tests {
         std::fs::write(outside.path().join("s"), "x").unwrap();
         std::os::unix::fs::symlink(outside.path().join("s"), dir.path().join("link")).unwrap();
         assert!(allowlisted("cat link", &ctx(&root, true)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dotdot_through_symlinked_directory_is_rejected() {
+        let (dir, root) = project();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("inner")).unwrap();
+        std::fs::write(outside.path().join("secret"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("inner"), dir.path().join("lnk")).unwrap();
+        let c = ctx(&root, true);
+        assert!(allowlisted("cat lnk/../secret", &c).is_err());
+        assert!(allowlisted("cat src/../input.txt", &c).is_ok());
     }
 
     #[test]

@@ -31,6 +31,10 @@ pub struct EscalationPrompt {
     pub tool: String,
     /// Short rendering of the arguments.
     pub args_preview: String,
+    /// Canonical rule subjects of the action (see
+    /// [`super::policy::Action::subjects`]); "allow + add rule" mints a literal
+    /// rule from the first one.
+    pub subjects: Vec<String>,
     /// The classifier's opinion, if it produced one.
     pub classifier_hint: Option<String>,
 }
@@ -44,6 +48,8 @@ pub struct EscalationRequest {
     pub tool: String,
     /// Short rendering of the arguments.
     pub args_preview: String,
+    /// Canonical rule subjects of the action.
+    pub subjects: Vec<String>,
     /// The classifier's opinion, if it produced one.
     pub classifier_hint: Option<String>,
     /// Where to send the answer.
@@ -87,6 +93,7 @@ impl EscalationBroker {
             session_id: prompt.session_id,
             tool: prompt.tool,
             args_preview: prompt.args_preview,
+            subjects: prompt.subjects,
             classifier_hint: prompt.classifier_hint,
             respond,
         };
@@ -115,6 +122,7 @@ mod tests {
             session_id: SessionId::new(),
             tool: tool.into(),
             args_preview: "{}".into(),
+            subjects: vec!["{}".into()],
             classifier_hint: None,
         }
     }

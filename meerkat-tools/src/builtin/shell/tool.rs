@@ -360,22 +360,25 @@ pub struct ShellOutput {
     pub stderr_lossy: bool,
 }
 
+// Public so approval policies can interpret shell calls with the exact type
+// the tool deserializes. The doc comment is the tool's schema description, so
+// it must stay unchanged.
 /// Input arguments for the shell tool
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
-struct ShellInput {
+pub struct ShellInput {
     /// The command to execute
     #[schemars(description = "The command to execute (POSIX-style parsing for policy checks)")]
-    command: String,
+    pub command: String,
     /// Working directory (optional)
     #[schemars(description = "Working directory (relative to project root)")]
-    working_dir: Option<String>,
+    pub working_dir: Option<String>,
     /// Timeout in seconds (optional, uses config default)
     #[schemars(description = "Timeout in seconds (uses config default if not specified)")]
-    timeout_secs: Option<u64>,
+    pub timeout_secs: Option<u64>,
     /// Run in background (optional, default false)
     #[serde(default)]
     #[schemars(description = "If true, run in background and return job ID immediately")]
-    background: bool,
+    pub background: bool,
 }
 
 #[async_trait]

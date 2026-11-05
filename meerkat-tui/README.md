@@ -66,20 +66,38 @@ arg = "git push*"
 ## Keys and commands
 
 Enter sends; Alt+Enter / Ctrl+J insert a newline; Ctrl-C interrupts a running
-turn (twice to quit when idle); Ctrl-D quits; Ctrl-O toggles the last reasoning
-block; Ctrl-R searches prompt history (workspace, then global; Ctrl-R again for
-older matches, Enter/arrows accept into the editor, Esc cancels); Ctrl-X Ctrl-S
+turn (twice to quit when idle); Ctrl-O toggles the last reasoning block; Ctrl-R
+searches prompt history (workspace, then global; Ctrl-R again for older
+matches, Enter/arrows accept into the editor, Esc cancels); Ctrl-X Ctrl-S
 interrupts the running turn and sends the input; PgUp/PgDn and Shift+↑/↓ scroll.
+
+While the agent is working, Enter queues the message and delivers it at the
+agent's next step (between tool calls). Esc recalls every queued message into
+the editor (and interrupts the turn when nothing is queued); ↑ on an empty
+editor takes back only the newest queued message for editing. When a message
+reached the model too late to be answered, rkat-tui asks for an answer once on
+its own; if it still goes unanswered you are told, and Enter on an empty editor
+asks again.
+
+Ctrl-D on an empty editor (or `/quit`) quits at once when idle. While a turn is
+running or messages are queued it warns first; pressing it again within 3
+seconds interrupts the turn, saves the session, and appends every message the
+model never received to `<workspace>/.rkat/tui/tui_unsent.txt` (the next start
+says so).
 
 `/help`, `/quit`, `/clear`, `/resume [ref]`, `/rules [list|add allow|deny <tool> [pattern]|rm <n>]`,
 `/auto [on|off|resume]`, `/model <id>`, `/remember <text>`, `/compact`.
+`/clear`, `/resume`, `/model <id>` and `/compact` work only while idle (no turn
+running, nothing queued); the transcript is replaced only once the new session
+is live.
 
 A single-line prompt starting with `#` (`# use cargo nextest`) is the same as
 `/remember`; `##…`, multi-line input and `\#…` are sent as prompts.
 
 The status bar shows a context gauge, `ctx 42% (84k/200k)`, yellow from 70%
 and red from 90% (`~` marks an estimate, e.g. right after `/resume` or
-`/compact`).
+`/compact`, or a window borrowed from a related model or the provider default
+for a model the catalog does not know).
 
 ## Instructions and memory
 
@@ -129,7 +147,9 @@ directory and `rkat-tui -c` still continues the latest session. A `.gitignore`
 is written into that directory so it is never committed.
 
 The workspace is `--workspace <dir>` (`-w`), else the nearest ancestor of the
-current directory that already has `.rkat/tui/`, else the current directory.
+current directory that already has `.rkat/tui/` (the search stops at the git
+root and never picks your home directory), else the current directory. Running
+from your home directory requires an explicit `--workspace`.
 
 `--realm`, `--isolated` and `--state-root` opt into the shared realm model that
 `rkat` uses (`$XDG_DATA_HOME/meerkat/realms/<realm>/`) instead.

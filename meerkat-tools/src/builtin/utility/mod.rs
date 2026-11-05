@@ -8,7 +8,7 @@
 //! These tools are enabled by default when built-in tools are enabled.
 
 #[cfg(not(target_arch = "wasm32"))]
-mod apply_patch;
+pub mod apply_patch;
 mod datetime;
 mod tool_set;
 #[cfg(not(target_arch = "wasm32"))]

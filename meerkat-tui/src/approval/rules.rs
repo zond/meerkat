@@ -54,6 +54,12 @@ pub enum RulesError {
     /// Serializing a rules file failed.
     #[error("failed to serialize rules: {0}")]
     Serialize(#[from] toml::ser::Error),
+    /// A rule entry set both `arg` and `literal`.
+    #[error("rule for `{tool}` sets both `arg` and `literal`")]
+    ArgAndLiteral {
+        /// The rule's tool pattern.
+        tool: String,
+    },
 }
 
 /// Whether a rule allows or denies.
@@ -139,15 +145,22 @@ impl fmt::Debug for ToolPattern {
     }
 }
 
-/// Glob over the canonical action subject (`*` also matches `/` and spaces).
+/// Matcher over the canonical action subject.
 #[derive(Clone)]
-pub struct ArgPattern {
-    raw: String,
-    matcher: GlobMatcher,
+pub enum ArgPattern {
+    /// Glob (`*` also matches `/` and spaces).
+    Glob {
+        /// The pattern as written.
+        raw: String,
+        /// Compiled matcher.
+        matcher: GlobMatcher,
+    },
+    /// The exact subject string (what "allow + add rule" mints).
+    Literal(String),
 }
 
 impl ArgPattern {
-    /// Parse an argument pattern.
+    /// Parse a glob argument pattern.
     ///
     /// # Errors
     ///
@@ -155,23 +168,34 @@ impl ArgPattern {
     pub fn new(raw: impl Into<String>) -> Result<Self, RulesError> {
         let raw = raw.into();
         let matcher = compile(&raw)?;
-        Ok(Self { raw, matcher })
+        Ok(Self::Glob { raw, matcher })
     }
 
-    /// The pattern as written.
+    /// The pattern (or literal) as written.
     pub fn as_str(&self) -> &str {
-        &self.raw
+        match self {
+            Self::Glob { raw, .. } => raw,
+            Self::Literal(text) => text,
+        }
+    }
+
+    /// Whether this is a [`Self::Literal`].
+    pub fn is_literal(&self) -> bool {
+        matches!(self, Self::Literal(_))
     }
 
     /// Whether `subject` matches.
     pub fn matches(&self, subject: &str) -> bool {
-        self.matcher.is_match(subject)
+        match self {
+            Self::Glob { matcher, .. } => matcher.is_match(subject),
+            Self::Literal(text) => text == subject,
+        }
     }
 }
 
 impl PartialEq for ArgPattern {
     fn eq(&self, other: &Self) -> bool {
-        self.raw == other.raw
+        self.is_literal() == other.is_literal() && self.as_str() == other.as_str()
     }
 }
 
@@ -179,7 +203,102 @@ impl Eq for ArgPattern {}
 
 impl fmt::Debug for ArgPattern {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("ArgPattern").field(&self.raw).finish()
+        match self {
+            Self::Glob { raw, .. } => f.debug_tuple("Glob").field(raw).finish(),
+            Self::Literal(text) => f.debug_tuple("Literal").field(text).finish(),
+        }
+    }
+}
+
+impl fmt::Display for ArgPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Glob { raw, .. } => f.write_str(raw),
+            Self::Literal(text) => write!(f, "={text:?}"),
+        }
+    }
+}
+
+/// Shell commands as rule subjects.
+///
+/// Allow rules must cover *every* simple command of a `;`/`&&`/`||`/`|` chain,
+/// so `cargo nextest run*` does not allow `cargo nextest run; curl x | sh`.
+/// Deny rules match when *any* simple command (or the whole command) matches,
+/// after whitespace normalisation and with a leading `\` stripped from the
+/// command word, so `true && git push`, `git  push` and `\git push` are all
+/// caught by `git push*`.
+mod shell_subject {
+    use super::ArgPattern;
+    use crate::approval::shell::{Op, RedirectKind, Segment, lex, segments};
+
+    /// Command words of a segment joined by single spaces, without a leading `\`.
+    fn segment_text(seg: &Segment) -> String {
+        let mut out = String::new();
+        for (i, word) in seg.words.iter().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            let text = if i == 0 {
+                word.text.trim_start_matches('\\')
+            } else {
+                word.text.as_str()
+            };
+            out.push_str(text);
+        }
+        out
+    }
+
+    /// Whitespace-normalised text with a leading `\` stripped.
+    fn normalise(raw: &str) -> String {
+        let joined = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        joined.trim_start_matches('\\').to_string()
+    }
+
+    /// Allow semantics: every segment matches. Unsupported syntax, background
+    /// jobs and file redirections never match.
+    pub(super) fn allow_matches(arg: &ArgPattern, command: &str) -> bool {
+        if let ArgPattern::Literal(text) = arg {
+            return text == command;
+        }
+        let Ok(tokens) = lex(command) else {
+            return false;
+        };
+        let mut any = false;
+        for seg in segments(tokens) {
+            if seg.terminator == Some(Op::Amp) {
+                return false;
+            }
+            if seg.words.is_empty() && seg.redirects.is_empty() {
+                continue;
+            }
+            let fd_dup_only = seg
+                .redirects
+                .iter()
+                .all(|r| matches!(r.kind, RedirectKind::DupOut | RedirectKind::DupIn));
+            if !fd_dup_only || !arg.matches(&segment_text(&seg)) {
+                return false;
+            }
+            any = true;
+        }
+        any
+    }
+
+    /// Deny semantics: the whole command or any segment matches.
+    pub(super) fn deny_matches(arg: &ArgPattern, command: &str) -> bool {
+        if arg.matches(command) || arg.matches(&normalise(command)) {
+            return true;
+        }
+        match lex(command) {
+            Ok(tokens) => segments(tokens)
+                .iter()
+                .any(|seg| arg.matches(&segment_text(seg))),
+            // Best effort for syntax the lexer refuses: split on anything that
+            // can separate or nest commands.
+            Err(_) => command
+                .split([';', '&', '|', '\n', '(', ')', '`', '{', '}'])
+                .map(|piece| normalise(piece.trim_start_matches('$')))
+                .any(|piece| !piece.is_empty() && arg.matches(&piece)),
+        }
     }
 }
 
@@ -232,11 +351,45 @@ impl Rule {
         })
     }
 
+    /// A rule matching exactly one subject string (no glob semantics).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RulesError`] when the tool pattern is invalid.
+    pub fn literal(
+        kind: RuleKind,
+        tool: &str,
+        subject: impl Into<String>,
+        origin: RuleOrigin,
+    ) -> Result<Self, RulesError> {
+        Ok(Self {
+            tool: ToolPattern::new(tool)?,
+            arg: Some(ArgPattern::Literal(subject.into())),
+            kind,
+            origin,
+        })
+    }
+
+    fn from_entry(
+        kind: RuleKind,
+        entry: &RuleEntry,
+        origin: RuleOrigin,
+    ) -> Result<Self, RulesError> {
+        match (&entry.arg, &entry.literal) {
+            (Some(_), Some(_)) => Err(RulesError::ArgAndLiteral {
+                tool: entry.tool.clone(),
+            }),
+            (None, Some(literal)) => Self::literal(kind, &entry.tool, literal.clone(), origin),
+            (arg, None) => Self::new(kind, &entry.tool, arg.as_deref(), origin),
+        }
+    }
+
     /// Whether this rule matches the tool and subjects.
     ///
     /// Deny rules match when **any** subject matches; allow rules require
     /// **every** subject to match (an `apply_patch` touching two files is
-    /// allowed only when both are covered).
+    /// allowed only when both are covered). For `shell`, the same applies per
+    /// simple command of the command line (see [`shell_subject`]).
     pub fn matches(&self, tool: &str, subjects: &[String]) -> bool {
         if !self.tool.matches(tool) {
             return false;
@@ -244,17 +397,39 @@ impl Rule {
         let Some(arg) = &self.arg else {
             return true;
         };
+        let shell = tool == "shell";
         match self.kind {
-            RuleKind::Deny => subjects.iter().any(|s| arg.matches(s)),
-            RuleKind::Allow => !subjects.is_empty() && subjects.iter().all(|s| arg.matches(s)),
+            RuleKind::Deny => subjects.iter().any(|s| {
+                if shell {
+                    shell_subject::deny_matches(arg, s)
+                } else {
+                    arg.matches(s)
+                }
+            }),
+            RuleKind::Allow => {
+                !subjects.is_empty()
+                    && subjects.iter().all(|s| {
+                        if shell {
+                            shell_subject::allow_matches(arg, s)
+                        } else {
+                            arg.matches(s)
+                        }
+                    })
+            }
         }
     }
 
     /// The serialized form.
     pub fn to_entry(&self) -> RuleEntry {
+        let (arg, literal) = match &self.arg {
+            Some(ArgPattern::Glob { raw, .. }) => (Some(raw.clone()), None),
+            Some(ArgPattern::Literal(text)) => (None, Some(text.clone())),
+            None => (None, None),
+        };
         RuleEntry {
             tool: self.tool.as_str().to_string(),
-            arg: self.arg.as_ref().map(|a| a.as_str().to_string()),
+            arg,
+            literal,
         }
     }
 
@@ -281,7 +456,7 @@ impl Rule {
         let Some(arg) = &self.arg else {
             return Some("allows every shell command");
         };
-        broad_shell_arg(arg.as_str())
+        broad_shell_arg(arg.as_str(), !arg.is_literal())
     }
 }
 
@@ -301,15 +476,15 @@ const RUNNER_PREFIXES: &[&[&str]] = &[
     &["make"],
 ];
 
-fn broad_shell_arg(arg: &str) -> Option<&'static str> {
+fn broad_shell_arg(arg: &str, glob: bool) -> Option<&'static str> {
     let trimmed = arg.trim();
-    if trimmed.is_empty() || trimmed.starts_with(['*', '?', '[', '{']) {
+    if trimmed.is_empty() || (glob && trimmed.starts_with(['*', '?', '[', '{'])) {
         return Some("matches any shell command");
     }
     let mut words = trimmed.split_whitespace();
     let first = words.next().unwrap_or_default();
     let first_bare = first.trim_end_matches(['*', '?']);
-    let wildcard = has_glob_meta(trimmed);
+    let wildcard = glob && has_glob_meta(trimmed);
     if wildcard
         && INTERPRETER_PREFIXES.iter().any(|p| {
             if *p == "python" {
@@ -446,7 +621,8 @@ pub struct AutoSettings {
     pub enabled: bool,
     /// Classifier model override.
     pub classifier_model: Option<String>,
-    /// Whether `cargo build|test|nextest|check|clippy` are Tier 1.
+    /// Whether `cargo build|test|nextest|check|clippy` are Tier 1. Off by
+    /// default: builds execute project code (`build.rs`, tests, proc macros).
     pub trust_project_builds: bool,
 }
 
@@ -455,7 +631,7 @@ impl Default for AutoSettings {
         Self {
             enabled: true,
             classifier_model: None,
-            trust_project_builds: true,
+            trust_project_builds: false,
         }
     }
 }
@@ -484,6 +660,9 @@ pub struct RuleEntry {
     /// Optional subject glob.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arg: Option<String>,
+    /// Optional exact subject (mutually exclusive with `arg`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub literal: Option<String>,
 }
 
 /// On-disk rules file.
@@ -525,11 +704,11 @@ impl RulesFile {
         let allow = self
             .allow
             .iter()
-            .map(|e| Rule::new(RuleKind::Allow, &e.tool, e.arg.as_deref(), origin));
+            .map(|e| Rule::from_entry(RuleKind::Allow, e, origin));
         let deny = self
             .deny
             .iter()
-            .map(|e| Rule::new(RuleKind::Deny, &e.tool, e.arg.as_deref(), origin));
+            .map(|e| Rule::from_entry(RuleKind::Deny, e, origin));
         allow.chain(deny).collect()
     }
 }
@@ -544,7 +723,8 @@ pub enum Notice {
         /// Number of ignored entries.
         count: usize,
     },
-    /// The project-level file tried to enable `trust_project_builds` against a user setting.
+    /// The project-level file tried to enable `trust_project_builds`; only the
+    /// user's own layers may turn it on.
     ProjectTrustIgnored {
         /// Project rules file.
         path: PathBuf,
@@ -556,6 +736,19 @@ pub enum Notice {
         path: PathBuf,
         /// Number of ignored allow rules.
         count: usize,
+    },
+    /// The realm rules file is tracked by git, so its `[auto]` settings are ignored.
+    TrackedRealmAutoIgnored {
+        /// Realm rules file.
+        path: PathBuf,
+    },
+    /// Whether the realm rules file is tracked by git could not be determined,
+    /// so it is treated as tracked.
+    RealmTrackingUnknown {
+        /// Realm rules file.
+        path: PathBuf,
+        /// Why the check failed.
+        reason: String,
     },
     /// A global rules file exists at the pre-`GlobalDirs` location and is no
     /// longer read.
@@ -577,7 +770,17 @@ impl fmt::Display for Notice {
             ),
             Self::ProjectTrustIgnored { path } => write!(
                 f,
-                "ignored trust_project_builds=true in {}: a project file cannot loosen your setting",
+                "ignored trust_project_builds=true in {}: a project file can only lower trust",
+                path.display()
+            ),
+            Self::TrackedRealmAutoIgnored { path } => write!(
+                f,
+                "{} is tracked by git; ignored its [auto] settings",
+                path.display()
+            ),
+            Self::RealmTrackingUnknown { path, reason } => write!(
+                f,
+                "could not tell whether {} is tracked by git ({reason}); treating it as tracked",
                 path.display()
             ),
             Self::TrackedRealmAllowIgnored { path, count } => write!(
@@ -613,15 +816,26 @@ pub fn legacy_global_rules_notice(
     })
 }
 
+/// How far the realm rules file (`<realm>/tui.toml`) is trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealmTrust {
+    /// The file is the user's own: all of it applies.
+    Owned,
+    /// The file is (or may be) tracked by git, i.e. it may have arrived with
+    /// the repository: only its deny rules apply.
+    Tracked,
+}
+
 /// Load and merge the three rule layers.
 ///
 /// `global_rules_file` is the user-global rules file itself (typically
 /// [`crate::bootstrap::GlobalDirs::rules_file`]); the realm and project layers
 /// are `tui.toml` inside `realm_dir` and `project_rkat_dir`.
 ///
-/// Settings precedence (later wins): global, realm, project. The project layer
-/// contributes only deny rules and `[auto]` settings, and cannot turn
-/// `trust_project_builds` on when a user layer turned it off.
+/// Settings precedence (later wins): global, realm, project. A
+/// [`RealmTrust::Tracked`] realm file contributes only deny rules (no allow
+/// rules, no `[auto]` settings). The project layer contributes only deny rules
+/// and `[auto]` settings, and can never turn `trust_project_builds` on.
 ///
 /// # Errors
 ///
@@ -630,6 +844,7 @@ pub fn load_layered(
     realm_dir: &Path,
     global_rules_file: Option<&Path>,
     project_rkat_dir: &Path,
+    realm_trust: RealmTrust,
 ) -> Result<(RuleSet, AutoSettings, Vec<Notice>), RulesError> {
     let mut rules = RuleSet::default();
     let mut settings = AutoSettings::default();
@@ -641,17 +856,31 @@ pub fn load_layered(
     }
     user_layers.push((realm_dir.join(RULES_FILE_NAME), RuleOrigin::Realm));
 
-    let mut user_trust: Option<bool> = None;
     for (path, origin) in user_layers {
         let file = RulesFile::load(&path)?;
+        let untrusted = origin == RuleOrigin::Realm && realm_trust == RealmTrust::Tracked;
+        let mut ignored_allow = 0;
         for rule in file.rules(origin)? {
-            rules.push(rule);
-        }
-        if let Some(auto) = &file.auto {
-            apply_auto(&mut settings, auto);
-            if auto.trust_project_builds.is_some() {
-                user_trust = auto.trust_project_builds;
+            if untrusted && rule.kind == RuleKind::Allow {
+                ignored_allow += 1;
+            } else {
+                rules.push(rule);
             }
+        }
+        if ignored_allow > 0 {
+            notices.push(Notice::TrackedRealmAllowIgnored {
+                path: path.clone(),
+                count: ignored_allow,
+            });
+        }
+        match &file.auto {
+            Some(auto) if untrusted => {
+                if *auto != AutoSection::default() {
+                    notices.push(Notice::TrackedRealmAutoIgnored { path });
+                }
+            }
+            Some(auto) => apply_auto(&mut settings, auto),
+            None => {}
         }
     }
 
@@ -664,15 +893,14 @@ pub fn load_layered(
         });
     }
     for entry in &project.deny {
-        rules.push(Rule::new(
+        rules.push(Rule::from_entry(
             RuleKind::Deny,
-            &entry.tool,
-            entry.arg.as_deref(),
+            entry,
             RuleOrigin::Project,
         )?);
     }
     if let Some(mut auto) = project.auto {
-        if auto.trust_project_builds == Some(true) && user_trust == Some(false) {
+        if auto.trust_project_builds == Some(true) {
             auto.trust_project_builds = None;
             notices.push(Notice::ProjectTrustIgnored { path: project_path });
         }
@@ -859,13 +1087,22 @@ mod tests {
                 classifier_model: Some("claude-sonnet-4-6".into()),
                 trust_project_builds: Some(false),
             }),
-            allow: vec![RuleEntry {
-                tool: "shell".into(),
-                arg: Some("cargo nextest run*".into()),
-            }],
+            allow: vec![
+                RuleEntry {
+                    tool: "shell".into(),
+                    arg: Some("cargo nextest run*".into()),
+                    literal: None,
+                },
+                RuleEntry {
+                    tool: "shell".into(),
+                    arg: None,
+                    literal: Some("make lint [*]".into()),
+                },
+            ],
             deny: vec![RuleEntry {
                 tool: "mcp__prod__*".into(),
                 arg: None,
+                literal: None,
             }],
         };
         let text = toml::to_string_pretty(&file).unwrap();
@@ -877,6 +1114,18 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.allow.len(), 1);
         assert!(toml::from_str::<RulesFile>("[[allow]]\ntool=\"x\"\nbogus=1\n").is_err());
+        let rules = file.rules(RuleOrigin::Realm).unwrap();
+        assert_eq!(
+            rules[1].arg,
+            Some(ArgPattern::Literal("make lint [*]".into()))
+        );
+        assert_eq!(rules[1].to_entry(), file.allow[1]);
+        let both: RulesFile =
+            toml::from_str("[[allow]]\ntool=\"x\"\narg=\"a\"\nliteral=\"b\"\n").unwrap();
+        assert!(matches!(
+            both.rules(RuleOrigin::Realm),
+            Err(RulesError::ArgAndLiteral { .. })
+        ));
     }
 
     #[test]
@@ -903,8 +1152,13 @@ mod tests {
             "[auto]\ntrust_project_builds = true\nenabled = false\n[[allow]]\ntool = \"shell\"\n[[deny]]\ntool = \"agent_spawn\"\n",
         )
         .unwrap();
-        let (rules, settings, notices) =
-            load_layered(&realm, Some(&home.join(RULES_FILE_NAME)), &project).unwrap();
+        let (rules, settings, notices) = load_layered(
+            &realm,
+            Some(&home.join(RULES_FILE_NAME)),
+            &project,
+            RealmTrust::Owned,
+        )
+        .unwrap();
         assert_eq!(rules.allow.len(), 1);
         assert_eq!(rules.allow[0].origin, RuleOrigin::Realm);
         assert_eq!(rules.deny.len(), 2);
@@ -929,8 +1183,13 @@ mod tests {
             "[[allow]]\ntool = \"shell\"\narg = \"make test\"\n[[deny]]\ntool = \"shell\"\narg = \"rm *\"\n",
         )
         .unwrap();
-        let (rules, _, notices) =
-            load_layered(&tmp.path().join("realm"), Some(&global), tmp.path()).unwrap();
+        let (rules, _, notices) = load_layered(
+            &tmp.path().join("realm"),
+            Some(&global),
+            tmp.path(),
+            RealmTrust::Owned,
+        )
+        .unwrap();
         assert_eq!(rules.allow.len(), 1);
         assert_eq!(rules.allow[0].origin, RuleOrigin::Global);
         assert_eq!(rules.deny.len(), 1);
@@ -941,6 +1200,7 @@ mod tests {
             &tmp.path().join("realm"),
             Some(&tmp.path().join("missing.toml")),
             tmp.path(),
+            RealmTrust::Owned,
         )
         .unwrap();
         assert_eq!(rules, RuleSet::default());
@@ -980,8 +1240,13 @@ mod tests {
     #[test]
     fn missing_files_give_defaults() {
         let tmp = tempfile::tempdir().unwrap();
-        let (rules, settings, notices) =
-            load_layered(tmp.path(), None, &tmp.path().join("nope")).unwrap();
+        let (rules, settings, notices) = load_layered(
+            tmp.path(),
+            None,
+            &tmp.path().join("nope"),
+            RealmTrust::Owned,
+        )
+        .unwrap();
         assert_eq!(rules, RuleSet::default());
         assert_eq!(settings, AutoSettings::default());
         assert!(notices.is_empty());
@@ -996,12 +1261,12 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            load_layered(tmp.path(), None, tmp.path()),
+            load_layered(tmp.path(), None, tmp.path(), RealmTrust::Owned),
             Err(RulesError::Pattern { .. })
         ));
         std::fs::write(tmp.path().join(RULES_FILE_NAME), "not toml [").unwrap();
         assert!(matches!(
-            load_layered(tmp.path(), None, tmp.path()),
+            load_layered(tmp.path(), None, tmp.path(), RealmTrust::Owned),
             Err(RulesError::Parse { .. })
         ));
     }
@@ -1040,5 +1305,136 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty());
+    }
+
+    fn deny(tool: &str, arg: Option<&str>) -> Rule {
+        Rule::new(RuleKind::Deny, tool, arg, RuleOrigin::Realm).unwrap()
+    }
+
+    fn cmd(c: &str) -> Vec<String> {
+        vec![c.to_string()]
+    }
+
+    #[test]
+    fn shell_allow_rules_cover_every_segment() {
+        let a = allow("shell", Some("cargo nextest run*"));
+        assert!(a.matches("shell", &cmd("cargo nextest run -p x")));
+        assert!(a.matches(
+            "shell",
+            &cmd("cargo nextest run && cargo nextest run --lib")
+        ));
+        assert!(a.matches("shell", &cmd("cargo nextest run 2>&1")));
+        for bad in [
+            "cargo nextest run; curl x | sh",
+            "cargo nextest run && rm -rf ~",
+            "cargo nextest run | sh",
+            "cargo nextest run $(curl x)",
+            "cargo nextest run > /etc/passwd",
+            "cargo nextest run &",
+            "",
+        ] {
+            assert!(!a.matches("shell", &cmd(bad)), "{bad}");
+        }
+    }
+
+    #[test]
+    fn shell_deny_rules_match_any_segment() {
+        let d = deny("shell", Some("git push*"));
+        for hit in [
+            "git push",
+            "true && git push origin main",
+            "git  push",
+            "\\git push",
+            "ls; git push --force",
+            "echo $(git push)",
+            "cd x && \\git   push",
+        ] {
+            assert!(d.matches("shell", &cmd(hit)), "{hit}");
+        }
+        assert!(!d.matches("shell", &cmd("git status && git pull")));
+    }
+
+    #[test]
+    fn literal_rules_match_exactly() {
+        let r = Rule::literal(
+            RuleKind::Allow,
+            "shell",
+            "cargo test *",
+            RuleOrigin::Session,
+        )
+        .unwrap();
+        assert!(r.matches("shell", &cmd("cargo test *")));
+        assert!(!r.matches("shell", &cmd("cargo test foo")));
+        assert!(r.broad_reason().is_none());
+        let f = Rule::literal(RuleKind::Allow, "read_file", "a[b].txt", RuleOrigin::Realm).unwrap();
+        assert!(f.matches("read_file", &["a[b].txt".to_string()]));
+        assert!(!f.matches("read_file", &["ab.txt".to_string()]));
+        assert!(
+            Rule::literal(RuleKind::Allow, "shell", "make", RuleOrigin::Realm)
+                .unwrap()
+                .broad_reason()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn trust_defaults_off_and_project_can_only_lower_it() {
+        assert!(!AutoSettings::default().trust_project_builds);
+        let tmp = tempfile::tempdir().unwrap();
+        let realm = tmp.path().join("realm");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&realm).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(RULES_FILE_NAME),
+            "[auto]\ntrust_project_builds = true\n",
+        )
+        .unwrap();
+        let (_, settings, notices) =
+            load_layered(&realm, None, &project, RealmTrust::Owned).unwrap();
+        assert!(!settings.trust_project_builds);
+        assert!(matches!(notices[..], [Notice::ProjectTrustIgnored { .. }]));
+
+        std::fs::write(
+            realm.join(RULES_FILE_NAME),
+            "[auto]\ntrust_project_builds = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(RULES_FILE_NAME),
+            "[auto]\ntrust_project_builds = false\n",
+        )
+        .unwrap();
+        let (_, settings, _) = load_layered(&realm, None, &project, RealmTrust::Owned).unwrap();
+        assert!(!settings.trust_project_builds, "project lowers trust");
+        std::fs::remove_file(project.join(RULES_FILE_NAME)).unwrap();
+        let (_, settings, _) = load_layered(&realm, None, &project, RealmTrust::Owned).unwrap();
+        assert!(
+            settings.trust_project_builds,
+            "the user's realm may raise it"
+        );
+    }
+
+    #[test]
+    fn tracked_realm_contributes_only_deny_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let realm = tmp.path().join("realm");
+        std::fs::create_dir_all(&realm).unwrap();
+        std::fs::write(
+            realm.join(RULES_FILE_NAME),
+            "[auto]\ntrust_project_builds = true\nenabled = true\n[[allow]]\ntool = \"shell\"\narg = \"make lint\"\n[[deny]]\ntool = \"shell\"\narg = \"rm *\"\n",
+        )
+        .unwrap();
+        let (rules, settings, notices) =
+            load_layered(&realm, None, &tmp.path().join("p"), RealmTrust::Tracked).unwrap();
+        assert!(rules.allow.is_empty());
+        assert_eq!(rules.deny.len(), 1);
+        assert!(!settings.trust_project_builds);
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(
+            notices
+                .iter()
+                .any(|n| matches!(n, Notice::TrackedRealmAutoIgnored { .. }))
+        );
     }
 }
