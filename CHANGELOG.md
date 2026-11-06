@@ -35,6 +35,124 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat-tui`: a new crate whose `rkat-tui` binary is an interactive
+  terminal coding harness. Its sessions run on the runtime-backed session
+  path (durable Queue/Steer input while the agent works, interrupt, resume
+  with `-c`/`/resume`); every tool call, helpers' included, passes an
+  auto-mode approval gate (tiers, user rules, a reasoning-blind two-stage
+  classifier, escalation dialogs) installed as the build's
+  `ToolDispatchAdmission`; the shell runs under OS confinement by default
+  (`--confinement workspace|strict|off`, `--no-confinement`); models come
+  from live endpoint lists with hot swap and a per-model cost readout;
+  `delegate` runs helpers as mob members, on models only an endpoint lists
+  too and on the model a `/model` switch chose; instruction files (user-global
+  `SYSTEM.md`/`AGENTS.md`, ancestor `AGENTS.md`, `AGENTS.local.md`),
+  `/remember`, notes (`note_*` tools, indexed as untrusted context), native
+  semantic memory, MCP servers from `mcp.toml` (the project file's only once
+  trusted with `/mcp trust` or `--allow-project-mcp`), and a native/warn/auto
+  policy over native auto-compaction with `/compact now`. Configured
+  endpoints and the `[models.<id>]` profiles of models only an endpoint
+  knows are written into the realm's own `config.toml`, so `rkat`, REST and
+  RPC resolve a TUI session's binding too; a realm `[confinement]` is a
+  floor the command line may only narrow; turns end with typed outcomes
+  (completed, failed, interrupted, pending, unknown); the cost readout
+  states its confidence. Endpoint keys come from the environment only
+  (`api_key_env`; an inline `api_key` refuses the start, and the realm
+  document records only the variable's name). A host that cannot confine
+  refuses the start with an explanation of what blocked it (on Linux the
+  user-namespace switches, with the AppArmor profile or sysctl that fixes
+  it) and how to run unconfined; `--confinement-read`/`--confinement-write`
+  add directories to the sandbox; a confined command inherits none of
+  `rkat-tui`'s environment but a curated set of it (`PATH`, `HOME`, locale,
+  TLS roots, proxies and a few tool directories; provider API keys stay
+  outside). User-global files live in `~/.rkat/tui`
+  (`--config-dir` overrides; an existing `~/.config/rkat-tui` is used with a
+  notice until the new directory exists). File tools never write the gate's
+  own `.rkat/` state or `.git/`, nor, wherever they lie, the git directories
+  governing the project (an enclosing repository's, a worktree's and its
+  common dir), the realm directory or the user config directory (sealed
+  paths: denied before the classifier and any allow rule, for every target
+  of a patch), nor a file with another hard link, and `fork_off` is denied
+  to sessions and helpers (a fork child would seat outside the approval
+  gate); the session's own `fork`
+  tool runs a helper that starts with the session's conversation, rendered
+  as text, as context, behind the same gate. A mouse copy goes out with
+  OSC 52 to the clipboard and the primary selection, written after the
+  frame, and its notice says the terminal must support OSC 52. An
+  escalation that arrives over an open model or resume picker parks the
+  picker and restores it once no escalation remains, and a held Enter or
+  Esc never answers, selects or closes a dialog. A prompt re-sent with the
+  same text right after a failed turn (which already committed it) retries
+  that turn instead of adding the message twice. Helpers nest at most
+  `[helpers] max_depth` levels (default 1: helpers cannot delegate); a
+  helper at the limit has no tool that starts helpers and a deeper spawn
+  is refused. Each helper shows as one live header line (state, calls,
+  last activity, tokens) that Ctrl+↑/↓ and Enter, a click or
+  `/helpers expand|fold` open to show its work (`[ui] helpers` sets the
+  default). An interrupt abandons the messages still queued for the
+  running turn before it stops the run, so none of them runs as a
+  follow-up turn after the interrupt, and every one comes back to the
+  editor with the turn reported as interrupted, not failed. Esc while a
+  turn runs pulls back the steers the runtime still holds queued without
+  stopping the run (only when nothing is left to pull back does it
+  interrupt), and the first Ctrl-C after a mouse selection only clears the
+  selection. The terminal is asked for keyboard disambiguation only, not
+  event types: kitty 0.32 sent a Backspace release as a second press byte,
+  which deleted two characters per keystroke. A call the classifier
+  allowed shows a dim `allowed by classifier: <reason>` line under its tool
+  block, a denial's tag reads `[classifier checked N files, M searches]`,
+  and a block for lack of user intent asks the agent to get the user's
+  confirmation instead of claiming the user never asked. A file-tool write
+  to a protected path in the project (`.env*`, `build.rs`, `.cargo/`,
+  `AGENTS.md`, `.gitmodules`, …) always asks you in the escalation dialog,
+  naming the path and why, instead of going to the classifier; an allow
+  rule for the path (the dialog's "allow + rule") stops the prompts.
+  Running helpers (and those finished this turn) are listed in a panel
+  under the input; Ctrl+↑/↓ select one and Enter on an empty input opens
+  its full view (its prose, reasoning, tool calls and nested helpers) in
+  place of the transcript until Esc. Long lines in the input editor wrap
+  at the field width instead of scrolling sideways; the field grows up to
+  six rows and ↑/↓ move by wrapped rows. See
+  `crates/meerkat-tui/README.md`.
+
+- `meerkat-mob-mcp`: `MobMcpState::with_implicit_mob_customizer` takes an
+  `ImplicitMobCustomizer`, asked once with an `ImplicitMobContext` (owner
+  bridge session, model) before a session's implicit delegation mob is
+  created, for the `delegate` profile's provider. A host whose sessions run
+  on models outside the static catalog (profiled under its own
+  `[models.<id>]`) answers the provider, the engine sets
+  `profiles.delegate.provider`, and `delegate` works on them; nothing else of
+  the definition is open to the host. Opt-in: without one, or on a `None`
+  answer, the definition is `MobDefinition::implicit` as before; an error
+  refuses the create. `ensure_implicit_mob_for_model` is now documented
+  public API for host surfaces that run helpers in a session's implicit mob.
+
+### Changed
+
+- `meerkat-anthropic`: a request that replays a signed `thinking` block or
+  a `redacted_thinking` block now sets
+  `thinking.block_binding.prefix_mismatch_behavior` to `"drop_block"` and
+  sends the `thinking-binding-controls-2026-08-01` beta, so a resumed
+  session whose tool list changed drops the stale block instead of failing
+  its turn with "bound to a different conversation". A request without a
+  `thinking` configuration on a model that thinks by default names the
+  default (`{"type": "adaptive"}`) beside the control; a request with
+  thinking disabled, or on a model without adaptive thinking, is unchanged.
+- `meerkat-sandbox`: on Linux, a read-only file grant may now name a symbolic
+  link to a regular file (its parent directories still real, not links), and
+  the confined process sees the target read-only at the link's own path, so a
+  systemd-resolved host's `/etc/resolv.conf` can be granted and DNS works
+  inside the sandbox; `rkat-tui` grants it this way. The link is accepted
+  only when no less-trusted party can retarget it: the link and every
+  directory from `/` down to its parent are owned by root or the effective
+  uid, and none of those directories is writable by group or others unless
+  it is sticky; any other link is refused as before. macOS (Seatbelt) still
+  refuses every such link. The new `meerkat_sandbox::literal_file_grantable`
+  answers whether this host's backend accepts a path as a read-only literal
+  file grant.
+
 ## [0.9.10] - 2026-11-04
 
 ### Highlights

@@ -1,0 +1,93 @@
+[package]
+name = "meerkat-tui"
+description = "Interactive terminal coding harness for Meerkat with an auto-mode approval model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "rkat-tui"
+path = "src/main.rs"
+
+[dependencies]
+# Meerkat engine: the runtime-backed persistent session path (SQLite realm
+# store, auto-compaction), skills, MCP, comms and semantic memory
+# (`meerkat-memory` directly for the start-up index probe).
+meerkat = { workspace = true, features = ["anthropic", "openai", "gemini", "session-store", "jsonl-store", "session-compaction", "memory-store-session", "skills", "comms"] }
+meerkat-core = { workspace = true }
+meerkat-runtime = { workspace = true, features = ["sqlite-store"] }
+meerkat-store = { workspace = true }
+meerkat-sqlite = { workspace = true }
+meerkat-tools = { workspace = true }
+meerkat-models = { workspace = true }
+meerkat-llm-core = { workspace = true }
+meerkat-memory = { workspace = true }
+meerkat-sandbox = { workspace = true }
+meerkat-mob = { workspace = true, optional = true }
+meerkat-mob-mcp = { workspace = true, optional = true }
+
+# Async + serialization
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+schemars = { workspace = true }
+
+# Infra
+clap = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dirs = { workspace = true }
+indexmap = { workspace = true }
+parking_lot = { workspace = true }
+reqwest = { workspace = true }
+# Durable digests (allow cache, trust record) and atomic file writes.
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+
+# Terminal UI
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+unicode-width = "0.2"
+
+# File tools and path policy
+ignore = "0.4"
+globset = "0.4"
+regex = "1"
+similar = "2"
+
+[features]
+default = ["mcp", "mob"]
+mcp = ["meerkat/mcp"]
+# Sub-agents run as mob members (`delegate` / `fork_off`).
+mob = ["dep:meerkat-mob", "dep:meerkat-mob-mcp"]
+# Makes the internal modules public and adds `harness` (the headless
+# runner) for this crate's own integration tests. Not a stable API.
+test-support = []
+
+[dev-dependencies]
+# The integration tests drive the internal modules through `test-support`.
+meerkat-tui = { path = ".", features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = { workspace = true }
+
+# The feature set this crate's own tests need. The published package has
+# no self dev-dependency to turn them on, so its README.md prints the
+# command with these features, and the standalone test lane
+# (scripts/published_crates_standalone.py) reads them from here.
+[package.metadata.meerkat.standalone-tests]
+features = ["test-support"]
+
+[lints]
+workspace = true
